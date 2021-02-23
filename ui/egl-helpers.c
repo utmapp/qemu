@@ -417,7 +417,7 @@ void egl_dmabuf_create_fence(QemuDmaBuf *dmabuf)
 
 /* ---------------------------------------------------------------------- */
 
-EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
+EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win)
 {
     EGLSurface esurface;
     EGLBoolean b;
@@ -560,8 +560,6 @@ int qemu_egl_init_dpy_cocoa(DisplayGLMode mode)
 
     return 0;
 }
-
-/* ---------------------------------------------------------------------- */
 
 #if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
 

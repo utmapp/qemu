@@ -345,7 +345,7 @@ static void gd_update_full_redraw(VirtualConsole *vc)
     int ww, wh;
     ww = gdk_window_get_width(gtk_widget_get_window(area));
     wh = gdk_window_get_height(gtk_widget_get_window(area));
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (vc->gfx.gls && gtk_use_gl_area) {
         gtk_gl_area_queue_render(GTK_GL_AREA(vc->gfx.drawing_area));
         return;
@@ -565,7 +565,7 @@ static const DisplayChangeListenerOps dcl_ops = {
 };
 
 
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 
 static bool gd_has_dmabuf(DisplayChangeListener *dcl)
 {
@@ -676,7 +676,7 @@ static const DisplayGLCtxOps egl_ctx_ops = {
 };
 #endif
 
-#endif /* CONFIG_OPENGL */
+#endif /* defined(CONFIG_OPENGL) && defined(CONFIG_EGL) */
 
 /** QEMU Events **/
 
@@ -754,7 +754,7 @@ static void gd_set_ui_size(VirtualConsole *vc, gint width, gint height)
     dpy_set_ui_info(vc->gfx.dcl.con, &info, true);
 }
 
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 
 static gboolean gd_render_event(GtkGLArea *area, GdkGLContext *context,
                                 void *opaque)
@@ -824,7 +824,7 @@ static gboolean gd_draw_event(GtkWidget *widget, cairo_t *cr, void *opaque)
     int ww, wh;
     int fbw, fbh;
 
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (vc->gfx.gls) {
         if (gtk_use_gl_area) {
             /* invoke render callback please */
@@ -1387,7 +1387,7 @@ static gboolean gd_tab_window_close(GtkWidget *widget, GdkEvent *event,
                                     vc->tab_item, vc->label);
     gtk_widget_destroy(vc->window);
     vc->window = NULL;
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (vc->gfx.esurface) {
         eglDestroySurface(qemu_egl_display, vc->gfx.esurface);
         vc->gfx.esurface = NULL;
@@ -1426,7 +1426,7 @@ static void gd_menu_untabify(GtkMenuItem *item, void *opaque)
     if (!vc->window) {
         gtk_widget_set_sensitive(vc->menu_item, false);
         vc->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
         if (vc->gfx.esurface) {
             eglDestroySurface(qemu_egl_display, vc->gfx.esurface);
             vc->gfx.esurface = NULL;
@@ -2030,7 +2030,7 @@ static void gd_connect_vc_gfx_signals(VirtualConsole *vc)
 {
     g_signal_connect(vc->gfx.drawing_area, "draw",
                      G_CALLBACK(gd_draw_event), vc);
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (gtk_use_gl_area) {
         /* wire up GtkGlArea events */
         g_signal_connect(vc->gfx.drawing_area, "render",
@@ -2146,7 +2146,7 @@ static GtkWidget *gd_create_menu_machine(GtkDisplayState *s)
     return machine_menu;
 }
 
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 static void gl_area_realize(GtkGLArea *area, VirtualConsole *vc)
 {
     gtk_gl_area_make_current(area);
@@ -2170,7 +2170,7 @@ static GSList *gd_vc_gfx_init(GtkDisplayState *s, VirtualConsole *vc,
     vc->gfx.scale_x = 1.0;
     vc->gfx.scale_y = 1.0;
 
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (display_opengl) {
         if (gtk_use_gl_area) {
             vc->gfx.drawing_area = gtk_gl_area_new();
@@ -2534,7 +2534,7 @@ static void early_gtk_display_init(DisplayOptions *opts)
 
     assert(opts->type == DISPLAY_TYPE_GTK);
     if (opts->has_gl && opts->gl != DISPLAY_GL_MODE_OFF) {
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 #if defined(GDK_WINDOWING_WAYLAND)
         if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) {
             gtk_use_gl_area = true;
@@ -2577,6 +2577,6 @@ static void register_gtk(void)
 
 type_init(register_gtk);
 
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 module_dep("ui-opengl");
 #endif

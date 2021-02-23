@@ -60,7 +60,7 @@ void egl_dmabuf_create_fence(QemuDmaBuf *dmabuf);
 
 #endif
 
-EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win);
+EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win);
 EGLSurface qemu_egl_init_buffer_surface(EGLContext ectx, EGLenum buftype,
                                         EGLClientBuffer buffer, const EGLint *attrib_list);
 bool qemu_egl_destroy_surface(EGLSurface surface);

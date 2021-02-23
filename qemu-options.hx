@@ -2111,7 +2111,7 @@ DEF("display", HAS_ARG, QEMU_OPTION_display,
     "              [,show-cursor=on|off][,left-command-key=on|off]\n"
     "              [,full-screen=on|off][,zoom-to-fit=on|off]\n"
 #endif
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     "-display egl-headless[,rendernode=<file>]\n"
 #endif
 #if defined(CONFIG_DBUS_DISPLAY)

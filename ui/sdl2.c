@@ -93,7 +93,7 @@ void sdl2_window_create(struct sdl2_console *scon)
     if (scon->hidden) {
         flags |= SDL_WINDOW_HIDDEN;
     }
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     if (scon->opengl) {
         flags |= SDL_WINDOW_OPENGL;
     }
@@ -155,7 +155,7 @@ void sdl2_window_resize(struct sdl2_console *scon)
 static void sdl2_redraw(struct sdl2_console *scon)
 {
     if (scon->opengl) {
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
         sdl2_gl_redraw(scon);
 #endif
     } else {
@@ -785,7 +785,7 @@ static const DisplayChangeListenerOps dcl_2d_ops = {
     .dpy_cursor_define    = sdl_mouse_define,
 };
 
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 static const DisplayChangeListenerOps dcl_gl_ops = {
     .dpy_name                = "sdl2-gl",
     .dpy_gfx_update          = sdl2_gl_update,
@@ -819,7 +819,7 @@ static void sdl2_display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_SDL);
     if (o->has_gl && o->gl) {
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
         display_opengl = 1;
 #endif
     }
@@ -886,7 +886,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         }
         sdl2_console[i].idx = i;
         sdl2_console[i].opts = o;
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
         sdl2_console[i].opengl = display_opengl;
         sdl2_console[i].dcl.ops = display_opengl ? &dcl_gl_ops : &dcl_2d_ops;
         sdl2_console[i].dgc.ops = display_opengl ? &gl_ctx_ops : NULL;
@@ -958,6 +958,6 @@ static void register_sdl1(void)
 
 type_init(register_sdl1);
 
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 module_dep("ui-opengl");
 #endif
