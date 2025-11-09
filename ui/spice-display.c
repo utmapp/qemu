@@ -1132,36 +1132,30 @@ static void qemu_spice_gl_scanout_disable(DisplayChangeListener *dcl)
     spice_iosurface_destroy(ssd);
 #endif
 #if defined(CONFIG_ANGLE)
-    ssd->backing_borrow = NULL;
-    ssd->backing_id = -1;
+    ssd->tex_id = -1;
 #endif
 }
 
 static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
-                                          uint32_t backing_id,
-                                          DisplayGLTextureBorrower backing_borrow,
+                                          uint32_t tex_id,
+                                          bool y_0_top,
+                                          uint32_t backing_width,
+                                          uint32_t backing_height,
                                           uint32_t x, uint32_t y,
-                                          uint32_t w, uint32_t h)
+                                          uint32_t w, uint32_t h,
+                                          void *d3d_tex2d)
 {
     SimpleSpiceDisplay *ssd = container_of(dcl, SimpleSpiceDisplay, dcl);
     EGLint stride = 0, fourcc = 0;
     int fd = -1;
-    bool y_0_top;
-    uint32_t backing_width;
-    uint32_t backing_height;
-    void *d3d_tex2d;
 
-    GLuint tex_id = backing_borrow(backing_id, &y_0_top,
-                                   &backing_width, &backing_height,
-                                   &d3d_tex2d);
-    assert(tex_id);
 #if defined(CONFIG_GBM)
     fd = egl_get_fd_for_texture(tex_id, &stride, &fourcc, NULL);
 #elif defined(CONFIG_IOSURFACE)
     if (spice_iosurface_resize(ssd, backing_width, backing_height)) {
 #if defined(CONFIG_ANGLE)
-        ssd->backing_borrow = backing_borrow;
-        ssd->backing_id = backing_id;
+        ssd->tex_id = tex_id;
+        ssd->y_0_top = y_0_top;
 #endif
         fd = spice_iosurface_create_fd(ssd, &fourcc);
     } else {
@@ -1253,11 +1247,10 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
     EGLint stride = 0, fourcc = 0;
     int fd;
     bool render_cursor = false;
+    uint32_t texture;
 #endif
     bool y_0_top = false; /* FIXME */
     uint64_t cookie;
-    int fd;
-    uint32_t width, height, texture;
 
     if (!ssd->have_scanout) {
         return;
@@ -1331,8 +1324,8 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
         glFlush();
     }
 #elif defined(CONFIG_ANGLE) && defined(CONFIG_IOSURFACE)
-    GLuint tex_id = ssd->backing_borrow(ssd->backing_id, &y_0_top,
-                                        NULL, NULL, NULL);
+    GLuint tex_id = ssd->tex_id;
+    y_0_top = ssd->y_0_top;
     spice_iosurface_blit(ssd, tex_id, !y_0_top, false);
     //TODO: cursor stuff
 #endif
@@ -1403,8 +1396,7 @@ static void qemu_spice_display_init_one(QemuConsole *con)
 #endif
 #if defined(CONFIG_ANGLE)
         ssd->esurface = EGL_NO_SURFACE;
-        ssd->backing_borrow = NULL;
-        ssd->backing_id = -1;
+        ssd->tex_id = -1;
 #endif
     }
 #endif

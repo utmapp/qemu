@@ -248,7 +248,7 @@ void gd_gl_area_destroy_context(DisplayGLCtx *dgc, QEMUGLContext ctx)
     g_clear_object(&ctx);
 }
 
-void gd_gl_area_scanout_borrowed_texture(DisplayChangeListener *dcl,
+void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
                                 uint32_t backing_id,
                                 bool backing_y_0_top,
                                 uint32_t backing_width,
@@ -275,26 +275,6 @@ void gd_gl_area_scanout_borrowed_texture(DisplayChangeListener *dcl,
     gtk_gl_area_set_scanout_mode(vc, true);
     egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
                          backing_id, false);
-}
-
-void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
-                                uint32_t backing_id,
-                                DisplayGLTextureBorrower backing_borrow,
-                                uint32_t x, uint32_t y,
-                                uint32_t w, uint32_t h)
-{
-    bool backing_y_0_top;
-    uint32_t backing_width;
-    uint32_t backing_height;
-    void *d3d_tex2d;
-
-    GLuint backing_texture = backing_borrow(backing_id, &backing_y_0_top,
-                                            &backing_width, &backing_height,
-                                            &d3d_tex2d);
-    gd_gl_area_scanout_borrowed_texture(dcl, backing_texture,
-                                        backing_y_0_top,
-                                        backing_width, backing_height,
-                                        x, y, w, h, d3d_tex2d);
 }
 
 void gd_gl_area_scanout_disable(DisplayChangeListener *dcl)
@@ -341,7 +321,7 @@ void gd_gl_area_scanout_dmabuf(DisplayChangeListener *dcl,
     backing_height = qemu_dmabuf_get_backing_height(dmabuf);
     y0_top = qemu_dmabuf_get_y0_top(dmabuf);
 
-    gd_gl_area_scanout_borrowed_texture(dcl, texture, y0_top,
+    gd_gl_area_scanout_texture(dcl, texture, y0_top,
                                backing_width, backing_height,
                                x, y, width, height, NULL);
 

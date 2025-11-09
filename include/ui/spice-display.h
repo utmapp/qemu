@@ -141,8 +141,8 @@ struct SimpleSpiceDisplay {
 #if defined(CONFIG_ANGLE)
     EGLSurface esurface;
     egl_fb iosurface_fb;
-    DisplayGLTextureBorrower backing_borrow;
-    uint32_t backing_id;
+    GLuint tex_id;
+    bool y_0_top;
 #endif
     bool render_cursor;
 
