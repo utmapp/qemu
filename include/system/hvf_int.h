@@ -37,6 +37,7 @@ extern hv_return_t _hv_vcpu_set_actlr(hv_vcpu_t vcpu, uint64_t value);
 /* hvf_slot flags */
 #define HVF_SLOT_LOG (1 << 0)
 
+/* Represent memory logically mapped by QEMU */
 typedef struct hvf_slot {
     uint64_t start;
     uint64_t size;
@@ -45,6 +46,14 @@ typedef struct hvf_slot {
     uint32_t flags;
     MemoryRegion *region;
 } hvf_slot;
+
+/* Represent memory currently mapped in HVF */
+typedef struct hvf_mac_slot {
+    int present;
+    uint64_t size;
+    uint64_t gpa_start;
+    uint64_t gva;
+} hvf_mac_slot;
 
 typedef struct hvf_vcpu_caps {
     uint64_t vmx_cap_pinbased;
@@ -57,7 +66,8 @@ typedef struct hvf_vcpu_caps {
 
 struct HVFState {
     AccelState parent;
-    hvf_slot slots[32];
+    hvf_slot *slots;
+    hvf_mac_slot *mac_slots;
     int num_slots;
 
     hvf_vcpu_caps *hvf_caps;
