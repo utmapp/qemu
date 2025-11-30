@@ -2584,6 +2584,11 @@ config_host_data.set('CONFIG_VNC', vnc.found())
 config_host_data.set('CONFIG_VNC_JPEG', jpeg.found())
 config_host_data.set('CONFIG_VNC_SASL', sasl.found())
 if virgl.found()
+  config_host_data.set('HAVE_VIRGL_RENDERER_NATIVE_SCANOUT',
+                        cc.has_function('virgl_renderer_create_handle_for_scanout',
+                                        args: '-DVIRGL_RENDERER_UNSTABLE_APIS',
+                                        prefix: '#include <virglrenderer.h>',
+                                        dependencies: virgl))
   config_host_data.set('VIRGL_VERSION_MAJOR', virgl.version().split('.')[0])
 endif
 config_host_data.set('CONFIG_VIRTFS', have_virtfs)

@@ -22,6 +22,7 @@
 
 #include "ui/egl-helpers.h"
 
+#define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
 
 #define NATIVE_HANDLE_SUPPORT_VERSION (1)
@@ -828,6 +829,59 @@ static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
     }
 }
 
+#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
+static void virgl_scanout_native_blob_cleanup(ScanoutTextureNative *native)
+{
+    assert(native->type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL);
+    virgl_renderer_release_handle_for_scanout(VIRGL_NATIVE_HANDLE_METAL_TEXTURE,
+                                              native->handle);
+}
+
+static bool virgl_scanout_native_blob(VirtIOGPU *g,
+                                      struct virtio_gpu_set_scanout_blob *ss)
+{
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[ss->scanout_id];
+    enum virgl_renderer_native_handle_type type;
+    virgl_renderer_native_handle handle;
+    ScanoutTextureNative native;
+
+    type = virgl_renderer_create_handle_for_scanout(ss->resource_id,
+                                                    ss->width,
+                                                    ss->height,
+                                                    ss->format,
+                                                    ss->padding,
+                                                    ss->strides[0],
+                                                    ss->offsets[0],
+                                                    &handle);
+#ifdef CONFIG_METAL
+    if (type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
+        native = (ScanoutTextureNative){
+            .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+            .handle = handle,
+        };
+        qemu_console_resize(scanout->con,
+                            ss->r.width, ss->r.height);
+        dpy_gl_scanout_texture(
+            scanout->con, 0,
+            false,
+            ss->width, ss->height,
+            ss->r.x, ss->r.y, ss->r.width, ss->r.height,
+            native, virgl_scanout_native_blob_cleanup);
+        scanout->resource_id = ss->resource_id;
+
+        return true;
+    }
+#endif
+
+    /* don't leak memory if handle type is unknown */
+    if (type != VIRGL_NATIVE_HANDLE_NONE) {
+        virgl_renderer_release_handle_for_scanout(type, handle);
+    }
+
+    return false;
+}
+#endif
+
 static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
                                        struct virtio_gpu_ctrl_command *cmd)
 {
@@ -865,6 +919,12 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
     }
+
+#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
+    if (virgl_scanout_native_blob(g, &ss)) {
+        return;
+    }
+#endif
 
     res = virtio_gpu_virgl_find_resource(g, ss.resource_id);
     if (!res) {
