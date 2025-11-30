@@ -24,6 +24,8 @@
 
 #include <virglrenderer.h>
 
+#define NATIVE_HANDLE_SUPPORT_VERSION (1)
+
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
@@ -423,12 +425,28 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         memset(&ext, 0, sizeof(ext));
         ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
         info = ext.base;
+        /* fallback to older version */
         native = (ScanoutTextureNative){
             .type = ext.d3d_tex2d ? SCANOUT_TEXTURE_NATIVE_TYPE_D3D :
                                     SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
             .handle = ext.d3d_tex2d,
         };
-#else
+#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= NATIVE_HANDLE_SUPPORT_VERSION
+        if (ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION) {
+            switch (ext.native_type) {
+            case VIRGL_NATIVE_HANDLE_NONE:
+            case VIRGL_NATIVE_HANDLE_D3D_TEX2D: {
+                /* already handled above */
+                break;
+            }
+            default: {
+                /* ignore unsupported hint texture type */
+                break;
+            }
+            }
+        }
+#endif
+#else /* VIRGL_VERSION_MAJOR < 1 */
         memset(&info, 0, sizeof(info));
         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
 #endif
@@ -1107,11 +1125,13 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
     }
 #endif
-#ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
     if (qemu_egl_angle_native_device) {
+#if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE)
+        flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
+#elif defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE) && defined(WIN32)
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
-    }
 #endif
+    }
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
