@@ -434,6 +434,13 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 #if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= NATIVE_HANDLE_SUPPORT_VERSION
         if (ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION) {
             switch (ext.native_type) {
+#ifdef CONFIG_METAL
+            case VIRGL_NATIVE_HANDLE_METAL_TEXTURE: {
+                native.type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL;
+                native.handle = ext.native_handle;
+                break;
+            }
+#endif
             case VIRGL_NATIVE_HANDLE_NONE:
             case VIRGL_NATIVE_HANDLE_D3D_TEX2D: {
                 /* already handled above */
@@ -1134,7 +1141,10 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
-        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
+        flags |= VIRGL_RENDERER_VENUS;
+#ifndef CONFIG_METAL /* Metal does not support render server */
+        flags |= VIRGL_RENDERER_RENDER_SERVER;
+#endif
     }
 #endif
 

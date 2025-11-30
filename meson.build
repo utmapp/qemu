@@ -836,6 +836,7 @@ coref = []
 iokit = []
 iosurface = not_found
 pvg = not_found
+metal = not_found
 quartzcore = not_found
 emulator_link_args = []
 midl = not_found
@@ -861,6 +862,7 @@ elif host_os == 'darwin'
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
+  metal = dependency('appleframeworks', modules: 'Metal', required: false)
   quartzcore = dependency('appleframeworks', modules: ['OpenGL', 'QuartzCore'], required: false)
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
@@ -2627,6 +2629,7 @@ if xen.found()
     ('0' + xen_version[2]).substring(-2)
   config_host_data.set('CONFIG_XEN_CTRL_INTERFACE_VERSION', xen_ctrl_version)
 endif
+config_host_data.set('CONFIG_METAL', metal.found())
 config_host_data.set('QEMU_VERSION', '"@0@"'.format(meson.project_version()))
 config_host_data.set('QEMU_VERSION_MAJOR', meson.project_version().split('.')[0])
 config_host_data.set('QEMU_VERSION_MINOR', meson.project_version().split('.')[1])

@@ -134,6 +134,7 @@ struct QemuConsoleClass {
 typedef enum ScanoutTextureNativeType {
     SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
     SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+    SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
 } ScanoutTextureNativeType;
 
 typedef struct ScanoutTextureNative {
