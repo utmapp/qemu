@@ -139,6 +139,14 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
 
     if (!QEMU_IS_ALIGNED(int128_get64(section->size), page_size) ||
         !QEMU_IS_ALIGNED(section->offset_within_address_space, page_size)) {
+        if (add) {
+            warn_report("Cannot add 0x%016llX:0x%016llX because it is not "
+                        "aligned to page size (0x%X)",
+                        section->offset_within_address_space,
+                        section->offset_within_address_space +
+                        int128_get64(section->size),
+                        (uint32_t)page_size);
+        }
         /* Not page aligned, so we can not map as RAM */
         add = false;
     }
