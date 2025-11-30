@@ -27,7 +27,7 @@
 EGLDisplay *qemu_egl_display;
 EGLConfig qemu_egl_config;
 DisplayGLMode qemu_egl_mode;
-bool qemu_egl_angle_d3d;
+void *qemu_egl_angle_native_device;
 
 /* ------------------------------------------------------------------ */
 
@@ -640,7 +640,7 @@ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode)
         }
 
         trace_egl_init_d3d11_device(device);
-        qemu_egl_angle_d3d = device != NULL;
+        qemu_egl_angle_native_device = d3d11_device;
     }
 #endif
 

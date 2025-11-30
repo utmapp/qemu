@@ -1104,7 +1104,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
-    if (qemu_egl_angle_d3d) {
+    if (qemu_egl_angle_native_device) {
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
     }
 #endif
