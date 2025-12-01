@@ -57,6 +57,14 @@
 #include "ui/egl-context.h"
 #endif
 
+#if defined(CONFIG_METAL) && defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
+#define USE_METAL
+#endif
+
+#ifdef USE_METAL
+#include <Metal/Metal.h>
+#endif
+
 #ifndef MAC_OS_VERSION_14_0
 #define MAC_OS_VERSION_14_0 140000
 #endif
@@ -248,6 +256,14 @@ static void handleAnyDeviceErrors(Error * err)
     }
 }
 
+typedef NS_ENUM(NSInteger, QemuCocoaViewScanout) {
+    QemuCocoaViewScanoutNone,
+    QemuCocoaViewScanoutGL,
+#ifdef USE_METAL
+    QemuCocoaViewScanoutMetal,
+#endif
+};
+
 /*
  ------------------------------------------------------
     QemuCocoaView
@@ -268,12 +284,18 @@ static void handleAnyDeviceErrors(Error * err)
     BOOL isAbsoluteEnabled;
     CFMachPortRef eventsTap;
     CGColorSpaceRef colorspace;
-    CALayer *cursorLayer;
     QEMUCursor *cursor;
     int mouseX;
     int mouseY;
     bool mouseOn;
 }
+
+#ifdef CONFIG_OPENGL
+@property (nonatomic,readonly) CALayer* glLayer;
+#endif
+@property (nonatomic,readonly) CALayer* cursorLayer;
+@property (nonatomic,assign) QemuCocoaViewScanout scanout;
+
 - (void) grabMouse;
 - (void) ungrabMouse;
 - (void) setFullGrab:(id)sender;
@@ -283,6 +305,18 @@ static void handleAnyDeviceErrors(Error * err)
 - (void) notifyMouseModeChange;
 - (BOOL) isMouseGrabbed;
 - (void) raiseAllKeys;
+- (void) setScanout:(QemuCocoaViewScanout)scanout;
+
+#ifdef USE_METAL
+@property (nonatomic,readonly) CAMetalLayer* metalLayer;
+@property (nonatomic,readonly) id<MTLCommandQueue> commandQueue;
+@property (nonatomic,retain) id<MTLTexture> fbTexture;
+@property (nonatomic,assign) MTLOrigin fbOrigin;
+@property (nonatomic,assign) MTLSize fbSize;
+
+- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture origin:(MTLOrigin)origin size:(MTLSize)size;
+- (void)drawFrame;
+#endif
 @end
 
 QemuCocoaView *cocoaView;
@@ -304,6 +338,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (id)initWithFrame:(NSRect)frameRect
 #ifdef CONFIG_OPENGL
                 cgl:(BOOL)cgl
+#ifdef USE_METAL
+          mtlDevice:(id<MTLDevice>)mtlDevice
+#endif
 #endif
 {
     COCOA_DEBUG("QemuCocoaView: initWithFrame\n");
@@ -331,16 +368,29 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [self setClipsToBounds:YES];
 #endif
         [self setWantsLayer:YES];
-        if (cgl) {
-            QemuCGLLayer *layer = [[QemuCGLLayer alloc] init];
-            [self setLayer:layer];
-            [layer release];
+#ifdef USE_METAL
+        if (mtlDevice) {
+            _metalLayer = [[CAMetalLayer alloc] init];
+            _metalLayer.device = mtlDevice;
+            _metalLayer.framebufferOnly = NO;
+            _metalLayer.autoresizingMask = kCALayerNotSizable;
+            _commandQueue = [mtlDevice newCommandQueue];
         }
-        cursorLayer = [[CALayer alloc] init];
-        [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
-        [cursorLayer setZPosition:1];
-        [[self layer] addSublayer:cursorLayer];
-
+#endif
+#ifdef CONFIG_OPENGL
+        if (cgl) {
+            _glLayer = [[QemuCGLLayer alloc] init];
+        } else {
+            _glLayer = [[CALayer alloc] init];
+        }
+#endif
+        _cursorLayer = [[CALayer alloc] init];
+        [_cursorLayer setAnchorPoint:CGPointMake(0, 1)];
+        [_cursorLayer setZPosition:1];
+#ifdef CONFIG_OPENGL
+        [[self layer] addSublayer:_glLayer];
+#endif
+        [[self layer] addSublayer:_cursorLayer];
     }
     return self;
 }
@@ -354,8 +404,16 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     CGColorSpaceRelease(colorspace);
-    [cursorLayer release];
+    [_cursorLayer release];
     cursor_unref(cursor);
+#ifdef CONFIG_OPENGL
+    [_glLayer release];
+#endif
+#ifdef USE_METAL
+    [_fbTexture release];
+    [_commandQueue release];
+    [_metalLayer release];
+#endif
     [super dealloc];
 }
 
@@ -423,12 +481,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         bounds.size.width = cursor->width * scale;
         bounds.size.height = cursor->height * scale;
 
-        [cursorLayer setBounds:bounds];
-        [cursorLayer setContentsScale:scale];
-        [cursorLayer setPosition:position];
+        [self.cursorLayer setBounds:bounds];
+        [self.cursorLayer setContentsScale:scale];
+        [self.cursorLayer setPosition:position];
     }
 
-    [cursorLayer setHidden:!mouseOn];
+    [self.cursorLayer setHidden:!mouseOn];
     [CATransaction commit];
 }
 
@@ -478,7 +536,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     CGDataProviderRelease(provider);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    [cursorLayer setContents:(id)image];
+    [self.cursorLayer setContents:(id)image];
     [self updateCursorLayout];
     [CATransaction commit];
     CGImageRelease(image);
@@ -611,7 +669,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) updateScale
 {
     if (display_opengl) {
-        [[self layer] setContentsScale:[[self window] backingScaleFactor]];
+#ifdef CONFIG_OPENGL
+        [self.glLayer setContentsScale:[[self window] backingScaleFactor]];
+#ifdef USE_METAL
+        [self.metalLayer setContentsScale:[[self window] backingScaleFactor]];
+#endif
+#endif
     } else {
         [self setBoundsSize:NSMakeSize(screen.width, screen.height)];
     }
@@ -1211,6 +1274,86 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_MIDDLE, false);
     });
 }
+
+- (void)setScanout:(QemuCocoaViewScanout)scanout
+{
+    COCOA_DEBUG("QemuCocoaView: setScanout:%d\n", scanout);
+    if (_scanout != scanout) {
+        _scanout = scanout;
+        [self.cursorLayer removeFromSuperlayer];
+#ifdef CONFIG_OPENGL
+        [self.glLayer removeFromSuperlayer];
+#endif
+#ifdef USE_METAL
+        [self.metalLayer removeFromSuperlayer];
+        if (scanout != QemuCocoaViewScanoutMetal) {
+            self.fbTexture = nil;
+        }
+#endif
+        switch (scanout) {
+#ifdef CONFIG_OPENGL
+            case QemuCocoaViewScanoutGL: [self.layer addSublayer:self.glLayer]; break;
+#endif
+#ifdef USE_METAL
+            case QemuCocoaViewScanoutMetal: [self.layer addSublayer:self.metalLayer]; break;
+#endif
+            default: break;
+        }
+        [self.layer addSublayer:self.cursorLayer];
+    }
+}
+
+#ifdef USE_METAL
+- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture origin:(MTLOrigin)origin size:(MTLSize)size
+{
+    COCOA_DEBUG("QemuCocoaView: scanoutMetalTexture(%p) origin:(%d, %d) size:(%d, %d)\n",
+                metalTexture, origin.x, origin.y, size.width, size.height);
+    self.fbTexture = metalTexture;
+    self.fbOrigin = origin;
+    self.fbSize = size;
+
+    if (metalTexture) {
+        CGFloat scale = self.window.backingScaleFactor;
+        self.metalLayer.contentsScale = scale;
+        self.metalLayer.pixelFormat = metalTexture.pixelFormat;
+        self.metalLayer.frame = CGRectMake(0, 0, size.width / scale, size.height / scale);
+        self.metalLayer.drawableSize = CGSizeMake(size.width, size.height);
+        self.scanout = QemuCocoaViewScanoutMetal;
+    }
+}
+
+- (void)drawFrame
+{
+    @autoreleasepool {
+        if (!self.fbTexture) {
+            return;
+        }
+        id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
+        if (!drawable) {
+            return;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+
+        [blit copyFromTexture:self.fbTexture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:self.fbOrigin
+                   sourceSize:self.fbSize
+                    toTexture:drawable.texture
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:(MTLOrigin){0,0,0}];
+
+        [blit endEncoding];
+
+        [commandBuffer presentDrawable:drawable];
+        [commandBuffer commit];
+    }
+}
+#endif
+
 @end
 
 
@@ -1245,6 +1388,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 @implementation QemuCocoaAppController
 #ifdef CONFIG_OPENGL
 - (id) initWithCGL:(BOOL)cgl
+#ifdef USE_METAL
+         mtlDevice:(id<MTLDevice>)mtlDevice
+#endif
 #else
 - (id) init
 #endif
@@ -1259,7 +1405,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
         // create a view and add it to the window
 #ifdef CONFIG_OPENGL
+#ifdef USE_METAL
+        cocoaView = [[QemuCocoaView alloc] initWithFrame:frame cgl:cgl mtlDevice:mtlDevice];
+#else
         cocoaView = [[QemuCocoaView alloc] initWithFrame:frame cgl:cgl];
+#endif
 #else
         cocoaView = [[QemuCocoaView alloc] initWithFrame:frame];
 #endif
@@ -2199,6 +2349,13 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
         gl_dirty = false;
 
 #ifdef CONFIG_EGL
+#ifdef USE_METAL
+        if (cocoaView.scanout == QemuCocoaViewScanoutMetal) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [cocoaView drawFrame];
+            });
+        } else
+#endif
         if (egl_surface) {
             with_gl_view_ctx(^{
                 cocoa_gl_render();
@@ -2219,6 +2376,9 @@ static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
 {
     gl_scanout_id = 0;
     gl_dirty = true;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        cocoaView.scanout = QemuCocoaViewScanoutNone;
+    });
 }
 
 static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
@@ -2233,6 +2393,25 @@ static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
     gl_scanout_id = backing_id;
     gl_scanout_y0_top = backing_y_0_top;
     gl_dirty = true;
+#ifdef USE_METAL
+    if (native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL) {
+        id<MTLTexture> mtlTexture = [(id<MTLTexture>)native.handle retain];
+        MTLOrigin mtlOrigin = MTLOriginMake(x, y, 0);
+        MTLSize mtlSize = MTLSizeMake(w, h, 1);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [cocoaView scanoutMetalTexture:mtlTexture origin:mtlOrigin size:mtlSize];
+            [mtlTexture release];
+        });
+    } else
+#endif
+    {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CGFloat scale = cocoaView.window.backingScaleFactor;
+            cocoaView.glLayer.contentsScale = scale;
+            cocoaView.glLayer.frame = CGRectMake(0, 0, w / scale, h / scale);
+            cocoaView.scanout = QemuCocoaViewScanoutGL;
+        });
+    }
 }
 
 static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
@@ -2290,10 +2469,22 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     kbd = qkbd_state_init(dcl.con);
     surface = qemu_console_surface(dcl.con);
 
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
+    if (display_opengl && opts->gl == DISPLAY_GL_MODE_ES) {
+        if (qemu_egl_init_dpy_cocoa(DISPLAY_GL_MODE_ES)) {
+            exit(1);
+        }
+    }
+#endif
+
     // Create an Application controller
 #ifdef CONFIG_OPENGL
     controller = [[QemuCocoaAppController alloc] initWithCGL:display_opengl &&
-                                                             opts->gl != DISPLAY_GL_MODE_ES];
+                                                             opts->gl != DISPLAY_GL_MODE_ES
+#ifdef USE_METAL
+                                                   mtlDevice:(id<MTLDevice>)qemu_egl_angle_native_device
+#endif
+                 ];
 #else
     controller = [[QemuCocoaAppController alloc] init];
 #endif
@@ -2303,14 +2494,11 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 #ifdef CONFIG_OPENGL
         if (opts->gl == DISPLAY_GL_MODE_ES) {
 #ifdef CONFIG_EGL
-            if (qemu_egl_init_dpy_cocoa(DISPLAY_GL_MODE_ES)) {
-                exit(1);
-            }
             gl_view_ctx = qemu_egl_init_ctx();
             if (!gl_view_ctx) {
                 exit(1);
             }
-            egl_surface = qemu_egl_init_surface(gl_view_ctx, [cocoaView layer]);
+            egl_surface = qemu_egl_init_surface(gl_view_ctx, cocoaView.glLayer);
             if (!egl_surface) {
                 exit(1);
             }
