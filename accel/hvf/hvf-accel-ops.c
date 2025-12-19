@@ -54,6 +54,8 @@
 #include "exec/exec-all.h"
 #include "gdbstub/enums.h"
 #include "hw/boards.h"
+#include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "system/accel-ops.h"
 #include "system/cpus.h"
 #include "system/hvf.h"
@@ -64,6 +66,7 @@
 
 HVFState *hvf_state;
 bool hvf_tso_mode = 0;
+uint32_t hvf_ipa_granule_size = 0;
 
 /* Memory slots */
 
@@ -177,6 +180,10 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
              */
              add = false;
         }
+    }
+
+    if (hvf_ipa_granule_size) {
+        page_size = hvf_ipa_granule_size;
     }
 
     if (!QEMU_IS_ALIGNED(int128_get64(section->size), page_size) ||
@@ -387,7 +394,7 @@ static int hvf_accel_init(MachineState *ms)
         }
     }
 
-    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range);
+    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range, hvf_ipa_granule_size);
     assert_hvf_ok(ret);
 
     s = g_new0(HVFState, 1);
@@ -422,6 +429,34 @@ static inline int hvf_gdbstub_sstep_flags(void)
     return SSTEP_ENABLE | SSTEP_NOIRQ;
 }
 
+static void hvf_get_ipa_granule_size(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    HVFState *s = HVF_STATE(obj);
+    uint32_t value = hvf_ipa_granule_size;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void hvf_set_ipa_granule_size(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    HVFState *s = HVF_STATE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value & (value - 1)) {
+        error_setg(errp, "ipa-granule-size must be a power of two.");
+        return;
+    }
+
+    hvf_ipa_granule_size = value;
+}
+
 static void hvf_accel_class_init(ObjectClass *oc, void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -436,6 +471,12 @@ static void hvf_accel_class_init(ObjectClass *oc, void *data)
     object_class_property_set_description(oc, "tso",
         "Set on/off to enable/disable total store ordering mode");
 #endif
+
+    object_class_property_add(oc, "ipa-granule-size", "uint32",
+        hvf_get_ipa_granule_size, hvf_set_ipa_granule_size,
+        NULL, NULL);
+    object_class_property_set_description(oc, "ipa-granule-size",
+        "Size of a single guest page");
 }
 
 static const TypeInfo hvf_accel_type = {
