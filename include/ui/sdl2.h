@@ -93,7 +93,7 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
                              uint32_t backing_height,
                              uint32_t x, uint32_t y,
                              uint32_t w, uint32_t h,
-                             void *d3d_tex2d);
+                             ScanoutTextureNative native);
 void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 

@@ -131,6 +131,20 @@ struct QemuConsoleClass {
     ObjectClass parent_class;
 };
 
+typedef enum ScanoutTextureNativeType {
+    SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
+    SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+} ScanoutTextureNativeType;
+
+typedef struct ScanoutTextureNative {
+    ScanoutTextureNativeType type;
+    void *handle;
+} ScanoutTextureNative;
+
+#define NO_NATIVE_TEXTURE ((ScanoutTextureNative){ \
+    .type = SCANOUT_TEXTURE_NATIVE_TYPE_NONE \
+})
+
 typedef struct ScanoutTexture {
     uint32_t backing_id;
     bool backing_y_0_top;
@@ -140,7 +154,7 @@ typedef struct ScanoutTexture {
     uint32_t y;
     uint32_t width;
     uint32_t height;
-    void *d3d_tex2d;
+    ScanoutTextureNative native;
 } ScanoutTexture;
 
 typedef struct QemuUIInfo {
@@ -245,7 +259,7 @@ typedef struct DisplayChangeListenerOps {
                                    uint32_t backing_height,
                                    uint32_t x, uint32_t y,
                                    uint32_t w, uint32_t h,
-                                   void *d3d_tex2d);
+                                   ScanoutTextureNative native);
     /* optional (default to true if has dpy_gl_scanout_dmabuf) */
     bool (*dpy_has_dmabuf)(DisplayChangeListener *dcl);
     /* optional */
@@ -329,7 +343,7 @@ void dpy_gl_scanout_texture(QemuConsole *con,
                             uint32_t backing_id, bool backing_y_0_top,
                             uint32_t backing_width, uint32_t backing_height,
                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                            void *d3d_tex2d);
+                            ScanoutTextureNative native);
 void dpy_gl_scanout_dmabuf(QemuConsole *con,
                            QemuDmaBuf *dmabuf);
 void dpy_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,

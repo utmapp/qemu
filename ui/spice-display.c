@@ -1143,7 +1143,7 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
                                           uint32_t backing_height,
                                           uint32_t x, uint32_t y,
                                           uint32_t w, uint32_t h,
-                                          void *d3d_tex2d)
+                                          ScanoutTextureNative native)
 {
     SimpleSpiceDisplay *ssd = container_of(dcl, SimpleSpiceDisplay, dcl);
     EGLint stride = 0, fourcc = 0;

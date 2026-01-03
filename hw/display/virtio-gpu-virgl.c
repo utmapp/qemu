@@ -416,14 +416,18 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 
     if (ss.resource_id && ss.r.width && ss.r.height) {
         struct virgl_renderer_resource_info info;
-        void *d3d_tex2d = NULL;
+        ScanoutTextureNative native = NO_NATIVE_TEXTURE;
 
 #if VIRGL_VERSION_MAJOR >= 1
         struct virgl_renderer_resource_info_ext ext;
         memset(&ext, 0, sizeof(ext));
         ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
         info = ext.base;
-        d3d_tex2d = ext.d3d_tex2d;
+        native = (ScanoutTextureNative){
+            .type = ext.d3d_tex2d ? SCANOUT_TEXTURE_NATIVE_TYPE_D3D :
+                                    SCANOUT_TEXTURE_NATIVE_TYPE_NONE,
+            .handle = ext.d3d_tex2d,
+        };
 #else
         memset(&info, 0, sizeof(info));
         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
@@ -443,7 +447,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
             info.width, info.height,
             ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d);
+            native);
     } else {
         dpy_gfx_replace_surface(
             g->parent_obj.scanout[ss.scanout_id].con, NULL);
