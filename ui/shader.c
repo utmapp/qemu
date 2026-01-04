@@ -30,13 +30,10 @@
 #include "ui/shader/texture-blit-vert.h"
 #include "ui/shader/texture-blit-flip-vert.h"
 #include "ui/shader/texture-blit-frag.h"
-#include "ui/shader/texture-blit-swap-frag.h"
 
 struct QemuGLShader {
     GLint texture_blit_prog;
     GLint texture_blit_flip_prog;
-    GLint texture_blit_swap_prog;
-    GLint texture_blit_flip_swap_prog;
     GLint texture_blit_vao;
 };
 
@@ -72,17 +69,11 @@ static GLuint qemu_gl_init_texture_blit(GLint texture_blit_prog)
     return vao;
 }
 
-void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip, bool swapped)
+void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip)
 {
-    if (flip && swapped) {
-        glUseProgram(gls->texture_blit_flip_swap_prog);
-    } else if (flip && !swapped) {
-        glUseProgram(gls->texture_blit_flip_prog);
-    } else if (!flip && swapped) {
-        glUseProgram(gls->texture_blit_swap_prog);
-    } else { // !flip && !swapped
-        glUseProgram(gls->texture_blit_prog);
-    }
+    glUseProgram(flip
+                 ? gls->texture_blit_flip_prog
+                 : gls->texture_blit_prog);
     glBindVertexArray(gls->texture_blit_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
@@ -174,14 +165,7 @@ QemuGLShader *qemu_gl_init_shader(void)
     strcpy(vert_src_body, texture_blit_flip_vert_src);
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
         (vert_src, frag_src);
-    strcpy(frag_src_body, texture_blit_swap_frag_src);
-    gls->texture_blit_flip_swap_prog = qemu_gl_create_compile_link_program
-        (vert_src, frag_src);
-    strcpy(vert_src_body, texture_blit_vert_src);
-    gls->texture_blit_swap_prog = qemu_gl_create_compile_link_program
-        (vert_src, frag_src);
-    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog ||
-        !gls->texture_blit_swap_prog || !gls->texture_blit_flip_swap_prog) {
+    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
         exit(1);
     }
 

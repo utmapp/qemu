@@ -951,7 +951,7 @@ static int spice_iosurface_create_fd(SimpleSpiceDisplay *ssd, int *fourcc)
     return fds[0];
 }
 
-static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bool flip, bool swap)
+static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bool flip)
 {
     egl_fb tmp_fb = { .texture = src_texture, .texture_target = GL_TEXTURE_2D };
     if (!ssd->iosurface) {
@@ -960,7 +960,7 @@ static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bo
 
 #if defined(CONFIG_ANGLE)
     eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
-    egl_texture_blit(ssd->gls, &ssd->iosurface_fb, &tmp_fb, flip, swap);
+    egl_texture_blit(ssd->gls, &ssd->iosurface_fb, &tmp_fb, flip);
 #endif
 }
 
@@ -1045,7 +1045,7 @@ static void spice_gl_update(DisplayChangeListener *dcl,
     surface_gl_update_texture(ssd->gls, ssd->ds, x, y, w, h);
 #if defined(CONFIG_IOSURFACE)
     if (!qemu_console_is_gl_blocked(ssd->dcl.con)) {
-        spice_iosurface_blit(ssd, ssd->ds->texture, true, ssd->ds->glswapped);
+        spice_iosurface_blit(ssd, ssd->ds->texture, true);
     }
 #endif
     ssd->gl_updates++;
@@ -1319,7 +1319,7 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
         ptr_y = ssd->ptr_y;
         qemu_mutex_unlock(&ssd->lock);
         egl_texture_blit(ssd->gls, &ssd->blit_fb, &ssd->guest_fb,
-                         !y_0_top, false);
+                         !y_0_top);
         egl_texture_blend(ssd->gls, &ssd->blit_fb, &ssd->cursor_fb,
                           !y_0_top, false, ptr_x, ptr_y, 1.0, 1.0);
         glFlush();
@@ -1327,7 +1327,7 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
 #elif defined(CONFIG_ANGLE) && defined(CONFIG_IOSURFACE)
     GLuint tex_id = ssd->tex_id;
     y_0_top = ssd->y_0_top;
-    spice_iosurface_blit(ssd, tex_id, !y_0_top, false);
+    spice_iosurface_blit(ssd, tex_id, !y_0_top);
     //TODO: cursor stuff
 #endif
 

@@ -355,9 +355,9 @@ void gd_egl_scanout_flush(DisplayChangeListener *dcl,
     egl_fb_setup_default(&vc->gfx.win_fb, ww, wh);
     if (vc->gfx.cursor_fb.texture) {
         egl_texture_blit(vc->gfx.gls, &vc->gfx.win_fb, &vc->gfx.guest_fb,
-                         vc->gfx.y0_top, false);
+                         vc->gfx.y0_top);
         egl_texture_blend(vc->gfx.gls, &vc->gfx.win_fb, &vc->gfx.cursor_fb,
-                          vc->gfx.y0_top, false,
+                          vc->gfx.y0_top,
                           vc->gfx.cursor_x, vc->gfx.cursor_y,
                           vc->gfx.scale_x, vc->gfx.scale_y);
     } else {

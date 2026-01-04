@@ -22,7 +22,6 @@ typedef struct DisplaySurface {
     GLenum glformat;
     GLenum gltype;
     GLuint texture;
-    bool   glswapped;
 #endif
     qemu_pixman_shareable share_handle;
     uint32_t share_handle_offset;

@@ -198,17 +198,17 @@ void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 }
 
-void egl_texture_blit(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip, bool swap)
+void egl_texture_blit(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip)
 {
     glBindFramebuffer(GL_FRAMEBUFFER_EXT, dst->framebuffer);
     glViewport(0, 0, dst->width, dst->height);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(src->texture_target, src->texture);
-    qemu_gl_run_texture_blit(gls, flip, swap);
+    qemu_gl_run_texture_blit(gls, flip);
 }
 
 void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
-                       bool swap, int x, int y, double scale_x, double scale_y)
+                       int x, int y, double scale_x, double scale_y)
 {
     glBindFramebuffer(GL_FRAMEBUFFER_EXT, dst->framebuffer);
     int w = scale_x * src->width;
@@ -222,7 +222,7 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
     glBindTexture(src->texture_target, src->texture);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    qemu_gl_run_texture_blit(gls, flip, swap);
+    qemu_gl_run_texture_blit(gls, flip);
     glDisable(GL_BLEND);
 }
 
