@@ -24,6 +24,7 @@
 #include "qemu/option.h"
 #include "qemu/queue.h"
 #include "ui/console.h"
+#include "system/system.h"
 #include "trace.h"
 #ifdef CONFIG_IOSURFACE
 #include <TargetConditionals.h>
@@ -1424,6 +1425,44 @@ static void qemu_spice_display_init_one(QemuConsole *con)
         qemu_console_set_display_gl_ctx(con, &ssd->dgc);
     }
     register_displaychangelistener(&ssd->dcl);
+}
+
+void qemu_spice_display_early_init(void)
+{
+#ifdef HAVE_SPICE_GL
+    QemuOptsList *olist = qemu_find_opts("spice");
+    QemuOpts *opts = QTAILQ_FIRST(&olist->head);
+    int port, tls_port;
+
+    port = qemu_opt_get_number(opts, "port", 0);
+    tls_port = qemu_opt_get_number(opts, "tls-port", 0);
+    if (qemu_opt_get_bool(opts, "gl", 0)) {
+        if ((port != 0) || (tls_port != 0)) {
+            error_report("SPICE GL support is local-only for now and "
+                         "incompatible with -spice port/tls-port");
+            exit(1);
+        }
+#if defined(CONFIG_GBM)
+        egl_init(qemu_opt_get(opts, "rendernode"), DISPLAY_GL_MODE_ON, &error_fatal);
+#elif defined(CONFIG_ANGLE)
+        if (qemu_egl_init_dpy_angle(DISPLAY_GL_MODE_ES)) {
+            error_report("SPICE GL failed to initialize ANGLE display");
+            exit(1);
+        }
+
+        spice_gl_ctx = qemu_egl_init_ctx();
+        if (!spice_gl_ctx) {
+            error_report("egl: egl_init_ctx failed");
+            exit(1);
+        }
+#else
+        error_report("No backend to support SPICE GL");
+        exit(1);
+#endif
+        display_opengl = 1;
+        spice_opengl = 1;
+    }
+#endif
 }
 
 void qemu_spice_display_init(void)

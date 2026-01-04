@@ -27,6 +27,7 @@
 #include "qemu/config-file.h"
 
 void qemu_spice_input_init(void);
+void qemu_spice_display_early_init(void);
 void qemu_spice_display_init(void);
 void qemu_spice_display_init_done(void);
 bool qemu_spice_have_display_interface(QemuConsole *con);
