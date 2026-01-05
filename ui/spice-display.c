@@ -29,7 +29,7 @@
 #ifdef CONFIG_IOSURFACE
 #include <TargetConditionals.h>
 #endif
-#ifdef CONFIG_ANGLE
+#ifdef CONFIG_EGL
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #endif
@@ -38,7 +38,7 @@
 
 bool spice_opengl;
 
-#ifdef CONFIG_ANGLE
+#ifdef CONFIG_EGL
 EGLContext spice_gl_ctx;
 #endif
 
@@ -806,6 +806,10 @@ static const DisplayChangeListenerOps display_listener_ops = {
 
 #if defined(CONFIG_IOSURFACE)
 
+#ifndef EGL_IOSURFACE_WRITE_HINT_ANGLE
+#define EGL_IOSURFACE_WRITE_HINT_ANGLE (0x0002)
+#endif
+
 static void AddIntegerValue(CFMutableDictionaryRef dictionary, const CFStringRef key, int32_t value)
 {
     CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
@@ -833,7 +837,7 @@ static int spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height
         return 0;
     }
 
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
     EGLint target = 0;
     GLenum tex_target = 0;
     if (eglGetConfigAttrib(qemu_egl_display,
@@ -892,7 +896,7 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
     if (!ssd->iosurface) {
         return;
     }
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
     eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
     eglReleaseTexImage(qemu_egl_display, ssd->esurface, EGL_BACK_BUFFER);
     egl_fb_destroy(&ssd->iosurface_fb);
@@ -958,7 +962,7 @@ static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bo
         return;
     }
 
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
     eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
     egl_texture_blit(ssd->gls, &ssd->iosurface_fb, &tmp_fb, flip);
 #endif
@@ -1113,7 +1117,7 @@ static QEMUGLContext qemu_spice_gl_create_context(DisplayGLCtx *dgc,
 #if defined(CONFIG_GBM)
     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    qemu_egl_rn_ctx);
-#elif defined(CONFIG_ANGLE)
+#elif defined(CONFIG_EGL)
     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    spice_gl_ctx);
 #endif
@@ -1132,7 +1136,7 @@ static void qemu_spice_gl_scanout_disable(DisplayChangeListener *dcl)
 #if defined(CONFIG_IOSURFACE)
     spice_iosurface_destroy(ssd);
 #endif
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
     ssd->tex_id = -1;
 #endif
 }
@@ -1154,7 +1158,7 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
     fd = egl_get_fd_for_texture(tex_id, &stride, &fourcc, NULL);
 #elif defined(CONFIG_IOSURFACE)
     if (spice_iosurface_resize(ssd, backing_width, backing_height)) {
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
         ssd->tex_id = tex_id;
         ssd->y_0_top = y_0_top;
 #endif
@@ -1324,7 +1328,7 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
                           !y_0_top, false, ptr_x, ptr_y, 1.0, 1.0);
         glFlush();
     }
-#elif defined(CONFIG_ANGLE) && defined(CONFIG_IOSURFACE)
+#elif defined(CONFIG_EGL) && defined(CONFIG_IOSURFACE)
     GLuint tex_id = ssd->tex_id;
     y_0_top = ssd->y_0_top;
     spice_iosurface_blit(ssd, tex_id, !y_0_top);
@@ -1395,7 +1399,7 @@ static void qemu_spice_display_init_one(QemuConsole *con)
         ssd->iosurface = NULL;
         ssd->surface_send_fd = -1;
 #endif
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
         ssd->esurface = EGL_NO_SURFACE;
         ssd->tex_id = -1;
 #endif
@@ -1444,8 +1448,8 @@ void qemu_spice_display_early_init(void)
         }
 #if defined(CONFIG_GBM)
         egl_init(qemu_opt_get(opts, "rendernode"), DISPLAY_GL_MODE_ON, &error_fatal);
-#elif defined(CONFIG_ANGLE)
-        if (qemu_egl_init_dpy_angle(DISPLAY_GL_MODE_ES)) {
+#elif defined(CONFIG_EGL)
+        if (qemu_egl_init_dpy_cocoa(DISPLAY_GL_MODE_ES)) {
             error_report("SPICE GL failed to initialize ANGLE display");
             exit(1);
         }

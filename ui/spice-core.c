@@ -52,7 +52,7 @@ static int spice_have_target_host;
 
 static QemuThread me;
 
-#ifdef CONFIG_ANGLE
+#ifdef CONFIG_EGL
 extern EGLContext spice_gl_ctx;
 #endif
 

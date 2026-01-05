@@ -138,7 +138,7 @@ struct SimpleSpiceDisplay {
     IOSurfaceRef iosurface;
     int surface_send_fd;
 #endif
-#if defined(CONFIG_ANGLE)
+#if defined(CONFIG_EGL)
     EGLSurface esurface;
     egl_fb iosurface_fb;
     GLuint tex_id;
