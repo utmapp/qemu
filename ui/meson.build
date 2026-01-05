@@ -141,6 +141,9 @@ if spice.found()
   if iosurface.found()
     spice_core_ss.add(iosurface)
   endif
+  if quartzcore.found()
+    spice_core_ss.add(quartzcore)
+  endif
   ui_modules += {'spice-core' : spice_core_ss}
 
   if gio.found()

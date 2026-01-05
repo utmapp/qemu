@@ -141,9 +141,9 @@ struct SimpleSpiceDisplay {
 #if defined(CONFIG_EGL)
     EGLSurface esurface;
     egl_fb iosurface_fb;
+#endif
     GLuint tex_id;
     bool y_0_top;
-#endif
     bool render_cursor;
 
     egl_fb guest_fb;
@@ -166,8 +166,6 @@ struct SimpleSpiceCursor {
     QXLCommandExt ext;
     QXLCursor cursor;
 };
-
-extern bool spice_opengl;
 
 int qemu_spice_rect_is_empty(const QXLRect* r);
 void qemu_spice_rect_union(QXLRect *dest, const QXLRect *r);

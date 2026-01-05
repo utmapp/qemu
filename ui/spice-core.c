@@ -510,7 +510,7 @@ static QemuOptsList qemu_spice_opts = {
 #ifdef HAVE_SPICE_GL
         },{
             .name = "gl",
-            .type = QEMU_OPT_BOOL,
+            .type = QEMU_OPT_STRING,
         },{
             .name = "rendernode",
             .type = QEMU_OPT_STRING,

@@ -836,6 +836,7 @@ coref = []
 iokit = []
 iosurface = not_found
 pvg = not_found
+quartzcore = not_found
 emulator_link_args = []
 midl = not_found
 widl = not_found
@@ -860,6 +861,7 @@ elif host_os == 'darwin'
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
+  quartzcore = dependency('appleframeworks', modules: ['OpenGL', 'QuartzCore'], required: false)
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
