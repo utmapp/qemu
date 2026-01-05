@@ -817,26 +817,9 @@ static void AddIntegerValue(CFMutableDictionaryRef dictionary, const CFStringRef
     CFRelease(number);
 }
 
-static int spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height)
+static bool spice_iosurface_create_egl(SimpleSpiceDisplay *ssd, int width, int height,
+                                       IOSurfaceRef surface)
 {
-    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    AddIntegerValue(dict, kIOSurfaceWidth, width);
-    AddIntegerValue(dict, kIOSurfaceHeight, height);
-    AddIntegerValue(dict, kIOSurfacePixelFormat, 'BGRA');
-    AddIntegerValue(dict, kIOSurfaceBytesPerElement, 4);
-#if TARGET_OS_OSX
-    CFDictionaryAddValue(dict, kIOSurfaceIsGlobal, kCFBooleanTrue);
-#endif
-
-    ssd->iosurface = IOSurfaceCreate(dict);
-    CFRelease(dict);
-
-    if (!ssd->iosurface) {
-        error_report("spice_iosurface_create: IOSurfaceCreate failed");
-        return 0;
-    }
-
 #if defined(CONFIG_EGL)
     EGLint target = 0;
     GLenum tex_target = 0;
@@ -845,7 +828,7 @@ static int spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height
                            EGL_BIND_TO_TEXTURE_TARGET_ANGLE,
                            &target) != EGL_TRUE) {
         error_report("spice_iosurface_create: eglGetConfigAttrib failed");
-        goto gl_error;
+        return false;
     }
     if (target == EGL_TEXTURE_2D) {
         tex_target = GL_TEXTURE_2D;
@@ -853,7 +836,7 @@ static int spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height
         tex_target = GL_TEXTURE_RECTANGLE_ANGLE;
     } else {
         error_report("spice_iosurface_create: unsupported texture target");
-        goto gl_error;
+        return false;
     }
 
     const EGLint attribs[] = {
@@ -869,25 +852,63 @@ static int spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height
     };
     ssd->esurface = qemu_egl_init_buffer_surface(spice_gl_ctx,
                                                  EGL_IOSURFACE_ANGLE,
-                                                 ssd->iosurface,
+                                                 surface,
                                                  attribs);
 
     if (ssd->esurface == NULL) {
-        goto gl_error;
+        return false;
     }
 
     egl_fb_setup_new_tex_target(&ssd->iosurface_fb, width, height, tex_target);
 
     eglBindTexImage(qemu_egl_display, ssd->esurface, EGL_BACK_BUFFER);
 
-    return 1;
-gl_error:
-    CFRelease(ssd->iosurface);
-    ssd->iosurface = NULL;
-    return 0;
+    return true;
 #else
     error_report("spice_iosurface_create: ANGLE not found");
-    return 0;
+    return false;
+#endif
+}
+
+static bool spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height)
+{
+    IOSurfaceRef surface;
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    AddIntegerValue(dict, kIOSurfaceWidth, width);
+    AddIntegerValue(dict, kIOSurfaceHeight, height);
+    AddIntegerValue(dict, kIOSurfacePixelFormat, 'BGRA');
+    AddIntegerValue(dict, kIOSurfaceBytesPerElement, 4);
+#if TARGET_OS_OSX
+    CFDictionaryAddValue(dict, kIOSurfaceIsGlobal, kCFBooleanTrue);
+#endif
+
+    surface = IOSurfaceCreate(dict);
+    CFRelease(dict);
+
+    if (!surface) {
+        error_report("spice_iosurface_create: IOSurfaceCreate failed");
+        return false;
+    }
+
+    if (!spice_iosurface_create_egl(ssd, width, height, surface)) {
+        CFRelease(surface);
+        return false;
+    }
+
+    ssd->iosurface = surface;
+
+    return true;
+}
+
+static void spice_iosurface_destroy_egl(SimpleSpiceDisplay *ssd)
+{
+#if defined(CONFIG_EGL)
+    eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
+    eglReleaseTexImage(qemu_egl_display, ssd->esurface, EGL_BACK_BUFFER);
+    egl_fb_destroy(&ssd->iosurface_fb);
+    qemu_egl_destroy_surface(ssd->esurface);
+    ssd->esurface = EGL_NO_SURFACE;
 #endif
 }
 
@@ -896,13 +917,9 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
     if (!ssd->iosurface) {
         return;
     }
-#if defined(CONFIG_EGL)
-    eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
-    eglReleaseTexImage(qemu_egl_display, ssd->esurface, EGL_BACK_BUFFER);
-    egl_fb_destroy(&ssd->iosurface_fb);
-    qemu_egl_destroy_surface(ssd->esurface);
-    ssd->esurface = EGL_NO_SURFACE;
-#endif
+
+    spice_iosurface_destroy_egl(ssd);
+
     if (ssd->surface_send_fd > -1) {
         // this sends POLLHUP and indicates that any unread data is stale
         // and should not be used
@@ -914,7 +931,7 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
     ssd->iosurface = NULL;
 }
 
-static int spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height)
+static bool spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height)
 {
     if (ssd->iosurface) {
         if (IOSurfaceGetHeight(ssd->iosurface) != height ||
@@ -922,7 +939,7 @@ static int spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height
             spice_iosurface_destroy(ssd);
             return spice_iosurface_create(ssd, width, height);
         } else {
-            return 1;
+            return true;
         }
     } else {
         return spice_iosurface_create(ssd, width, height);
@@ -955,17 +972,24 @@ static int spice_iosurface_create_fd(SimpleSpiceDisplay *ssd, int *fourcc)
     return fds[0];
 }
 
+static void spice_iosurface_blit_egl(SimpleSpiceDisplay *ssd, GLuint src_texture,
+                                     bool flip)
+{
+#if defined(CONFIG_EGL)
+    egl_fb tmp_fb = { .texture = src_texture, .texture_target = GL_TEXTURE_2D };
+
+    eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
+    egl_texture_blit(ssd->gls, &ssd->iosurface_fb, &tmp_fb, flip);
+#endif
+}
+
 static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bool flip)
 {
-    egl_fb tmp_fb = { .texture = src_texture, .texture_target = GL_TEXTURE_2D };
     if (!ssd->iosurface) {
         return;
     }
 
-#if defined(CONFIG_EGL)
-    eglMakeCurrent(qemu_egl_display, ssd->esurface, ssd->esurface, spice_gl_ctx);
-    egl_texture_blit(ssd->gls, &ssd->iosurface_fb, &tmp_fb, flip);
-#endif
+    spice_iosurface_blit_egl(ssd, src_texture, flip);
 }
 
 #endif
