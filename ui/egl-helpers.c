@@ -584,11 +584,6 @@ static int qemu_egl_init_dpy(EGLNativeDisplayType dpy,
 
 #endif
 
-int qemu_egl_init_dpy_surfaceless(DisplayGLMode mode)
-{
-    return qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, EGL_PLATFORM_SURFACELESS_MESA, mode);
-}
-
 #if defined(CONFIG_X11) || defined(CONFIG_GBM)
 int qemu_egl_init_dpy_x11(EGLNativeDisplayType dpy, DisplayGLMode mode)
 {

@@ -19,10 +19,6 @@ typedef struct egl_dpy {
     uint32_t pos_y;
 } egl_dpy;
 
-#ifndef CONFIG_GBM
-static EGLContext ctx;
-#endif
-
 /* ------------------------------------------------------------------ */
 
 static void egl_refresh(DisplayChangeListener *dcl)
@@ -46,12 +42,8 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
 static QEMUGLContext egl_create_context(DisplayGLCtx *dgc,
                                         QEMUGLParams *params)
 {
-#ifdef CONFIG_GBM
     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    qemu_egl_rn_ctx);
-#else
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
-#endif
     return qemu_egl_create_context(dgc, params);
 }
 
@@ -221,20 +213,7 @@ static void early_egl_headless_init(DisplayOptions *opts)
         mode = opts->gl;
     }
 
-#ifdef CONFIG_GBM
     egl_init(opts->u.egl_headless.rendernode, mode, &error_fatal);
-#else
-    if (qemu_egl_init_dpy_surfaceless(mode)) {
-        error_report("egl: display init failed");
-        exit(1);
-    }
-
-    ctx = qemu_egl_init_ctx();
-    if (!ctx) {
-        error_report("egl: egl_init_ctx failed");
-        exit(1);
-    }
-#endif
 }
 
 static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)

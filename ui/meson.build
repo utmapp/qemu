@@ -69,7 +69,7 @@ endif
 if opengl.found()
   egl_headless_ss = ss.source_set()
   egl_headless_ss.add(when: [opengl, pixman],
-                      if_true: files('egl-headless.c'))
+                      if_true: [files('egl-headless.c'), gbm])
   ui_modules += {'egl-headless' : egl_headless_ss}
 endif
 

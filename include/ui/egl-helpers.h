@@ -68,8 +68,6 @@ EGLSurface qemu_egl_init_buffer_surface(EGLContext ectx, EGLenum buftype,
                                         EGLClientBuffer buffer, const EGLint *attrib_list);
 bool qemu_egl_destroy_surface(EGLSurface surface);
 
-int qemu_egl_init_dpy_surfaceless(DisplayGLMode mode);
-
 #if defined(CONFIG_X11) || defined(CONFIG_GBM)
 
 int qemu_egl_init_dpy_x11(EGLNativeDisplayType dpy, DisplayGLMode mode);
