@@ -939,6 +939,10 @@ static bool spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int heigh
 
     ssd->iosurface = surface;
 
+#if defined(CONFIG_METAL)
+    ssd->metal_context = qemu_spice_display_metal_create_context(surface, width, height);
+#endif
+
     return true;
 }
 
@@ -966,6 +970,13 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
     if (!ssd->iosurface) {
         return;
     }
+
+#if defined(CONFIG_METAL)
+    if (ssd->metal_context) {
+        qemu_spice_display_metal_destroy_context(ssd->metal_context);
+        ssd->metal_context = NULL;
+    }
+#endif
 
     if (spice_opengl == DISPLAY_GL_MODE_CORE) {
         spice_iosurface_destroy_cgl(ssd);
@@ -1059,6 +1070,52 @@ static void spice_iosurface_blit(SimpleSpiceDisplay *ssd, GLuint src_texture, bo
         spice_iosurface_blit_egl(ssd, src_texture, flip);
     }
 }
+
+#if defined(CONFIG_METAL)
+static void qemu_spice_gl_block(SimpleSpiceDisplay *ssd, bool block);
+
+static void spice_iosurface_blit_completion(void *data)
+{
+    QXLCookie *cookie = (QXLCookie *)data;
+
+    spice_qxl_gl_draw_async(cookie->u.gl_draw.qxl,
+                            cookie->u.gl_draw.x,
+                            cookie->u.gl_draw.y,
+                            cookie->u.gl_draw.w,
+                            cookie->u.gl_draw.h,
+                            (uintptr_t)cookie);
+}
+
+static bool spice_iosurface_blit_metal(SimpleSpiceDisplay *ssd,
+                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    SpiceDisplayMetalContext context = ssd->metal_context;
+    QXLCookie *cookie;
+
+    if (!ssd->iosurface || !context) {
+        return false;
+    }
+
+    if (!qemu_spice_display_metal_has_scanout(context)) {
+        return false;
+    }
+
+    cookie = qxl_cookie_new(QXL_COOKIE_TYPE_GL_DRAW_DONE, 0);
+    cookie->u.gl_draw.qxl = &ssd->qxl;
+    cookie->u.gl_draw.x = x;
+    cookie->u.gl_draw.y = y;
+    cookie->u.gl_draw.w = w;
+    cookie->u.gl_draw.h = h;
+
+    qemu_spice_gl_block(ssd, true);
+    qemu_spice_display_metal_draw_frame(context,
+                                        x, y, w, h,
+                                        spice_iosurface_blit_completion,
+                                        cookie);
+
+    return true;
+}
+#endif
 
 #endif
 
@@ -1215,6 +1272,11 @@ static void spice_gl_switch(DisplayChangeListener *dcl,
             return;
         }
 #elif defined(CONFIG_IOSURFACE)
+#if defined(CONFIG_METAL)
+        if (ssd->metal_context) {
+            qemu_spice_display_metal_scanout_disable(ssd->metal_context);
+        }
+#endif
         if (spice_iosurface_resize(ssd, width, height)) {
             fd = spice_iosurface_create_fd(ssd, &fourcc);
             if (fd < 0) {
@@ -1252,6 +1314,8 @@ static QEMUGLContext qemu_spice_gl_create_context(DisplayGLCtx *dgc,
     if (spice_opengl == DISPLAY_GL_MODE_CORE) {
 #if defined(HAVE_SPICE_MAC_CGL)
         return spice_cgl_create_context(spice_gl_ctx);
+#else
+        return NULL;
 #endif
     } else {
 #if defined(CONFIG_GBM)
@@ -1282,6 +1346,8 @@ static int qemu_spice_gl_make_context_current(DisplayGLCtx *dgc,
     if (spice_opengl == DISPLAY_GL_MODE_CORE) {
 #if defined(HAVE_SPICE_MAC_CGL)
         return spice_cgl_make_context_current(ctx);
+#else
+        return -1;
 #endif
     } else {
         return qemu_egl_make_context_current(dgc, ctx);
@@ -1298,6 +1364,11 @@ static void qemu_spice_gl_scanout_disable(DisplayChangeListener *dcl)
     ssd->have_surface = false;
     ssd->have_scanout = false;
 #if defined(CONFIG_IOSURFACE)
+#if defined(CONFIG_METAL)
+    if (ssd->metal_context) {
+        qemu_spice_display_metal_scanout_disable(ssd->metal_context);
+    }
+#endif
     spice_iosurface_destroy(ssd);
 #endif
     ssd->tex_id = -1;
@@ -1326,6 +1397,15 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
     } else {
         fd = -1;
     }
+#if defined(CONFIG_METAL)
+    if (ssd->metal_context && native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL) {
+        qemu_spice_display_metal_scanout_texture(ssd->metal_context,
+                                                 native.handle,
+                                                 x, y, w, h);
+    } else if (ssd->metal_context) {
+        qemu_spice_display_metal_scanout_disable(ssd->metal_context);
+    }
+#endif
 #endif
     if (fd < 0) {
         fprintf(stderr, "%s: failed to get fd for texture\n", __func__);
@@ -1491,8 +1571,12 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
 #elif defined(CONFIG_IOSURFACE)
     GLuint tex_id = ssd->tex_id;
     y_0_top = ssd->y_0_top;
+#if defined(CONFIG_METAL)
+    if (spice_iosurface_blit_metal(ssd, x, y, w, h)) {
+        return;
+    }
+#endif
     spice_iosurface_blit(ssd, tex_id, !y_0_top);
-    //TODO: cursor stuff
 #endif
 
     trace_qemu_spice_gl_update(ssd->qxl.id, w, h, x, y);

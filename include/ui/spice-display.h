@@ -77,6 +77,13 @@ typedef struct QXLCookie {
             QXLRect area;
             int redraw;
         } render;
+        struct {
+            QXLInstance *qxl;
+            uint32_t x;
+            uint32_t y;
+            uint32_t w;
+            uint32_t h;
+        } gl_draw;
         void *data;
     } u;
 } QXLCookie;
@@ -86,6 +93,7 @@ QXLCookie *qxl_cookie_new(int type, uint64_t io);
 typedef struct SimpleSpiceDisplay SimpleSpiceDisplay;
 typedef struct SimpleSpiceUpdate SimpleSpiceUpdate;
 typedef struct SimpleSpiceCursor SimpleSpiceCursor;
+typedef void *SpiceDisplayMetalContext;
 
 struct SimpleSpiceDisplay {
     DisplaySurface *ds;
@@ -137,6 +145,9 @@ struct SimpleSpiceDisplay {
 #if defined(CONFIG_IOSURFACE)
     IOSurfaceRef iosurface;
     int surface_send_fd;
+#if defined(CONFIG_METAL)
+    SpiceDisplayMetalContext metal_context;
+#endif
 #endif
 #if defined(CONFIG_EGL)
     EGLSurface esurface;
@@ -196,5 +207,24 @@ void qemu_spice_wakeup(SimpleSpiceDisplay *ssd);
 void qemu_spice_display_start(void);
 void qemu_spice_display_stop(void);
 int qemu_spice_display_is_running(SimpleSpiceDisplay *ssd);
+
+#if defined(CONFIG_METAL) && defined(CONFIG_IOSURFACE)
+typedef void *MTLTexture_id;
+typedef void (*SpiceDisplayMetalCompletion)(void *data);
+
+SpiceDisplayMetalContext qemu_spice_display_metal_create_context(IOSurfaceRef surface,
+                                                                 uint32_t width,
+                                                                 uint32_t height);
+void qemu_spice_display_metal_destroy_context(SpiceDisplayMetalContext ctx);
+void qemu_spice_display_metal_scanout_texture(SpiceDisplayMetalContext ctx,
+                                              MTLTexture_id tex, uint32_t x, uint32_t y,
+                                              uint32_t w, uint32_t h);
+void qemu_spice_display_metal_scanout_disable(SpiceDisplayMetalContext ctx);
+bool qemu_spice_display_metal_has_scanout(SpiceDisplayMetalContext ctx);
+void qemu_spice_display_metal_draw_frame(SpiceDisplayMetalContext ctx,
+                                         uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                         SpiceDisplayMetalCompletion completion,
+                                         void *data);
+#endif
 
 #endif

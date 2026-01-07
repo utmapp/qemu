@@ -533,7 +533,32 @@ int qemu_egl_init_dpy_cocoa(DisplayGLMode mode)
         return -1;
     }
 
-    return qemu_egl_init_dpy(dpy, mode);
+    if (qemu_egl_init_dpy(dpy, mode) < 0) {
+        return -1;
+    }
+
+#ifdef EGL_METAL_DEVICE_ANGLE
+    if (epoxy_has_egl_extension(qemu_egl_display, "EGL_EXT_device_query")) {
+        EGLDeviceEXT device;
+        void *metal_device;
+
+        if (!eglQueryDisplayAttribEXT(qemu_egl_display,
+                                      EGL_DEVICE_EXT,
+                                      (EGLAttrib *)&device)) {
+            return 0;
+        }
+
+        if (!eglQueryDeviceAttribEXT(device,
+                                     EGL_METAL_DEVICE_ANGLE,
+                                     (EGLAttrib *)&metal_device)) {
+            return 0;
+        }
+
+        qemu_egl_angle_native_device = metal_device;
+    }
+#endif
+
+    return 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -625,7 +650,7 @@ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode)
         mode = DISPLAY_GL_MODE_ES;
     }
 
-    if (qemu_egl_init_dpy(dpy, 0, mode) < 0) {
+    if (qemu_egl_init_dpy(dpy, mode) < 0) {
         return -1;
     }
 
