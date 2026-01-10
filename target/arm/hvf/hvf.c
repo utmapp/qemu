@@ -24,6 +24,7 @@
 #include "cpregs.h"
 
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 
 #include "exec/address-spaces.h"
 #include "hw/boards.h"
@@ -977,41 +978,53 @@ static hv_return_t hvf_vcpu_set_actlr(hv_vcpu_t vcpu, uint64_t value)
 #endif
 }
 
-#if !defined(CONFIG_HVF_PRIVATE)
-
 uint32_t hvf_arm_get_default_ipa_bit_size(void)
 {
+#if TARGET_OS_OSX
     if (__builtin_available(macOS 13.0, *)) {
         uint32_t default_ipa_size;
         hv_return_t ret = hv_vm_config_get_default_ipa_size(&default_ipa_size);
         assert_hvf_ok(ret);
 
         return default_ipa_size;
-    } else {
-        return 0;
     }
+#endif
+    return 0;
 }
 
 uint32_t hvf_arm_get_max_ipa_bit_size(void)
 {
+    uint64_t ipa_size_4k, ipa_size_16k;
+    size_t length;
+    uint32_t max_ipa_size = 0;
+
+#if TARGET_OS_OSX
     if (__builtin_available(macOS 13.0, *)) {
-        uint32_t max_ipa_size;
         hv_return_t ret = hv_vm_config_get_max_ipa_size(&max_ipa_size);
         assert_hvf_ok(ret);
-
-        /*
-         * We clamp any IPA size we want to back the VM with to a valid PARange
-         * value so the guest doesn't try and map memory outside of the valid
-         * range. This logic just clamps the passed in IPA bit size to the first
-         * valid PARange value <= to it.
-         */
-        return round_down_to_parange_bit_size(max_ipa_size);
-    } else {
-        return 0;
     }
-}
-
 #endif
+
+    if (!max_ipa_size) {
+        length = sizeof(uint64_t);
+        if (sysctlbyname("kern.hv.ipa_size_16k", &ipa_size_16k, &length, NULL, 0)) {
+            ipa_size_16k = 0;
+        }
+        length = sizeof(uint64_t);
+        if (sysctlbyname("kern.hv.ipa_size_4k", &ipa_size_4k, &length, NULL, 0)) {
+            ipa_size_4k = 0;
+        }
+        max_ipa_size = MIN(ctz64(ipa_size_16k), ctz64(ipa_size_4k));
+    }
+
+    /*
+     * We clamp any IPA size we want to back the VM with to a valid PARange
+     * value so the guest doesn't try and map memory outside of the valid
+     * range. This logic just clamps the passed in IPA bit size to the first
+     * valid PARange value <= to it.
+     */
+    return round_down_to_parange_bit_size(max_ipa_size);
+}
 
 void hvf_arm_set_cpu_features_from_host(ARMCPU *cpu)
 {
@@ -1075,27 +1088,54 @@ static hv_return_t hvf_set_ipa_granule(hv_vm_config_t config,
     return HV_SUCCESS;
 }
 
+static hv_return_t hvf_set_ipa_size(hv_vm_config_t config, uint32_t pa_range)
+{
+    static hv_return_t (*set_ipa_size)(hv_vm_config_t, uint64_t);
+    hv_return_t ret;
+
+#if TARGET_OS_OSX
+    if (__builtin_available(macOS 13.0, *)) {
+        ret = hv_vm_config_set_ipa_size(config, pa_range);
+        if (ret == HV_SUCCESS) {
+            chosen_ipa_bit_size = pa_range;
+        }
+        return ret;
+    }
+#endif
+
+    /* older macOS need to use a private API */
+    if (!set_ipa_size) {
+        set_ipa_size = dlsym(RTLD_NEXT, "_hv_vm_config_set_ipa_size");
+    }
+    if (set_ipa_size) {
+        ret = set_ipa_size(config, 1ULL << pa_range);
+        if (ret == HV_SUCCESS) {
+            chosen_ipa_bit_size = pa_range;
+        }
+        return ret;
+    } else if (!pa_range) {
+        return HV_SUCCESS;
+    }
+
+    return HV_UNSUPPORTED;
+}
+
 hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
                                uint32_t ipa_granule_size)
 {
     hv_return_t ret;
-    hv_vm_config_t config = NULL;
+    hv_vm_config_t config = hv_vm_config_create();
 
 #if defined(CONFIG_HVF_PRIVATE)
     if (hvf_tso_mode) {
-        config = hv_vm_config_create();
         _hv_vm_config_set_isa(config, HV_VM_CONFIG_ISA_PRIVATE);
     }
-#else
-    if (__builtin_available(macOS 13.0, *)) {
-        config = hv_vm_config_create();
-        ret = hv_vm_config_set_ipa_size(config, pa_range);
-        if (ret != HV_SUCCESS) {
-            goto cleanup;
-        }
-        chosen_ipa_bit_size = pa_range;
-    }
 #endif
+    
+    ret = hvf_set_ipa_size(config, pa_range);
+    if (ret != HV_SUCCESS) {
+        goto cleanup;
+    }
 
     if (ipa_granule_size) {
         ret = hvf_set_ipa_granule(config, ipa_granule_size);
@@ -1107,9 +1147,7 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
     ret = hv_vm_create(config);
 
 cleanup:
-    if (config) {
-        os_release(config);
-    }
+    os_release(config);
 
     return ret;
 }
