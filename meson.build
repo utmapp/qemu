@@ -2600,6 +2600,8 @@ if virgl.found()
                         cc.has_header_symbol('virglrenderer.h',
                                             'VIRGL_RENDERER_NEPTUNE',
                                             dependencies: virgl))
+  config_host_data.set('VIRGL_VERSION_MINOR', virgl.version().split('.')[1])
+  config_host_data.set('VIRGL_VERSION_MICRO', virgl.version().split('.')[2])
 endif
 config_host_data.set('CONFIG_VIRTFS', have_virtfs)
 config_host_data.set('CONFIG_VTE', vte.found())
