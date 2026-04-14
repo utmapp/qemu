@@ -2590,6 +2590,10 @@ if virgl.found()
                                         prefix: '#include <virglrenderer.h>',
                                         dependencies: virgl))
   config_host_data.set('VIRGL_VERSION_MAJOR', virgl.version().split('.')[0])
+  config_host_data.set('HAVE_VIRGL_RENDERER_NEPTUNE',
+                        cc.has_header_symbol('virglrenderer.h',
+                                            'VIRGL_RENDERER_NEPTUNE',
+                                            dependencies: virgl))
 endif
 config_host_data.set('CONFIG_VIRTFS', have_virtfs)
 config_host_data.set('CONFIG_VTE', vte.found())

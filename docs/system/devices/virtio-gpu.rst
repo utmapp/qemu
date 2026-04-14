@@ -82,6 +82,13 @@ of virtio-gpu host memory window. This is typically between 256M and 8G.
 
 .. _venus: https://gitlab.freedesktop.org/virgl/venus-protocol/
 
+Translation via the Neptune protocol is also supported when available in
+`virglrenderer`_. Like Venus, Neptune requires host blob support (``hostmem``
+and ``blob`` fields) and should be enabled using the ``neptune`` field.
+
+.. parsed-literal::
+    -device virtio-gpu-gl,hostmem=8G,blob=true,neptune=true
+
 virtio-gpu rutabaga
 -------------------
 

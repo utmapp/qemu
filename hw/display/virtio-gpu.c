@@ -1476,6 +1476,10 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
     if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
 #ifdef CONFIG_METAL
         have_ext_memory = virtio_gpu_venus_enabled(g->parent_obj.conf);
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        have_ext_memory = have_ext_memory ||
+            virtio_gpu_neptune_enabled(g->parent_obj.conf);
+#endif
 #else
         have_ext_memory = virtio_gpu_have_udmabuf();
 #endif
@@ -1508,6 +1512,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
         error_setg(errp, "old virglrenderer, venus unsupported");
         return;
     #endif
+#endif
+    }
+
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
+            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
+            error_setg(errp, "neptune requires enabled blob and hostmem options");
+            return;
+        }
+#else
+        error_setg(errp, "virglrenderer does not support neptune");
+        return;
 #endif
     }
 

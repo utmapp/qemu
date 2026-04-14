@@ -70,6 +70,8 @@ class Aarch64VirtGPUMachine(LinuxKernelTest):
                 self.skipTest("No blob support for virtio-gpu")
             elif "old virglrenderer, venus unsupported" in excp.output:
                 self.skipTest("No venus support for virtio-gpu")
+            elif "virglrenderer does not support neptune" in excp.output:
+                self.skipTest("No neptune support for virtio-gpu")
             elif "egl: no drm render node available" in excp.output:
                 self.skipTest("Can't access host DRM render node")
             elif "'type' does not accept value 'egl-headless'" in excp.output:
