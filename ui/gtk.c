@@ -771,8 +771,24 @@ static void gd_resize_event(GtkGLArea *area,
                             gint width, gint height, gpointer *opaque)
 {
     VirtualConsole *vc = (void *)opaque;
+    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(area));
+    int gs = window ? gdk_window_get_scale_factor(window) : 1;
+    double pw = width, ph = height;
 
-    gd_set_ui_size(vc, width, height);
+    /*
+     * GtkGLArea reports `width`/`height` in device pixels. The guest UI
+     * info expects buffer-coordinate dimensions, so undo the global scale
+     * factor and (in fixed-scale mode) the user zoom. Without this, the
+     * guest renders at gs× resolution while the input handler maps from
+     * the logical widget size, confining the pointer to the first 1/gs of
+     * the surface.
+     */
+    if (!vc->s->free_scale && !vc->s->full_screen) {
+        pw /= vc->gfx.scale_x;
+        ph /= vc->gfx.scale_y;
+    }
+
+    gd_set_ui_size(vc, pw / gs, ph / gs);
 }
 
 #endif
