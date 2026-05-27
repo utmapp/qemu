@@ -1047,8 +1047,13 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
         /* process command */
         vgc->process_cmd(g, cmd);
 
-        /* command suspended */
-        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+        /*
+         * A suspended command has not registered its fence (if any) yet
+         * and must be re-processed at the cmdq head after resume, so it
+         * must not be moved to fenceq like a normal in-flight fence.
+         */
+        if (cmd->suspended ||
+            (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE))) {
             trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
             break;
         }
@@ -1112,6 +1117,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->vq = vq;
         cmd->error = 0;
         cmd->finished = false;
+        cmd->suspended = false;
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
