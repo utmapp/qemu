@@ -196,6 +196,7 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, void *data)
     vgc->handle_ctrl = virtio_gpu_gl_handle_ctrl;
     vgc->process_cmd = virtio_gpu_virgl_process_cmd;
     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
+    vgc->resource_destroy = virtio_gpu_virgl_resource_destroy;
 
     vdc->realize = virtio_gpu_gl_device_realize;
     vdc->unrealize = virtio_gpu_gl_device_unrealize;

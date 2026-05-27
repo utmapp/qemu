@@ -214,7 +214,75 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
 
     return 0;
 }
+
+static void
+virtio_gpu_virgl_destroy_hostmem_region(VirtIOGPU *g,
+                                        struct virtio_gpu_virgl_resource *res)
+{
+    struct virtio_gpu_virgl_hostmem_region *vmr = to_hostmem_region(res->mr);
+    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
+
+    /*
+     * vmr is not QOM-owned, so object_finalize() does not free it; the unmap
+     * step 3 normally does. Reset can run here at any stage of an in-flight
+     * unmap, where step 3 may not run. This and the finalizer both hold the
+     * BQL, so free vmr or hand it to object_finalize() per the stage.
+     */
+    if (vmr->finish_unmapping) {
+        /* Finalizer ran and balanced renderer_blocked; just free vmr. */
+        res->mr = NULL;
+        g_free(vmr);
+        virgl_renderer_resource_unmap(res->base.resource_id);
+        return;
+    }
+
+    if (res->mr->container != &b->hostmem) {
+        /* Async unmap detached the subregion; let the finalizer free vmr. */
+        OBJECT(vmr)->free = g_free;
+        res->mr = NULL;
+        return;
+    }
+
+    /* No unmap in flight; tear down here and neutralize the finalizer. */
+    OBJECT(vmr)->free = g_free;
+    vmr->g = NULL;
+    memory_region_set_enabled(res->mr, false);
+    memory_region_del_subregion(&b->hostmem, res->mr);
+    object_unparent(OBJECT(vmr));
+    res->mr = NULL;
+
+    virgl_renderer_resource_unmap(res->base.resource_id);
+}
 #endif
+
+void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
+                                       struct virtio_gpu_simple_resource *res,
+                                       Error **errp)
+{
+    struct virtio_gpu_virgl_resource *vres =
+        container_of(res, struct virtio_gpu_virgl_resource, base);
+    struct iovec *res_iovs = NULL;
+    int num_iovs = 0;
+
+#if VIRGL_VERSION_MAJOR >= 1
+    if (vres->mr) {
+        virtio_gpu_virgl_destroy_hostmem_region(g, vres);
+    }
+#endif
+
+    virgl_renderer_resource_detach_iov(res->resource_id, &res_iovs, &num_iovs);
+    if (res_iovs && num_iovs) {
+        virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
+    }
+    /* The detached iov is the same allocation virgl took at attach time;
+     * clear res->iov so the base destroy does not free it again. */
+    res->iov = NULL;
+    res->iov_cnt = 0;
+
+    virgl_renderer_resource_unref(res->resource_id);
+
+    virtio_gpu_resource_destroy(g, res, errp);
+}
 
 static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
                                          struct virtio_gpu_ctrl_command *cmd)
