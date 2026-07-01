@@ -354,7 +354,7 @@ virgl_cmd_set_scanout(VuGpu *g,
                       struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_set_scanout ss;
-    struct virgl_renderer_texture_info info;
+    struct virgl_renderer_resource_info info;
     int ret;
 
     VUGPU_FILL_CMD(ss);
