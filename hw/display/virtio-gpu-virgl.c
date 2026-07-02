@@ -999,8 +999,14 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         return;
     }
 
+    /* The scanout rect sizes the displaysurface (virtio_gpu_update_dmabuf
+     * resizes the console to r.width x r.height, and a zero-area surface
+     * aborts in qemu_memfd_alloc), so bound the rect exactly like
+     * virtio_gpu_do_set_scanout does for non-blob scanouts. */
     if (ss.width < 16 ||
         ss.height < 16 ||
+        ss.r.width < 16 ||
+        ss.r.height < 16 ||
         ss.r.x + ss.r.width > ss.width ||
         ss.r.y + ss.r.height > ss.height) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout %d bounds for"
