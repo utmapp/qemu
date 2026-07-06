@@ -1340,17 +1340,13 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_VENUS;
-#ifndef CONFIG_METAL /* Metal does not support render server */
         flags |= VIRGL_RENDERER_RENDER_SERVER;
-#endif
     }
 #endif
 #ifdef VIRGL_RENDERER_NEPTUNE
     if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_NEPTUNE;
-#ifndef CONFIG_METAL
         flags |= VIRGL_RENDERER_RENDER_SERVER;
-#endif
     }
 #endif
 
