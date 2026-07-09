@@ -383,6 +383,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         } else {
             _glLayer = [[CALayer alloc] init];
         }
+        /*
+         * Unlike a backing layer, a sublayer does not track the view's
+         * geometry. The frame must be non-zero before the EGL window
+         * surface is created on this layer, and is kept in sync with the
+         * view in updateScale until a GL scanout takes ownership of it
+         * (cocoa_gl_scanout_texture).
+         */
+        _glLayer.frame = self.bounds;
 #endif
         _cursorLayer = [[CALayer alloc] init];
         [_cursorLayer setAnchorPoint:CGPointMake(0, 1)];
@@ -670,6 +678,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     if (display_opengl) {
 #ifdef CONFIG_OPENGL
+        if (self.scanout != QemuCocoaViewScanoutGL) {
+            [self.glLayer setFrame:[self.layer bounds]];
+        }
         [self.glLayer setContentsScale:[[self window] backingScaleFactor]];
 #ifdef USE_METAL
         [self.metalLayer setContentsScale:[[self window] backingScaleFactor]];
@@ -1292,6 +1303,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 #endif
         switch (scanout) {
 #ifdef CONFIG_OPENGL
+            case QemuCocoaViewScanoutNone:
+                /* in GL mode, 2D surface content is presented via glLayer */
+                self.glLayer.frame = self.layer.bounds;
+                [self.layer addSublayer:self.glLayer];
+                break;
             case QemuCocoaViewScanoutGL: [self.layer addSublayer:self.glLayer]; break;
 #endif
 #ifdef USE_METAL
@@ -2367,7 +2383,8 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
 #endif
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[cocoaView layer] setNeedsDisplay];
+            /* the CGL drawable is glLayer, not the view's backing layer */
+            [cocoaView.glLayer setNeedsDisplay];
         });
     }
 }
