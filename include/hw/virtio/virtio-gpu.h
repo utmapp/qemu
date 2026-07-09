@@ -180,6 +180,15 @@ struct VirtIOGPUBaseClass {
 typedef struct VGPUDMABuf {
     QemuDmaBuf *buf;
     uint32_t scanout_id;
+    /* Source identity of the scanout request that created this dmabuf, so a
+     * re-present of the SAME underlying buffer -- including a flip chain
+     * alternating between a small set of buffers -- can switch scanout
+     * without a costly EGL/GL re-import (which churns/hangs the display
+     * thread). */
+    int src_fd;
+    uint32_t src_res_id;
+    uint32_t src_w, src_h, src_x, src_y;
+    uint32_t fb_w, fb_h, fb_stride, fb_format;
     QTAILQ_ENTRY(VGPUDMABuf) next;
 } VGPUDMABuf;
 

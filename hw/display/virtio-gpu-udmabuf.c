@@ -187,9 +187,36 @@ static VGPUDMABuf
                                   qemu_pixman_to_drm_format(fb->format),
                                   0, res->dmabuf_fd, true, false);
     dmabuf->scanout_id = scanout_id;
+    /* Remember the request identity so a later identical present can reuse
+     * this dmabuf + its EGL import instead of re-creating it. */
+    dmabuf->src_fd     = res->dmabuf_fd;
+    dmabuf->src_res_id = res->resource_id;
+    dmabuf->src_w      = r->width;
+    dmabuf->src_h      = r->height;
+    dmabuf->src_x      = r->x;
+    dmabuf->src_y      = r->y;
+    dmabuf->fb_w       = fb->width;
+    dmabuf->fb_h       = fb->height;
+    dmabuf->fb_stride  = fb->stride;
+    dmabuf->fb_format  = fb->format;
     QTAILQ_INSERT_HEAD(&g->dmabuf.bufs, dmabuf, next);
 
     return dmabuf;
+}
+
+static bool virtio_gpu_dmabuf_matches(const VGPUDMABuf *d,
+                                      uint32_t scanout_id,
+                                      const struct virtio_gpu_simple_resource *res,
+                                      const struct virtio_gpu_framebuffer *fb,
+                                      const struct virtio_gpu_rect *r)
+{
+    return d->scanout_id == scanout_id &&
+           d->src_fd == res->dmabuf_fd &&
+           d->src_res_id == res->resource_id &&
+           d->src_w == r->width && d->src_h == r->height &&
+           d->src_x == r->x && d->src_y == r->y &&
+           d->fb_w == fb->width && d->fb_h == fb->height &&
+           d->fb_stride == fb->stride && d->fb_format == fb->format;
 }
 
 int virtio_gpu_update_dmabuf(VirtIOGPU *g,
@@ -199,27 +226,43 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
                              struct virtio_gpu_rect *r)
 {
     struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
-    VGPUDMABuf *new_primary, *old_primary = NULL;
+    VGPUDMABuf *primary = g->dmabuf.primary[scanout_id];
+    VGPUDMABuf *new_primary;
     uint32_t width, height;
 
+    /* Identical re-present of the displayed buffer: only refresh content.
+     * The flip-model guest re-presents at ~60 Hz; re-importing every time
+     * churns GL state on the display thread and hangs the UI. */
+    if (primary && virtio_gpu_dmabuf_matches(primary, scanout_id, res, fb, r)) {
+        return 0;
+    }
+
+    /* A different buffer (flip chain) or new geometry: import fresh.  The
+     * import must be fresh per switch -- a cached EGL import sampled while
+     * the guest GPU re-renders that buffer draws torn/stale content under
+     * present storms (cursor movement).  The historically expensive part
+     * of this path was the unconditional console resize, not the import;
+     * only resize when the dimensions actually change. */
     new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r);
     if (!new_primary) {
         return -EINVAL;
     }
 
-    if (g->dmabuf.primary[scanout_id]) {
-        old_primary = g->dmabuf.primary[scanout_id];
-    }
-
     width = qemu_dmabuf_get_width(new_primary->buf);
     height = qemu_dmabuf_get_height(new_primary->buf);
+
     g->dmabuf.primary[scanout_id] = new_primary;
-    qemu_console_resize(scanout->con, width, height);
+    if (!primary ||
+        qemu_dmabuf_get_width(primary->buf) != width ||
+        qemu_dmabuf_get_height(primary->buf) != height) {
+        qemu_console_resize(scanout->con, width, height);
+    }
     dpy_gl_scanout_dmabuf(scanout->con, new_primary->buf);
 
-    if (old_primary) {
-        virtio_gpu_free_dmabuf(g, old_primary);
+    if (primary) {
+        virtio_gpu_free_dmabuf(g, primary);
     }
 
     return 0;
 }
+
