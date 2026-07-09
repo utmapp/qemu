@@ -580,12 +580,41 @@ static bool gd_has_dmabuf(DisplayChangeListener *dcl)
     return vc->gfx.has_dmabuf;
 }
 
+/*
+ * Cancel a dmabuf's in-flight render fence: unregister the fd handler,
+ * close the fd, and release the gl block held for it.
+ *
+ * Without this, releasing or re-fencing a dmabuf whose fence has not yet
+ * signalled leaks the registered fd handler.  A sync-file fd stays
+ * readable forever once signalled, so the leaked handler turns into an
+ * always-ready priority-0 source: the main loop spins on it (one core
+ * pegged), GTK's redraw/resize idles (lower priority) are starved forever
+ * -- a frozen, unresponsive window -- while socket I/O at the same
+ * priority (SSH, QMP) keeps working.  The stray gd_hw_gl_flushed calls it
+ * makes also close *newer* pending fences early, unblocking the virtio-gpu
+ * cmdq while a draw is still consuming the previous scanout state, which
+ * shows up as scaled/flipped frame artifacts.  Triggered readily by a
+ * flip-model guest switching scanout buffers while a fence is in flight.
+ */
+void gd_dmabuf_cancel_fence(VirtualConsole *vc, QemuDmaBuf *dmabuf)
+{
+    int fence_fd = qemu_dmabuf_get_fence_fd(dmabuf);
+
+    if (fence_fd >= 0) {
+        qemu_set_fd_handler(fence_fd, NULL, NULL, NULL);
+        close(fence_fd);
+        qemu_dmabuf_set_fence_fd(dmabuf, -1);
+        graphic_hw_gl_block(vc->gfx.dcl.con, false);
+    }
+}
+
 static void gd_gl_release_dmabuf(DisplayChangeListener *dcl,
                                  QemuDmaBuf *dmabuf)
 {
 #ifdef CONFIG_GBM
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+    gd_dmabuf_cancel_fence(vc, dmabuf);
     egl_dmabuf_release_texture(dmabuf);
     if (vc->gfx.guest_fb.dmabuf == dmabuf) {
         vc->gfx.guest_fb.dmabuf = NULL;
@@ -598,6 +627,12 @@ void gd_hw_gl_flushed(void *vcon)
     VirtualConsole *vc = vcon;
     QemuDmaBuf *dmabuf = vc->gfx.guest_fb.dmabuf;
     int fence_fd;
+
+    /* No pending fence on the current dmabuf: the firing fd belongs to a
+     * replaced/freed dmabuf (a leaked handler). Ignore it. */
+    if (!dmabuf || qemu_dmabuf_get_fence_fd(dmabuf) < 0) {
+        return;
+    }
 
     fence_fd = qemu_dmabuf_get_fence_fd(dmabuf);
     if (fence_fd >= 0) {

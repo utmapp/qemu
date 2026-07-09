@@ -157,6 +157,7 @@ extern bool gtk_use_gl_area;
 void gd_update_windowsize(VirtualConsole *vc);
 void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
 void gd_hw_gl_flushed(void *vc);
+void gd_dmabuf_cancel_fence(VirtualConsole *vc, QemuDmaBuf *dmabuf);
 
 /* ui/gtk-egl.c */
 void gd_egl_init(VirtualConsole *vc);
