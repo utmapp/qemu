@@ -1161,10 +1161,27 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
     trace_virtio_gpu_fence_ctrl(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
 #if VIRGL_VERSION_MAJOR >= 1
     if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
-        virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id,
+        int ret = virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id,
                                             VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
                                             cmd->cmd_hdr.ring_idx,
                                             cmd->cmd_hdr.fence_id);
+        if (ret) {
+            /*
+             * The renderer context is gone (e.g. its render-server
+             * worker died mid-teardown): this fence can never retire
+             * through the timeline.  Complete it now — the cmd is not
+             * yet on fenceq, so responding here both signals the fence
+             * to the guest and keeps it off the queue.  Leaving it
+             * pending wedges the guest's GPU scheduler (VIDEO_TDR_
+             * FAILURE bugcheck on Windows).
+             */
+            fprintf(stderr,
+                    "%s: create_fence failed (%d) for dead ctx %u; "
+                    "retiring fence %" PRIu64 " immediately\n",
+                    __func__, ret, cmd->cmd_hdr.ctx_id,
+                    (uint64_t)cmd->cmd_hdr.fence_id);
+            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+        }
         return;
     }
 #endif
