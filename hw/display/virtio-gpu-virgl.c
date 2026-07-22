@@ -1317,7 +1317,17 @@ static void virtio_gpu_fence_poll(void *opaque)
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        /*
+         * On the render-server path virgl_renderer_poll() is the only place a
+         * retired renderer fence is discovered: virgl_renderer_get_poll_fd()
+         * is vrend-only and VIRGL_RENDERER_ASYNC_FENCE_CB is not enabled, so
+         * nothing wakes QEMU when a fence signals.  This period is therefore a
+         * hard floor under every guest operation that blocks on a fence, so
+         * keep it at the millisecond-timer granularity.  The timer only
+         * re-arms while cmdq/fenceq are non-empty, so it costs nothing at
+         * idle.
+         */
+        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
     }
 }
 
