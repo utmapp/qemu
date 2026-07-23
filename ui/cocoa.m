@@ -1330,10 +1330,24 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     if (metalTexture) {
         CGFloat scale = self.window.backingScaleFactor;
-        self.metalLayer.contentsScale = scale;
-        self.metalLayer.pixelFormat = metalTexture.pixelFormat;
-        self.metalLayer.frame = CGRectMake(0, 0, size.width / scale, size.height / scale);
-        self.metalLayer.drawableSize = CGSizeMake(size.width, size.height);
+        CGRect frame = CGRectMake(0, 0, size.width / scale, size.height / scale);
+        CGSize drawableSize = CGSizeMake(size.width, size.height);
+        /*
+         * A guest may re-emit SET_SCANOUT_BLOB for every scanned-out frame, so
+         * this method can run at frame rate.  Assigning drawableSize or
+         * pixelFormat discards the layer's drawable pool, which starves
+         * nextDrawable in drawFrame, so only touch the layer when a parameter
+         * actually changed.
+         */
+        if (self.metalLayer.contentsScale != scale ||
+            self.metalLayer.pixelFormat != metalTexture.pixelFormat ||
+            !CGRectEqualToRect(self.metalLayer.frame, frame) ||
+            !CGSizeEqualToSize(self.metalLayer.drawableSize, drawableSize)) {
+            self.metalLayer.contentsScale = scale;
+            self.metalLayer.pixelFormat = metalTexture.pixelFormat;
+            self.metalLayer.frame = frame;
+            self.metalLayer.drawableSize = drawableSize;
+        }
         self.scanout = QemuCocoaViewScanoutMetal;
     }
 }
