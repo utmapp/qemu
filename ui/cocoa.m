@@ -1360,6 +1360,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
         id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
         if (!drawable) {
+            /*
+             * The refresh that dispatched us already consumed gl_dirty, so
+             * re-arm it to retry on the next tick.  Otherwise the frame is
+             * dropped and the display keeps the stale image until the guest
+             * flushes again.
+             */
+            gl_dirty = true;
             return;
         }
 
