@@ -282,6 +282,11 @@ typedef NS_ENUM(NSInteger, QemuCocoaViewScanout) {
      */
     BOOL isMouseGrabbed;
     BOOL isAbsoluteEnabled;
+    /* isSelfResizing is set while resizeWindow changes the window frame
+     *   itself so that windowDidResize does not report the resize back to
+     *   the guest as a ui_info resolution request.
+     */
+    BOOL isSelfResizing;
     CFMachPortRef eventsTap;
     CGColorSpaceRef colorspace;
     QEMUCursor *cursor;
@@ -304,6 +309,7 @@ typedef NS_ENUM(NSInteger, QemuCocoaViewScanout) {
 - (bool) handleEventLocked:(NSEvent *)event;
 - (void) notifyMouseModeChange;
 - (BOOL) isMouseGrabbed;
+- (BOOL) isSelfResizing;
 - (void) raiseAllKeys;
 - (void) setScanout:(QemuCocoaViewScanout)scanout;
 
@@ -658,6 +664,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) resizeWindow
 {
+    /* setContentSize: delivers windowDidResize synchronously */
+    isSelfResizing = YES;
+
     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
 
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
@@ -672,6 +681,8 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     } else {
         [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
     }
+
+    isSelfResizing = NO;
 }
 
 - (void) updateScale
@@ -1264,6 +1275,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
+- (BOOL) isSelfResizing {return isSelfResizing;}
 
 /*
  * Makes the target think all down keys are being released.
@@ -1551,7 +1563,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void)windowDidResize:(NSNotification *)notification
 {
     [cocoaView updateScale];
-    [cocoaView updateUIInfo];
+    if (![cocoaView isSelfResizing]) {
+        [cocoaView updateUIInfo];
+    }
 }
 
 /* Called when the user clicks on a window's close button */
