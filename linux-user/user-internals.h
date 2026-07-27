@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 
 extern char *exec_path;
+extern char real_exec_path[PATH_MAX];
 void init_task_state(TaskState *ts);
 void task_settid(TaskState *);
 void stop_all_tasks(void);
@@ -68,6 +69,8 @@ abi_long get_errno(abi_long ret);
 const char *target_strerror(int err);
 int get_osversion(void);
 void init_qemu_uname_release(void);
+void clone_fork_start(void);
+void clone_fork_end(bool child);
 void fork_start(void);
 void fork_end(pid_t pid);
 
@@ -128,6 +131,9 @@ static inline uint64_t target_offset64(uint64_t word0, uint64_t word1)
 #endif /* TARGET_ABI_BITS != 32 */
 
 void print_termios(void *arg);
+#ifdef TARGET_TCGETS2
+void print_termios2(void *arg);
+#endif
 
 /* ARM EABI and MIPS expect 64bit types aligned even on pairs or registers */
 #ifdef TARGET_ARM

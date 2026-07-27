@@ -965,11 +965,13 @@ static TRBCCode xhci_alloc_device_streams(XHCIState *xhci, unsigned int slotid,
          * together and make an usb_device_alloc_streams call per group.
          */
         if (epctxs[i]->nr_pstreams != req_nr_streams) {
-            FIXME("guest streams config not identical for all eps");
+            qemu_log_mask(LOG_UNIMP,
+                          "guest streams config not identical for all eps\n");
             return CC_RESOURCE_ERROR;
         }
         if (eps[i]->max_streams != dev_max_streams) {
-            FIXME("device streams config not identical for all eps");
+            qemu_log_mask(LOG_UNIMP,
+                          "device streams config not identical for all eps\n");
             return CC_RESOURCE_ERROR;
         }
     }
@@ -1009,7 +1011,12 @@ static XHCIStreamContext *xhci_find_stream(XHCIEPContext *epctx,
     dma_addr_t base;
     uint32_t ctx[2], sct;
 
-    assert(streamid != 0);
+    if (!streamid) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xhci: stream ID is zero\n");
+        *cc_error = CC_INVALID_STREAM_ID_ERROR;
+        return NULL;
+    }
+
     if (epctx->lsa) {
         if (streamid >= epctx->nr_pstreams) {
             *cc_error = CC_INVALID_STREAM_ID_ERROR;
@@ -1120,7 +1127,7 @@ static void xhci_init_epctx(XHCIEPContext *epctx,
         epctx->ring.ccs = ctx[2] & 1;
     }
 
-    epctx->interval = 1 << ((ctx[0] >> 16) & 0xff);
+    epctx->interval = 1u << MIN((ctx[0] >> 16) & 0xffu, 18u);
 }
 
 static TRBCCode xhci_enable_ep(XHCIState *xhci, unsigned int slotid,
@@ -3039,6 +3046,12 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
         }
     } else {
         int v = (reg - 0x20) / 0x20;
+
+        if (v >= xhci->numintrs) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "xhci: read from nonexistent interrupter %i\n", v);
+            goto out_trace;
+        }
         XHCIInterrupter *intr = &xhci->intr[v];
         switch (reg & 0x1f) {
         case 0x00: /* IMAN */
@@ -3065,6 +3078,7 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
         }
     }
 
+out_trace:
     trace_usb_xhci_runtime_read(reg, ret);
     return ret;
 }
@@ -3082,7 +3096,13 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
         trace_usb_xhci_unimplemented("runtime write", reg);
         return;
     }
+
     v = (reg - 0x20) / 0x20;
+    if (v >= xhci->numintrs) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "xhci: write to nonexistent interrupter %i\n", v);
+        return;
+    }
     intr = &xhci->intr[v];
 
     switch (reg & 0x1f) {

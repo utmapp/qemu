@@ -252,6 +252,10 @@ static int usb_mouse_poll(USBWacomState *s, uint8_t *buf, int len)
     if (s->buttons_state & MOUSE_EVENT_MBUTTON)
         b |= 0x04;
 
+    if (len < 3) {
+        return 0;
+    }
+
     buf[0] = b;
     buf[1] = dx;
     buf[2] = dy;

@@ -105,12 +105,14 @@ CPUArchState *cpu_copy(CPUArchState *env);
 static inline int cpu_mmu_index(CPUState *cs, bool ifetch);
 
 /*
- * Allow some level of source compatibility with softmmu.  We do not
- * support any of the more exotic features, so only invalid pages may
- * be signaled by probe_access_flags().
+ * Allow some level of source compatibility with softmmu.
+ * Invalid is set when the page does not have requested permissions.
+ * MMIO is set when we want the target helper to use the functional
+ * interface for load/store so that plugins see the access.
  */
 #define TLB_INVALID_MASK    (1 << (TARGET_PAGE_BITS_MIN - 1))
-#define TLB_MMIO            (1 << (TARGET_PAGE_BITS_MIN - 2))
+#define TLB_FORCE_SLOW      (1 << (TARGET_PAGE_BITS_MIN - 2))
+#define TLB_MMIO            0
 #define TLB_WATCHPOINT      0
 
 static inline int cpu_mmu_index(CPUState *cs, bool ifetch)

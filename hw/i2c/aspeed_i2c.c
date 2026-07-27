@@ -94,7 +94,7 @@ static uint64_t aspeed_i2c_bus_old_read(AspeedI2CBus *bus, hwaddr offset,
                                         unsigned size)
 {
     AspeedI2CClass *aic = ASPEED_I2C_GET_CLASS(bus->controller);
-    uint64_t value = bus->regs[offset / sizeof(*bus->regs)];
+    uint64_t value = -1;
 
     switch (offset) {
     case A_I2CD_FUN_CTRL:
@@ -105,7 +105,7 @@ static uint64_t aspeed_i2c_bus_old_read(AspeedI2CBus *bus, hwaddr offset,
     case A_I2CD_DEV_ADDR:
     case A_I2CD_POOL_CTRL:
     case A_I2CD_BYTE_BUF:
-        /* Value is already set, don't do anything. */
+        value = bus->regs[offset / sizeof(*bus->regs)];
         break;
     case A_I2CD_CMD:
         value = SHARED_FIELD_DP32(value, BUS_BUSY_STS, i2c_bus_busy(bus->bus));
@@ -113,23 +113,20 @@ static uint64_t aspeed_i2c_bus_old_read(AspeedI2CBus *bus, hwaddr offset,
     case A_I2CD_DMA_ADDR:
         if (!aic->has_dma) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA support\n",  __func__);
-            value = -1;
             break;
         }
-
-        value = extract64(bus->dma_dram_offset, 0, 32);
+        value = bus->regs[offset / sizeof(*bus->regs)];
         break;
     case A_I2CD_DMA_LEN:
         if (!aic->has_dma) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA support\n",  __func__);
-            value = -1;
+            break;
         }
+        value = bus->regs[offset / sizeof(*bus->regs)];
         break;
-
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad offset 0x%" HWADDR_PRIx "\n", __func__, offset);
-        value = -1;
         break;
     }
 
@@ -141,7 +138,7 @@ static uint64_t aspeed_i2c_bus_new_read(AspeedI2CBus *bus, hwaddr offset,
                                         unsigned size)
 {
     AspeedI2CClass *aic = ASPEED_I2C_GET_CLASS(bus->controller);
-    uint64_t value = bus->regs[offset / sizeof(*bus->regs)];
+    uint64_t value = -1;
 
     switch (offset) {
     case A_I2CC_FUN_CTRL:
@@ -161,12 +158,11 @@ static uint64_t aspeed_i2c_bus_new_read(AspeedI2CBus *bus, hwaddr offset,
     case A_I2CS_CMD:
     case A_I2CS_INTR_CTRL:
     case A_I2CS_DMA_LEN_STS:
-        /* Value is already set, don't do anything. */
+    case A_I2CS_INTR_STS:
+        value = bus->regs[offset / sizeof(*bus->regs)];
         break;
     case A_I2CC_DMA_ADDR:
         value = extract64(bus->dma_dram_offset, 0, 32);
-        break;
-    case A_I2CS_INTR_STS:
         break;
     case A_I2CM_CMD:
         value = SHARED_FIELD_DP32(value, BUS_BUSY_STS, i2c_bus_busy(bus->bus));
@@ -178,13 +174,13 @@ static uint64_t aspeed_i2c_bus_new_read(AspeedI2CBus *bus, hwaddr offset,
         if (!aic->has_dma64) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA 64 bits support\n",
             __func__);
-            value = -1;
+            break;
         }
+        value = bus->regs[offset / sizeof(*bus->regs)];
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad offset 0x%" HWADDR_PRIx "\n", __func__, offset);
-        value = -1;
         break;
     }
 
@@ -219,6 +215,64 @@ static uint8_t aspeed_i2c_get_state(AspeedI2CBus *bus)
                                        TX_STATE);
     }
     return SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CD_CMD, TX_STATE);
+}
+
+/*
+ * The AST2700 support the maximum DRAM size is 8 GB.
+ * The DRAM offset range is from 0x0_0000_0000 to
+ * 0x1_FFFF_FFFF and it is enough to use bits [33:0]
+ * saving the dram offset.
+ * Therefore, save the high part physical address bit[1:0]
+ * of Tx/Rx buffer address as dma_dram_offset bit[33:32].
+ */
+static void aspeed_i2c_set_tx_dma_dram_offset(AspeedI2CBus *bus)
+{
+    AspeedI2CClass *aic = ASPEED_I2C_GET_CLASS(bus->controller);
+    uint32_t value;
+
+    assert(aic->has_dma);
+
+    if (aspeed_i2c_is_new_mode(bus->controller)) {
+        value = bus->regs[R_I2CM_DMA_TX_ADDR];
+        bus->dma_dram_offset =
+            deposit64(bus->dma_dram_offset, 0, 32,
+                      FIELD_EX32(value, I2CM_DMA_TX_ADDR, ADDR));
+        if (!aic->has_dma64) {
+            value = bus->regs[R_I2CM_DMA_TX_ADDR_HI];
+            bus->dma_dram_offset =
+                deposit64(bus->dma_dram_offset, 32, 32,
+                          extract32(value, 0, 2));
+        }
+    } else {
+        value = bus->regs[R_I2CD_DMA_ADDR];
+        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 0, 32,
+                                         value & 0x3ffffffc);
+    }
+}
+
+static void aspeed_i2c_set_rx_dma_dram_offset(AspeedI2CBus *bus)
+{
+    AspeedI2CClass *aic = ASPEED_I2C_GET_CLASS(bus->controller);
+    uint32_t value;
+
+    assert(aic->has_dma);
+
+    if (aspeed_i2c_is_new_mode(bus->controller)) {
+        value = bus->regs[R_I2CM_DMA_RX_ADDR];
+        bus->dma_dram_offset =
+            deposit64(bus->dma_dram_offset, 0, 32,
+                      FIELD_EX32(value, I2CM_DMA_RX_ADDR, ADDR));
+        if (!aic->has_dma64) {
+            value = bus->regs[R_I2CM_DMA_RX_ADDR_HI];
+            bus->dma_dram_offset =
+                deposit64(bus->dma_dram_offset, 32, 32,
+                          extract32(value, 0, 2));
+        }
+    } else {
+        value = bus->regs[R_I2CD_DMA_ADDR];
+        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 0, 32,
+                                         value & 0x3ffffffc);
+    }
 }
 
 static int aspeed_i2c_dma_read(AspeedI2CBus *bus, uint8_t *data)
@@ -270,9 +324,14 @@ static int aspeed_i2c_bus_send(AspeedI2CBus *bus)
         if (aspeed_i2c_is_new_mode(bus->controller)) {
             ARRAY_FIELD_DP32(bus->regs, I2CM_DMA_LEN_STS, TX_LEN, 0);
         }
+        aspeed_i2c_set_tx_dma_dram_offset(bus);
         while (bus->regs[reg_dma_len]) {
             uint8_t data;
-            aspeed_i2c_dma_read(bus, &data);
+            ret = aspeed_i2c_dma_read(bus, &data);
+            /* Check that we were able to read the DMA */
+            if (ret) {
+                break;
+            }
             trace_aspeed_i2c_bus_send("DMA", bus->regs[reg_dma_len],
                                       bus->regs[reg_dma_len], data);
             ret = i2c_send(bus->bus, data);
@@ -331,6 +390,7 @@ static void aspeed_i2c_bus_recv(AspeedI2CBus *bus)
             ARRAY_FIELD_DP32(bus->regs, I2CM_DMA_LEN_STS, RX_LEN, 0);
         }
 
+        aspeed_i2c_set_rx_dma_dram_offset(bus);
         while (bus->regs[reg_dma_len]) {
             MemTxResult result;
 
@@ -397,6 +457,7 @@ static uint8_t aspeed_i2c_get_addr(AspeedI2CBus *bus)
     } else if (SHARED_ARRAY_FIELD_EX32(bus->regs, reg_cmd, TX_DMA_EN)) {
         uint8_t data;
 
+        aspeed_i2c_set_tx_dma_dram_offset(bus);
         aspeed_i2c_dma_read(bus, &data);
         return data;
     } else {
@@ -653,20 +714,10 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
     case A_I2CM_DMA_TX_ADDR:
         bus->regs[R_I2CM_DMA_TX_ADDR] = FIELD_EX32(value, I2CM_DMA_TX_ADDR,
                                                    ADDR);
-        bus->dma_dram_offset =
-            deposit64(bus->dma_dram_offset, 0, 32,
-                      FIELD_EX32(value, I2CM_DMA_TX_ADDR, ADDR));
-        bus->regs[R_I2CC_DMA_LEN] = ARRAY_FIELD_EX32(bus->regs, I2CM_DMA_LEN,
-                                                     TX_BUF_LEN) + 1;
         break;
     case A_I2CM_DMA_RX_ADDR:
         bus->regs[R_I2CM_DMA_RX_ADDR] = FIELD_EX32(value, I2CM_DMA_RX_ADDR,
                                                    ADDR);
-        bus->dma_dram_offset =
-            deposit64(bus->dma_dram_offset, 0, 32,
-                      FIELD_EX32(value, I2CM_DMA_RX_ADDR, ADDR));
-        bus->regs[R_I2CC_DMA_LEN] = ARRAY_FIELD_EX32(bus->regs, I2CM_DMA_LEN,
-                                                     RX_BUF_LEN) + 1;
         break;
     case A_I2CM_DMA_LEN:
         w1t = FIELD_EX32(value, I2CM_DMA_LEN, RX_BUF_LEN_W1T) ||
@@ -679,10 +730,16 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         if (FIELD_EX32(value, I2CM_DMA_LEN, RX_BUF_LEN_W1T)) {
             ARRAY_FIELD_DP32(bus->regs, I2CM_DMA_LEN, RX_BUF_LEN,
                              FIELD_EX32(value, I2CM_DMA_LEN, RX_BUF_LEN));
+            bus->regs[R_I2CC_DMA_LEN] = ARRAY_FIELD_EX32(bus->regs,
+                                                         I2CM_DMA_LEN,
+                                                         RX_BUF_LEN) + 1;
         }
         if (FIELD_EX32(value, I2CM_DMA_LEN, TX_BUF_LEN_W1T)) {
             ARRAY_FIELD_DP32(bus->regs, I2CM_DMA_LEN, TX_BUF_LEN,
                              FIELD_EX32(value, I2CM_DMA_LEN, TX_BUF_LEN));
+            bus->regs[R_I2CC_DMA_LEN] = ARRAY_FIELD_EX32(bus->regs,
+                                                         I2CM_DMA_LEN,
+                                                         TX_BUF_LEN) + 1;
         }
         break;
     case A_I2CM_DMA_LEN_STS:
@@ -742,15 +799,6 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         qemu_log_mask(LOG_UNIMP, "%s: Slave mode DMA TX is not implemented\n",
                       __func__);
         break;
-
-    /*
-     * The AST2700 support the maximum DRAM size is 8 GB.
-     * The DRAM offset range is from 0x0_0000_0000 to
-     * 0x1_FFFF_FFFF and it is enough to use bits [33:0]
-     * saving the dram offset.
-     * Therefore, save the high part physical address bit[1:0]
-     * of Tx/Rx buffer address as dma_dram_offset bit[33:32].
-     */
     case A_I2CM_DMA_TX_ADDR_HI:
         if (!aic->has_dma64) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA 64 bits support\n",
@@ -760,8 +808,6 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         bus->regs[R_I2CM_DMA_TX_ADDR_HI] = FIELD_EX32(value,
                                                       I2CM_DMA_TX_ADDR_HI,
                                                       ADDR_HI);
-        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 32, 32,
-                                         extract32(value, 0, 2));
         break;
     case A_I2CM_DMA_RX_ADDR_HI:
         if (!aic->has_dma64) {
@@ -772,8 +818,6 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         bus->regs[R_I2CM_DMA_RX_ADDR_HI] = FIELD_EX32(value,
                                                       I2CM_DMA_RX_ADDR_HI,
                                                       ADDR_HI);
-        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 32, 32,
-                                         extract32(value, 0, 2));
         break;
     case A_I2CS_DMA_TX_ADDR_HI:
         qemu_log_mask(LOG_UNIMP,
@@ -789,8 +833,6 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         bus->regs[R_I2CS_DMA_RX_ADDR_HI] = FIELD_EX32(value,
                                                       I2CS_DMA_RX_ADDR_HI,
                                                       ADDR_HI);
-        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 32, 32,
-                                         extract32(value, 0, 2));
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%" HWADDR_PRIx "\n",
@@ -881,9 +923,6 @@ static void aspeed_i2c_bus_old_write(AspeedI2CBus *bus, hwaddr offset,
             qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA support\n",  __func__);
             break;
         }
-
-        bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 0, 32,
-                                         value & 0x3ffffffc);
         break;
 
     case A_I2CD_DMA_LEN:

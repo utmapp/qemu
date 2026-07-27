@@ -406,6 +406,19 @@ static int i8257_dma_read_memory(IsaDma *obj, int nchan, void *buf, int pos,
     hwaddr addr = ((r->pageh & 0x7f) << 24) | (r->page << 16) | r->now[ADDR];
 
     if (i8257_is_verify_transfer(r)) {
+        /*
+         * If the device is expecting this verify operation then
+         * it won't care about the nonexistent data. But if it
+         * is expecting a real read (i.e. the guest has misprogrammed
+         * the DMA controller and the device) it's going to try to do
+         * something with the buffer contents. Give it zeroes.
+         * (It's not clear whether this is exactly what happens if
+         * you do this on real hardware. In practice no device QEMU
+         * emulates has a use for verify on a memory-read transfer,
+         * so we don't care beyond avoiding the guest being able to
+         * trigger the caller reading uninitialized data.)
+         */
+        memset(buf, 0, len);
         return len;
     }
 

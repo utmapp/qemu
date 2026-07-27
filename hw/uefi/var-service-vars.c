@@ -260,6 +260,17 @@ static size_t uefi_vars_mm_error(mm_header *mhdr, mm_variable *mvar,
     return sizeof(*mvar);
 }
 
+static bool check_buffer_size(uefi_vars_state *uv, uint64_t length)
+{
+    /* uefi_vars_cmd_mm() checks that */
+    g_assert(uv->buf_size >= sizeof(mm_header));
+
+    if (uv->buf_size - sizeof(mm_header) < length) {
+        return false;
+    }
+    return true;
+}
+
 static size_t uefi_vars_mm_get_variable(uefi_vars_state *uv, mm_header *mhdr,
                                         mm_variable *mvar, void *func)
 {
@@ -307,7 +318,7 @@ static size_t uefi_vars_mm_get_variable(uefi_vars_state *uv, mm_header *mhdr,
     if (uadd64_overflow(length, va->data_size, &length)) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
-    if (uv->buf_size < length) {
+    if (!check_buffer_size(uv, length)) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
 
@@ -357,6 +368,9 @@ uefi_vars_mm_get_next_variable(uefi_vars_state *uv, mm_header *mhdr,
     if (uefi_strlen(name, nv->name_size) == 0) {
         /* empty string -> first */
         var = QTAILQ_FIRST(&uv->variables);
+        while (var && !check_access(uv, var)) {
+            var = QTAILQ_NEXT(var, next);
+        }
         if (!var) {
             return uefi_vars_mm_error(mhdr, mvar, EFI_NOT_FOUND);
         }
@@ -374,7 +388,7 @@ uefi_vars_mm_get_next_variable(uefi_vars_state *uv, mm_header *mhdr,
     }
 
     length = sizeof(*mvar) + sizeof(*nv) + var->name_size;
-    if (uv->buf_size < length) {
+    if (!check_buffer_size(uv, length)) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
 
@@ -564,7 +578,7 @@ static size_t uefi_vars_mm_variable_info(uefi_vars_state *uv, mm_header *mhdr,
     uint64_t length;
 
     length = sizeof(*mvar) + sizeof(*vi);
-    if (uv->buf_size < length) {
+    if (!check_buffer_size(uv, length)) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
 
@@ -585,11 +599,11 @@ uefi_vars_mm_get_payload_size(uefi_vars_state *uv, mm_header *mhdr,
     uint64_t length;
 
     length = sizeof(*mvar) + sizeof(*ps);
-    if (uv->buf_size < length) {
+    if (!check_buffer_size(uv, length)) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
 
-    ps->payload_size = uv->buf_size;
+    ps->payload_size = uv->buf_size - sizeof(*mhdr) - sizeof(*mvar);
     mvar->status = EFI_SUCCESS;
     return length;
 }
@@ -613,6 +627,9 @@ uefi_vars_mm_lock_variable(uefi_vars_state *uv, mm_header *mhdr,
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
     if (mhdr->length < length) {
+        return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
+    }
+    if (sizeof(*pe) + lv->name_size > UINT16_MAX) {
         return uefi_vars_mm_error(mhdr, mvar, EFI_BAD_BUFFER_SIZE);
     }
 
@@ -702,12 +719,14 @@ uint32_t uefi_vars_mm_vars_proto(uefi_vars_state *uv)
     case SMM_VARIABLE_FUNCTION_READY_TO_BOOT:
         trace_uefi_event("ready-to-boot");
         uv->ready_to_boot = true;
+        mvar->status = EFI_SUCCESS;
         length = 0;
         break;
 
     case SMM_VARIABLE_FUNCTION_EXIT_BOOT_SERVICE:
         trace_uefi_event("exit-boot-service");
         uv->exit_boot_service = true;
+        mvar->status = EFI_SUCCESS;
         length = 0;
         break;
 

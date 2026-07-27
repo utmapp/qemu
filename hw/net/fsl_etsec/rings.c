@@ -175,15 +175,30 @@ static void tx_padding_and_crc(eTSEC *etsec, uint32_t min_frame_len)
 static void process_tx_fcb(eTSEC *etsec)
 {
     uint8_t flags = (uint8_t)(*etsec->tx_buffer);
-    /* L3 header offset from start of frame */
+    /* L3 header offset from start of frame (FCB byte 3) */
     uint8_t l3_header_offset = (uint8_t)*(etsec->tx_buffer + 3);
-    /* L4 header offset from start of L3 header */
+    /* L4 header offset from start of L3 header (FCB byte 2) */
     uint8_t l4_header_offset = (uint8_t)*(etsec->tx_buffer + 2);
-    /* L3 header */
-    uint8_t *l3_header = etsec->tx_buffer + 8 + l3_header_offset;
-    /* L4 header */
-    uint8_t *l4_header = l3_header + l4_header_offset;
+    uint8_t *l3_header;
+    uint8_t *l4_header;
     int csum = 0;
+
+    /*
+     * Validate FCB header offsets before pointer arithmetic. The highest
+     * byte accessed is l4_header[7], at offset
+     *   8 (FCB size) + l3_header_offset + l4_header_offset + 7
+     * from tx_buffer. Drop the frame if this exceeds the buffer length.
+     */
+    if (etsec->tx_buffer_len < 8u + l3_header_offset + l4_header_offset + 8u) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "eTSEC: FCB offsets exceed frame length, dropping\n");
+        return;
+    }
+
+    /* L3 header */
+    l3_header = etsec->tx_buffer + 8 + l3_header_offset;
+    /* L4 header */
+    l4_header = l3_header + l4_header_offset;
 
     /* if packet is IP4 and IP checksum is requested */
     if (flags & FCB_TX_IP && flags & FCB_TX_CIP) {

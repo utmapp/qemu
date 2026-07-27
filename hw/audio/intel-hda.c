@@ -305,6 +305,7 @@ static int intel_hda_send_command(IntelHDAState *d, uint32_t verb)
 
 static void intel_hda_corb_run(IntelHDAState *d)
 {
+    const MemTxAttrs attrs = { .memory = true };
     hwaddr addr;
     uint32_t rp, verb;
 
@@ -330,7 +331,7 @@ static void intel_hda_corb_run(IntelHDAState *d)
 
         rp = (d->corb_rp + 1) & 0xff;
         addr = intel_hda_addr(d->corb_lbase, d->corb_ubase);
-        ldl_le_pci_dma(&d->pci, addr + 4 * rp, &verb, MEMTXATTRS_UNSPECIFIED);
+        ldl_le_pci_dma(&d->pci, addr + 4 * rp, &verb, attrs);
         d->corb_rp = rp;
 
         dprint(d, 2, "%s: [rp 0x%x] verb 0x%08x\n", __func__, rp, verb);
@@ -395,7 +396,7 @@ static void intel_hda_response(HDACodecDevice *dev, bool solicited, uint32_t res
 static bool intel_hda_xfer(HDACodecDevice *dev, uint32_t stnr, bool output,
                            uint8_t *buf, uint32_t len)
 {
-    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    const MemTxAttrs attrs = { .memory = true };
     HDACodecBus *bus = HDA_BUS(dev->qdev.parent_bus);
     IntelHDAState *d = container_of(bus, IntelHDAState, codecs);
     hwaddr addr;
@@ -466,6 +467,7 @@ static bool intel_hda_xfer(HDACodecDevice *dev, uint32_t stnr, bool output,
 
 static void intel_hda_parse_bdl(IntelHDAState *d, IntelHDAStream *st)
 {
+    const MemTxAttrs attrs = { .memory = true };
     hwaddr addr;
     uint8_t buf[16];
     uint32_t i;
@@ -475,7 +477,8 @@ static void intel_hda_parse_bdl(IntelHDAState *d, IntelHDAStream *st)
     g_free(st->bpl);
     st->bpl = g_new(bpl, st->bentries);
     for (i = 0; i < st->bentries; i++, addr += 16) {
-        pci_dma_read(&d->pci, addr, buf, 16);
+        pci_dma_rw(&d->pci, addr, buf, 16,
+                   DMA_DIRECTION_TO_DEVICE, attrs);
         st->bpl[i].addr  = le64_to_cpu(*(uint64_t *)buf);
         st->bpl[i].len   = le32_to_cpu(*(uint32_t *)(buf + 8));
         st->bpl[i].flags = le32_to_cpu(*(uint32_t *)(buf + 12));

@@ -417,12 +417,15 @@ abi_ulong mmap_next_start;
 static abi_ulong mmap_find_vma_reserved(abi_ulong start, abi_ulong size,
                                         abi_ulong align)
 {
-    target_ulong ret;
+    target_ulong ret = -1;
 
-    ret = page_find_range_empty(start, reserved_va, size, align);
+    if (start <= reserved_va) {
+        ret = page_find_range_empty(start, reserved_va, size, align);
+    }
     if (ret == -1 && start > mmap_min_addr) {
         /* Restart at the beginning of the address space. */
-        ret = page_find_range_empty(mmap_min_addr, start - 1, size, align);
+        ret = page_find_range_empty(mmap_min_addr, MIN(start - 1, reserved_va),
+                                    size, align);
     }
 
     return ret;
@@ -1027,9 +1030,9 @@ static int mmap_reserve_or_unmap(abi_ulong start, abi_ulong len)
     void *host_start;
     int prot;
 
-    last = start + len - 1;
+    last = ROUND_UP(start + len, TARGET_PAGE_SIZE) - 1;
     real_start = start & -host_page_size;
-    real_last = ROUND_UP(last, host_page_size) - 1;
+    real_last = ROUND_UP(last + 1, host_page_size) - 1;
 
     /*
      * If guest pages remain on the first or last host pages,
@@ -1108,12 +1111,67 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
     int prot;
     void *host_addr;
 
-    if (!guest_range_valid_untagged(old_addr, old_size) ||
-        ((flags & MREMAP_FIXED) &&
+    if (((flags & MREMAP_FIXED) &&
          !guest_range_valid_untagged(new_addr, new_size)) ||
         ((flags & MREMAP_MAYMOVE) == 0 &&
          !guest_range_valid_untagged(old_addr, new_size))) {
-        errno = ENOMEM;
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!old_size) {
+        if (!(flags & MREMAP_MAYMOVE)) {
+            errno = EINVAL;
+            return -1;
+        }
+        mmap_lock();
+        if (flags & MREMAP_FIXED) {
+            host_addr = mremap(g2h_untagged(old_addr), old_size, new_size,
+                             flags, g2h_untagged(new_addr));
+        } else {
+            /*
+             * We ensure that the new mapping stands in the
+             * region of guest mappable addresses.
+             */
+            abi_ulong mmap_start;
+
+            mmap_start = mmap_find_vma(0, new_size, TARGET_PAGE_SIZE);
+
+            if (mmap_start == -1) {
+                errno = ENOMEM;
+                mmap_unlock();
+                return -1;
+            }
+
+            host_addr = mremap(g2h_untagged(old_addr), old_size, new_size,
+                             flags | MREMAP_FIXED, g2h_untagged(mmap_start));
+
+            new_addr = mmap_start;
+        }
+
+        if (host_addr == MAP_FAILED) {
+            mmap_unlock();
+            return -1;
+        }
+
+        if (flags & MREMAP_FIXED) {
+            new_addr = h2g(host_addr);
+        }
+
+        prot = page_get_flags(old_addr);
+        /*
+         * For old_size zero, there is nothing to clear at old_addr.
+         * Only set the flags for the new mapping. They both are valid.
+         */
+        page_set_flags(new_addr, new_addr + new_size - 1,
+                       prot | PAGE_VALID | PAGE_RESET);
+        shm_region_rm_complete(new_addr, new_addr + new_size - 1);
+        mmap_unlock();
+        return new_addr;
+    }
+
+    if (!guest_range_valid_untagged(old_addr, old_size)) {
+        errno = EFAULT;
         return -1;
     }
 
@@ -1169,7 +1227,8 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
                     errno = ENOMEM;
                     host_addr = MAP_FAILED;
                 } else if (reserved_va && old_size > new_size) {
-                    mmap_reserve_or_unmap(old_addr + old_size,
+                    /* Re-reserve pages we just shrunk out of the mapping */
+                    mmap_reserve_or_unmap(old_addr + new_size,
                                           old_size - new_size);
                 }
             }

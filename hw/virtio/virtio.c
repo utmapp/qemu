@@ -929,18 +929,18 @@ static void virtqueue_packed_fill(VirtQueue *vq, const VirtQueueElement *elem,
 static void virtqueue_ordered_fill(VirtQueue *vq, const VirtQueueElement *elem,
                                    unsigned int len)
 {
-    unsigned int i, steps, max_steps;
+    unsigned int i, steps, max_steps, ndescs;
 
     i = vq->used_idx % vq->vring.num;
     steps = 0;
     /*
-     * We shouldn't need to increase 'i' by more than the distance
-     * between used_idx and last_avail_idx.
+     * We shouldn't need to increase 'i' by more than or equal to
+     * the distance between used_idx and last_avail_idx (max_steps).
      */
-    max_steps = (vq->last_avail_idx - vq->used_idx) % vq->vring.num;
+    max_steps = MIN(vq->last_avail_idx - vq->used_idx, vq->vring.num);
 
     /* Search for element in vq->used_elems */
-    while (steps <= max_steps) {
+    while (steps < max_steps) {
         /* Found element, set length and mark as filled */
         if (vq->used_elems[i].index == elem->index) {
             vq->used_elems[i].len = len;
@@ -948,8 +948,18 @@ static void virtqueue_ordered_fill(VirtQueue *vq, const VirtQueueElement *elem,
             break;
         }
 
-        i += vq->used_elems[i].ndescs;
-        steps += vq->used_elems[i].ndescs;
+        ndescs = vq->used_elems[i].ndescs;
+
+        /* Defensive sanity check */
+        if (unlikely(ndescs == 0 || ndescs > vq->vring.num)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: %s invalid ndescs %u at position %u\n",
+                          __func__, vq->vdev->name, ndescs, i);
+            return;
+        }
+
+        i += ndescs;
+        steps += ndescs;
 
         if (i >= vq->vring.num) {
             i -= vq->vring.num;
@@ -3257,18 +3267,18 @@ virtio_load(VirtIODevice *vdev, QEMUFile *f, int version_id)
         config_len--;
     }
 
-    if (vdc->pre_load_queues) {
-        ret = vdc->pre_load_queues(vdev);
-        if (ret) {
-            return ret;
-        }
-    }
-
     num = qemu_get_be32(f);
 
     if (num > VIRTIO_QUEUE_MAX) {
         error_report("Invalid number of virtqueues: 0x%x", num);
         return -1;
+    }
+
+    if (vdc->pre_load_queues) {
+        ret = vdc->pre_load_queues(vdev, num);
+        if (ret) {
+            return ret;
+        }
     }
 
     for (i = 0; i < num; i++) {
@@ -4392,4 +4402,14 @@ QEMUBH *virtio_bh_new_guarded_full(DeviceState *dev,
 
     return qemu_bh_new_full(cb, opaque, name,
                             &transport->mem_reentrancy_guard);
+}
+
+QEMUBH *virtio_bh_io_new_guarded_full(DeviceState *dev,
+                                      QEMUBHFunc *cb, void *opaque,
+                                      const char *name)
+{
+    DeviceState *transport = qdev_get_parent_bus(dev)->parent;
+
+    return aio_bh_new_full(iohandler_get_aio_context(), cb, opaque, name,
+                           &transport->mem_reentrancy_guard);
 }

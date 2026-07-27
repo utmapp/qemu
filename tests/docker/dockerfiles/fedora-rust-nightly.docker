@@ -172,7 +172,7 @@ RUN set -eux && \
   test "$CARGO" = "$(/usr/local/cargo/bin/rustup +nightly which cargo)" && \
   test "$RUSTC" = "$(/usr/local/cargo/bin/rustup +nightly which rustc)"
 ENV PATH=$CARGO_HOME/bin:$PATH
-RUN /usr/local/cargo/bin/rustup run nightly cargo install bindgen-cli
+RUN /usr/local/cargo/bin/rustup run nightly cargo install --locked bindgen-cli
 RUN $CARGO --list
 # As a final step configure the user (if env is defined)
 ARG USER

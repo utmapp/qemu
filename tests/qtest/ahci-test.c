@@ -1625,6 +1625,69 @@ static void test_cdrom_pio_multi(void)
     ahci_test_cdrom_read10(3, false);
 }
 
+/*
+ * Regression test: a buffered ATAPI read completing after a command
+ * engine restart must not dereference the cleared cur_cmd. Cover both
+ * PIO and DMA; the DMA variant is the reliable guard.
+ */
+static void test_atapi_engine_restart_in_flight(bool dma)
+{
+    AHCIQState *ahci;
+    AHCICommand *cmd;
+    unsigned char *tx;
+    char *iso;
+    int fd;
+    uint8_t port;
+    uint64_t buffer;
+    uint64_t iso_size = (uint64_t)ATAPI_SECTOR_SIZE * 2;
+
+    fd = prepare_iso(iso_size, &tx, &iso);
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,"
+                                "file=blkdebug::%s,format=raw,readonly=on "
+                                "-M q35 "
+                                "-device ide-cd,drive=drive0 ", iso);
+    port = ahci_port_select(ahci);
+
+    buffer = ahci_alloc(ahci, ATAPI_SECTOR_SIZE);
+    qtest_memset(ahci->parent->qts, buffer, 0x00, ATAPI_SECTOR_SIZE);
+
+    /* Suspend the next backend read so the ATAPI read stays in flight. */
+    g_free(qtest_hmp(ahci->parent->qts,
+                     "qemu-io drive0 \"break read_aio rd\""));
+
+    cmd = ahci_atapi_command_create(CMD_ATAPI_READ_10, ATAPI_SECTOR_SIZE,
+                                    dma);
+    ahci_command_adjust(cmd, 0, buffer, ATAPI_SECTOR_SIZE, 0);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue_async(ahci, cmd);
+
+    /* Stop and restart the command engine to re-map the command list. */
+    ahci_px_clr(ahci, port, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+    ahci_px_set(ahci, port, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+
+    g_free(qtest_hmp(ahci->parent->qts, "qemu-io drive0 \"resume rd\""));
+
+    /* Round-trip through the device to confirm qemu is still alive. */
+    ahci_px_rreg(ahci, port, AHCI_PX_TFD);
+
+    ahci_command_free(cmd);
+    ahci_free(ahci, buffer);
+    g_free(tx);
+    ahci_shutdown(ahci);
+    remove_iso(fd, iso);
+}
+
+static void test_atapi_engine_restart_pio(void)
+{
+    test_atapi_engine_restart_in_flight(false);
+}
+
+static void test_atapi_engine_restart_dma(void)
+{
+    test_atapi_engine_restart_in_flight(true);
+}
+
 /* Regression test: Test that a READ_CD command with a BCL of 0 but a size of 0
  * completes as a NOP instead of erroring out. */
 static void test_atapi_bcl(void)
@@ -2043,6 +2106,10 @@ int main(int argc, char **argv)
 
     qtest_add_func("/ahci/cdrom/pio/bcl", test_atapi_bcl);
     qtest_add_func("/ahci/cdrom/eject", test_atapi_tray);
+    qtest_add_func("/ahci/cdrom/engine_restart/pio",
+                   test_atapi_engine_restart_pio);
+    qtest_add_func("/ahci/cdrom/engine_restart/dma",
+                   test_atapi_engine_restart_dma);
 
     ret = g_test_run();
 

@@ -539,8 +539,7 @@ int riscv_cpu_mirq_pending(CPURISCVState *env)
 
 int riscv_cpu_sirq_pending(CPURISCVState *env)
 {
-    uint64_t irqs = riscv_cpu_all_pending(env) & env->mideleg &
-                    ~(MIP_VSSIP | MIP_VSTIP | MIP_VSEIP);
+    uint64_t irqs = riscv_cpu_all_pending(env) & env->mideleg & ~env->hideleg;
     uint64_t irqs_f = env->mvip & env->mvien & ~env->mideleg & env->sie;
 
     return riscv_cpu_pending_to_irq(env, IRQ_S_EXT, IPRIO_DEFAULT_S,
@@ -1411,12 +1410,15 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
         adue = adue && (env->henvcfg & HENVCFG_ADUE);
     }
 
-    int ptshift = (levels - 1) * ptidxbits;
+    int ptshift;
     target_ulong pte;
     hwaddr pte_addr;
+    const hwaddr base_root = base;
     int i;
 
  restart:
+    ptshift = (levels - 1) * ptidxbits;
+    base = base_root;
     for (i = 0; i < levels; i++, ptshift -= ptidxbits) {
         target_ulong idx;
         if (i == 0) {
@@ -1466,7 +1468,22 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
         }
 
         if (res != MEMTX_OK) {
-            return TRANSLATE_FAIL;
+            /*
+             * The result of address_space_* APIs above does not take into
+             * consideration reject reads, putting all errors in the same
+             * cathegory (DECODE_ERROR), although there's a clear
+             * distinction between a rejected read versus other errors
+             * (see memory_region_dispatch_read() ->
+             * memory_region_access_valid()).  This is something that
+             * we might have to deal with core QEMU logic some other
+             * day.
+             *
+             * For this particular error path, given that we made checks
+             * w.r.t legal PTE address before calling those APIs, we'll
+             * assume that anything != MEMTX_OK means a rejected read,
+             * i.e. a PMA error.
+             */
+            return TRANSLATE_PMA_FAIL;
         }
 
         if (riscv_cpu_sxl(env) == MXL_RV32) {
@@ -1485,6 +1502,25 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
                               "and Svpbmt extension is disabled: "
                               "addr: 0x%" HWADDR_PRIx " pte: 0x" TARGET_FMT_lx "\n",
                               __func__, pte_addr, pte);
+                return TRANSLATE_FAIL;
+            }
+
+            /*
+             * priv spec, "Svpbmt" chapter:
+             * "For non-leaf PTEs, bits 62-61 are reserved for future
+             * standard use.  Until their use is defined by a standard
+             * extension, they must be cleared by software for forward
+             * compatibility, or else a page-fault exception is raised."
+             *
+             * For leaf PTEs the same bits are also reserved but in that
+             * case the page-fault is mandatory.  Make both cases consistent
+             * by also page faulting here.
+             */
+            if ((pte & PTE_PBMT) == PTE_PBMT) {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: PBMT bits 62 and 61 are "
+                        "reserved but are set in PTE: "
+                        "addr: 0x%" HWADDR_PRIx " pte: 0x" TARGET_FMT_lx "\n",
+                        __func__, pte_addr, pte);
                 return TRANSLATE_FAIL;
             }
 
@@ -1535,6 +1571,23 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
         /* Reserved without Svpbmt. */
         qemu_log_mask(LOG_GUEST_ERROR, "%s: PBMT bits set in PTE, "
                       "and Svpbmt extension is disabled: "
+                      "addr: 0x%" HWADDR_PRIx " pte: 0x" TARGET_FMT_lx "\n",
+                      __func__, pte_addr, pte);
+        return TRANSLATE_FAIL;
+    }
+
+    /*
+     * priv spec, "Svpbmt" chapter:
+     * "For leaf PTEs, setting bits 62-61 to the value 3 is reserved
+     * for future standard use. Until this value is defined by a
+     * standard extension, using this reserved value in a leaf PTE
+     * raises a page-fault exception. "
+     *
+     * Raise a fault if 62-61 (i.e. PTE_PBMT) are set.
+     */
+    if ((pte & PTE_PBMT) == PTE_PBMT) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: PBMT bits 62 and 61 are "
+                      "reserved but are set in leaf PTE: "
                       "addr: 0x%" HWADDR_PRIx " pte: 0x" TARGET_FMT_lx "\n",
                       __func__, pte_addr, pte);
         return TRANSLATE_FAIL;
@@ -1642,8 +1695,16 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
 
     /* Page table updates need to be atomic with MTTCG enabled */
     if (updated_pte != pte && !is_debug) {
+        int pmp_prot, pmp_ret;
+
         if (!adue) {
             return TRANSLATE_FAIL;
+        }
+
+        pmp_ret = get_physical_address_pmp(env, &pmp_prot, pte_addr,
+                                           sxlen_bytes, MMU_DATA_STORE, PRV_S);
+        if (pmp_ret != TRANSLATE_SUCCESS) {
+            return TRANSLATE_PMP_FAIL;
         }
 
         /*
@@ -1710,7 +1771,8 @@ static int get_physical_address(CPURISCVState *env, hwaddr *physical,
 }
 
 static void raise_mmu_exception(CPURISCVState *env, target_ulong address,
-                                MMUAccessType access_type, bool pmp_violation,
+                                MMUAccessType access_type,
+                                bool pmp_pma_violation,
                                 bool first_stage, bool two_stage,
                                 bool two_stage_indirect)
 {
@@ -1718,7 +1780,7 @@ static void raise_mmu_exception(CPURISCVState *env, target_ulong address,
 
     switch (access_type) {
     case MMU_INST_FETCH:
-        if (pmp_violation) {
+        if (pmp_pma_violation) {
             cs->exception_index = RISCV_EXCP_INST_ACCESS_FAULT;
         } else if (env->virt_enabled && !first_stage) {
             cs->exception_index = RISCV_EXCP_INST_GUEST_PAGE_FAULT;
@@ -1727,7 +1789,7 @@ static void raise_mmu_exception(CPURISCVState *env, target_ulong address,
         }
         break;
     case MMU_DATA_LOAD:
-        if (pmp_violation) {
+        if (pmp_pma_violation) {
             cs->exception_index = RISCV_EXCP_LOAD_ACCESS_FAULT;
         } else if (two_stage && !first_stage) {
             cs->exception_index = RISCV_EXCP_LOAD_GUEST_ACCESS_FAULT;
@@ -1736,7 +1798,7 @@ static void raise_mmu_exception(CPURISCVState *env, target_ulong address,
         }
         break;
     case MMU_DATA_STORE:
-        if (pmp_violation) {
+        if (pmp_pma_violation) {
             cs->exception_index = RISCV_EXCP_STORE_AMO_ACCESS_FAULT;
         } else if (two_stage && !first_stage) {
             cs->exception_index = RISCV_EXCP_STORE_GUEST_AMO_ACCESS_FAULT;
@@ -1862,7 +1924,7 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     vaddr im_address;
     hwaddr pa = 0;
     int prot, prot2, prot_pmp;
-    bool pmp_violation = false;
+    bool pmp_pma_violation = false;
     bool first_stage_error = true;
     bool two_stage_lookup = mmuidx_2stage(mmu_idx);
     bool two_stage_indirect_error = false;
@@ -1963,8 +2025,8 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         }
     }
 
-    if (ret == TRANSLATE_PMP_FAIL) {
-        pmp_violation = true;
+    if (ret == TRANSLATE_PMP_FAIL || ret == TRANSLATE_PMA_FAIL) {
+        pmp_pma_violation = true;
     }
 
     if (ret == TRANSLATE_SUCCESS) {
@@ -1991,7 +2053,7 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         cpu_check_watchpoint(cs, address, size, MEMTXATTRS_UNSPECIFIED,
                              wp_access, retaddr);
 
-        raise_mmu_exception(env, address, access_type, pmp_violation,
+        raise_mmu_exception(env, address, access_type, pmp_pma_violation,
                             first_stage_error, two_stage_lookup,
                             two_stage_indirect_error);
         cpu_loop_exit_restore(cs, retaddr);
@@ -2216,6 +2278,9 @@ static target_ulong promote_load_fault(target_ulong orig_cause)
 
     case RISCV_EXCP_LOAD_PAGE_FAULT:
         return RISCV_EXCP_STORE_PAGE_FAULT;
+
+    case RISCV_EXCP_LOAD_ADDR_MIS:
+        return RISCV_EXCP_STORE_AMO_ADDR_MIS;
     }
 
     /* if no promotion, return original cause */

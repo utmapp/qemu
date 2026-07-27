@@ -351,6 +351,14 @@ rutabaga_cmd_submit_3d(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(cs);
     trace_virtio_gpu_cmd_ctx_submit(cs.hdr.ctx_id, cs.size);
 
+    if (cs.size > VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: command buffer too large (%u)\n",
+                      __func__, cs.size);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
     buf = g_new0(uint8_t, cs.size);
     s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
                    sizeof(cs), buf, cs.size);

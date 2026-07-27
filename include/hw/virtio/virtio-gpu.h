@@ -15,6 +15,7 @@
 #define HW_VIRTIO_GPU_H
 
 #include "qemu/queue.h"
+#include "qemu/units.h"
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 #include "hw/virtio/virtio.h"
@@ -293,6 +294,14 @@ struct VirtIOGPURutabaga {
     uint32_t num_capsets;
     struct rutabaga *rutabaga;
 };
+
+/*
+ * With 4 KiB pages and QEMU's VIRTQUEUE_MAX_SIZE (1024) mapped-iov
+ * limit, the largest inline command is ~4 MiB.  Cap submit_3d
+ * allocations to this value to prevent a malicious guest from
+ * triggering an OOM abort via an inflated cs.size field.
+ */
+#define VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE (4 * MiB)
 
 #define VIRTIO_GPU_FILL_CMD(out) do {                                   \
         size_t virtiogpufillcmd_s_ =                                    \

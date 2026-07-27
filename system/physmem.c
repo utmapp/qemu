@@ -164,13 +164,11 @@ static bool ram_is_cpr_compatible(RAMBlock *rb);
  * CPUAddressSpace: all the information a CPU needs about an AddressSpace
  * @cpu: the CPU whose AddressSpace this is
  * @as: the AddressSpace itself
- * @memory_dispatch: its dispatch pointer (cached, RCU protected)
  * @tcg_as_listener: listener for tracking changes to the AddressSpace
  */
 typedef struct CPUAddressSpace {
     CPUState *cpu;
     AddressSpace *as;
-    struct AddressSpaceDispatch *memory_dispatch;
     MemoryListener tcg_as_listener;
 } CPUAddressSpace;
 
@@ -689,7 +687,7 @@ address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr orig_addr,
     IOMMUTLBEntry iotlb;
     int iommu_idx;
     hwaddr addr = orig_addr;
-    AddressSpaceDispatch *d = cpu->cpu_ases[asidx].memory_dispatch;
+    AddressSpaceDispatch *d = address_space_to_dispatch(cpu->cpu_ases[asidx].as);
 
     for (;;) {
         section = address_space_translate_internal(d, addr, &addr, plen, false);
@@ -765,12 +763,8 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
         cpu->as = as;
     }
 
-    /* KVM cannot currently support multiple address spaces. */
-    assert(asidx == 0 || !kvm_enabled());
-
     if (!cpu->cpu_ases) {
         cpu->cpu_ases = g_new0(CPUAddressSpace, cpu->num_ases);
-        cpu->cpu_ases_count = cpu->num_ases;
     }
 
     newas = &cpu->cpu_ases[asidx];
@@ -784,32 +778,29 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
     }
 }
 
-void cpu_address_space_destroy(CPUState *cpu, int asidx)
+void cpu_destroy_address_spaces(CPUState *cpu)
 {
     CPUAddressSpace *cpuas;
+    int asidx;
 
     assert(cpu->cpu_ases);
-    assert(asidx >= 0 && asidx < cpu->num_ases);
-    /* KVM cannot currently support multiple address spaces. */
-    assert(asidx == 0 || !kvm_enabled());
 
-    cpuas = &cpu->cpu_ases[asidx];
-    if (tcg_enabled()) {
-        memory_listener_unregister(&cpuas->tcg_as_listener);
+    /* convenience alias just points to some cpu_ases[n] */
+    cpu->as = NULL;
+
+    for (asidx = 0; asidx < cpu->num_ases; asidx++) {
+        cpuas = &cpu->cpu_ases[asidx];
+        if (!cpuas->as) {
+            /* This index was never initialized; no deinit needed */
+            continue;
+        }
+        if (tcg_enabled()) {
+            memory_listener_unregister(&cpuas->tcg_as_listener);
+        }
+        g_clear_pointer(&cpuas->as, address_space_destroy_free);
     }
 
-    address_space_destroy(cpuas->as);
-    g_free_rcu(cpuas->as, rcu);
-
-    if (asidx == 0) {
-        /* reset the convenience alias for address space 0 */
-        cpu->as = NULL;
-    }
-
-    if (--cpu->cpu_ases_count == 0) {
-        g_free(cpu->cpu_ases);
-        cpu->cpu_ases = NULL;
-    }
+    g_clear_pointer(&cpu->cpu_ases, g_free);
 }
 
 AddressSpace *cpu_get_address_space(CPUState *cpu, int asidx)
@@ -2673,7 +2664,7 @@ MemoryRegionSection *iotlb_to_section(CPUState *cpu,
 {
     int asidx = cpu_asidx_from_attrs(cpu, attrs);
     CPUAddressSpace *cpuas = &cpu->cpu_ases[asidx];
-    AddressSpaceDispatch *d = cpuas->memory_dispatch;
+    AddressSpaceDispatch *d = address_space_to_dispatch(cpuas->as);
     int section_index = index & ~TARGET_PAGE_MASK;
     MemoryRegionSection *ret;
 
@@ -2750,9 +2741,6 @@ static void tcg_log_global_after_sync(MemoryListener *listener)
 
 static void tcg_commit_cpu(CPUState *cpu, run_on_cpu_data data)
 {
-    CPUAddressSpace *cpuas = data.host_ptr;
-
-    cpuas->memory_dispatch = address_space_to_dispatch(cpuas->as);
     tlb_flush(cpu);
 }
 
@@ -2768,11 +2756,7 @@ static void tcg_commit(MemoryListener *listener)
     cpu = cpuas->cpu;
 
     /*
-     * Defer changes to as->memory_dispatch until the cpu is quiescent.
-     * Otherwise we race between (1) other cpu threads and (2) ongoing
-     * i/o for the current cpu thread, with data cached by mmu_lookup().
-     *
-     * In addition, queueing the work function will kick the cpu back to
+     * Queueing the work function will kick the cpu back to
      * the main loop, which will end the RCU critical section and reclaim
      * the memory data structures.
      *

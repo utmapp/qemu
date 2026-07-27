@@ -112,6 +112,14 @@ static bool has_padding(AspeedHACEState *s, struct iovec *iov,
                         hwaddr req_len, uint32_t *total_msg_len,
                         uint32_t *pad_offset)
 {
+    /* Need at least 8 bytes to read the total message length field */
+    if (req_len < 8) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: invalid request length=0x%" HWADDR_PRIx "\n",
+                      __func__, req_len);
+        return false;
+    }
+
     *total_msg_len = (uint32_t)(ldq_be_p(iov->iov_base + req_len - 8) / 8);
     /*
      * SG_LIST_LEN_LAST asserted in the request length doesn't mean it is the
@@ -159,6 +167,19 @@ static int reconstruct_iov(AspeedHACEState *s, struct iovec *iov, int id,
     s->iov_count = 0;
     s->total_req_len = 0;
     return iov_count;
+}
+
+static bool hash_accumulate_len(AspeedHACEState *s, hwaddr plen)
+{
+    if (plen > UINT32_MAX - s->total_req_len) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: total_req_len overflow, current=0x%x, adding=0x%"
+                      HWADDR_PRIx "\n", __func__, s->total_req_len, plen);
+        return false;
+    }
+
+    s->total_req_len += plen;
+    return true;
 }
 
 static void do_hash_operation(AspeedHACEState *s, int algo, bool sg_mode,
@@ -216,7 +237,9 @@ static void do_hash_operation(AspeedHACEState *s, int algo, bool sg_mode,
             }
             iov[i].iov_base = haddr;
             if (acc_mode) {
-                s->total_req_len += plen;
+                if (!hash_accumulate_len(s, plen)) {
+                    return;
+                }
 
                 if (has_padding(s, &iov[i], plen, &total_msg_len,
                                 &pad_offset)) {
@@ -301,12 +324,6 @@ static void do_hash_operation(AspeedHACEState *s, int algo, bool sg_mode,
                             iov[i - 1].iov_len, false,
                             iov[i - 1].iov_len);
     }
-
-    /*
-     * Set status bits to indicate completion. Testing shows hardware sets
-     * these irrespective of HASH_IRQ_EN.
-     */
-    s->regs[R_STATUS] |= HASH_IRQ;
 }
 
 static uint64_t aspeed_hace_read(void *opaque, hwaddr addr, unsigned int size)
@@ -390,10 +407,16 @@ static void aspeed_hace_write(void *opaque, hwaddr addr, uint64_t data,
                 qemu_log_mask(LOG_GUEST_ERROR,
                         "%s: Invalid hash algorithm selection 0x%"PRIx64"\n",
                         __func__, data & ahc->hash_mask);
-                break;
+        } else {
+            do_hash_operation(s, algo, data & HASH_SG_EN,
+                    ((data & HASH_HMAC_MASK) == HASH_DIGEST_ACCUM));
         }
-        do_hash_operation(s, algo, data & HASH_SG_EN,
-                ((data & HASH_HMAC_MASK) == HASH_DIGEST_ACCUM));
+
+        /*
+         * Set status bits to indicate completion. Testing shows hardware sets
+         * these irrespective of HASH_IRQ_EN.
+         */
+        s->regs[R_STATUS] |= HASH_IRQ;
 
         if (data & HASH_IRQ_EN) {
             qemu_irq_raise(s->irq);

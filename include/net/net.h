@@ -329,9 +329,32 @@ uint32_t net_crc32_le(const uint8_t *p, int len);
     .offset     = vmstate_offset_macaddr(_state, _field),            \
 }
 
+/**
+ * net_peer_needs_padding: Should we pad as we send out packets?
+ * @nc: NetClientState
+ *
+ * Return true if the peer of this NetClientState (i.e. the
+ * destination that qemu_send_packet() etc send to) requires us to pad
+ * out packets that are shorter than the minimum ethernet frame
+ * length.
+ */
 static inline bool net_peer_needs_padding(NetClientState *nc)
 {
   return nc->peer && !nc->peer->do_not_pad;
+}
+
+/**
+ * net_client_needs_padding: Should we pad as we queue packets to ourselves?
+ * @nc: NetClientState
+ *
+ * Return true if this NetClientState requires us to pad out packets
+ * that are shorter than the minimum ethernet frame length.  This is
+ * the check to make in qemu_receive_packet() when we are queuing a
+ * packet back into ourselves (i.e. loopback).
+ */
+static inline bool net_client_needs_padding(NetClientState *nc)
+{
+    return !nc->do_not_pad;
 }
 
 #endif

@@ -303,6 +303,9 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     SCLPDeviceClass *sclp_c = SCLP_GET_CLASS(sclp);
     SCCBHeader header;
     g_autofree SCCB *work_sccb = NULL;
+    AddressSpace *as = CPU(cpu)->as;
+    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    MemTxResult ret;
 
     /* first some basic checks on program checks */
     if (env->psw.mask & PSW_MASK_PSTATE) {
@@ -317,7 +320,10 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     }
 
     /* the header contains the actual length of the sccb */
-    cpu_physical_memory_read(sccb, &header, sizeof(SCCBHeader));
+    ret = address_space_read(as, sccb, attrs, &header, sizeof(SCCBHeader));
+    if (ret != MEMTX_OK) {
+        return -PGM_ADDRESSING;
+    }
 
     /* Valid sccb sizes */
     if (be16_to_cpu(header.length) < sizeof(SCCBHeader)) {
@@ -327,10 +333,16 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     /*
      * we want to work on a private copy of the sccb, to prevent guests
      * from playing dirty tricks by modifying the memory content after
-     * the host has checked the values
+     * the host has checked the values.
+     * Reuse the previously fetched header
      */
     work_sccb = g_malloc0(be16_to_cpu(header.length));
-    cpu_physical_memory_read(sccb, work_sccb, be16_to_cpu(header.length));
+    ret = address_space_read(as, sccb, attrs,
+                            work_sccb, be16_to_cpu(header.length));
+    if (ret != MEMTX_OK) {
+        return -PGM_ADDRESSING;
+    }
+    work_sccb->h = header;
 
     if (!sclp_command_code_valid(code)) {
         work_sccb->h.response_code = cpu_to_be16(SCLP_RC_INVALID_SCLP_COMMAND);
@@ -344,8 +356,11 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
 
     sclp_c->execute(sclp, work_sccb, code);
 out_write:
-    cpu_physical_memory_write(sccb, work_sccb,
-                              be16_to_cpu(work_sccb->h.length));
+    ret = address_space_write(as, sccb, attrs,
+                              work_sccb, be16_to_cpu(header.length));
+    if (ret != MEMTX_OK) {
+        return -PGM_PROTECTION;
+    }
 
     sclp_c->service_interrupt(sclp, sccb);
 

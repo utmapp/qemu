@@ -190,8 +190,8 @@ static void pmp_decode_napot(hwaddr a, hwaddr *sa, hwaddr *ea)
 void pmp_update_rule_addr(CPURISCVState *env, uint32_t pmp_index)
 {
     uint8_t this_cfg = env->pmp_state.pmp[pmp_index].cfg_reg;
-    target_ulong this_addr = env->pmp_state.pmp[pmp_index].addr_reg;
-    target_ulong prev_addr = 0u;
+    hwaddr this_addr = env->pmp_state.pmp[pmp_index].addr_reg;
+    hwaddr prev_addr = 0u;
     hwaddr sa = 0u;
     hwaddr ea = 0u;
 
@@ -206,11 +206,12 @@ void pmp_update_rule_addr(CPURISCVState *env, uint32_t pmp_index)
         break;
 
     case PMP_AMATCH_TOR:
+        if (prev_addr >= this_addr) {
+            sa = ea = 0u;
+            break;
+        }
         sa = prev_addr << 2; /* shift up from [xx:0] to [xx+2:2] */
         ea = (this_addr << 2) - 1u;
-        if (sa > ea) {
-            sa = ea = 0u;
-        }
         break;
 
     case PMP_AMATCH_NA4:

@@ -182,6 +182,17 @@ void x86_cpu_plug(HotplugHandler *hotplug_dev,
         fw_cfg_modify_i16(x86ms->fw_cfg, FW_CFG_NB_CPUS, x86ms->boot_cpus);
     }
 
+    /*
+     * Non-hotplugged CPUs get their SMM cpu address space initialized in
+     * machine init done notifier: register_smram_listener().
+     *
+     * We need initialize the SMM cpu address space for the hotplugged CPU
+     * specifically.
+     */
+    if (kvm_enabled() && dev->hotplugged && x86_machine_is_smm_enabled(x86ms)) {
+        kvm_smm_cpu_address_space_init(cpu);
+    }
+
     found_cpu = x86_find_cpu_slot(MACHINE(x86ms), cpu->apic_id, NULL);
     found_cpu->cpu = CPU(dev);
 out:
@@ -642,7 +653,7 @@ void x86_load_linux(X86MachineState *x86ms,
     uint8_t header[8192], *setup, *kernel;
     hwaddr real_addr, prot_addr, cmdline_addr, initrd_addr = 0;
     FILE *f;
-    char *vmode;
+    const char *vmode;
     MachineState *machine = MACHINE(x86ms);
     struct setup_data *setup_data;
     const char *kernel_filename = machine->kernel_filename;

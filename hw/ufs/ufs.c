@@ -224,7 +224,8 @@ static MemTxResult ufs_dma_read_prdt(UfsRequest *req)
 
     for (uint16_t i = 0; i < prdt_len; ++i) {
         hwaddr data_dma_addr = le64_to_cpu(prd_entries[i].addr);
-        uint32_t data_byte_count = le32_to_cpu(prd_entries[i].size) + 1;
+        uint32_t data_byte_count =
+            (le32_to_cpu(prd_entries[i].size) & 0x3ffff) + 1;
         qemu_sglist_add(req->sg, data_dma_addr, data_byte_count);
         req->data_len += data_byte_count;
     }
@@ -446,17 +447,30 @@ static void ufs_mcq_process_cq(void *opaque)
 
     QTAILQ_FOREACH_SAFE(req, &cq->req_list, entry, next)
     {
+        if (ufs_mcq_cq_full(u, cq->cqid)) {
+            break;
+        }
+
         ufs_dma_write_rsp_upiu(req);
 
-        req->cqe.utp_addr =
-            ((uint64_t)req->utrd.command_desc_base_addr_hi << 32ULL) |
-            req->utrd.command_desc_base_addr_lo;
-        req->cqe.utp_addr |= req->sq->sqid;
-        req->cqe.resp_len = req->utrd.response_upiu_length;
-        req->cqe.resp_off = req->utrd.response_upiu_offset;
-        req->cqe.prdt_len = req->utrd.prd_table_length;
-        req->cqe.prdt_off = req->utrd.prd_table_offset;
-        req->cqe.status = req->utrd.header.dword_2 & 0xf;
+        /* UTRD/CQE are LE; round-trip through host to keep BE correct. */
+        uint64_t ucdba =
+            ((uint64_t)le32_to_cpu(req->utrd.command_desc_base_addr_hi)
+             << 32ULL) |
+            le32_to_cpu(req->utrd.command_desc_base_addr_lo);
+        uint16_t resp_len = le16_to_cpu(req->utrd.response_upiu_length);
+        uint16_t resp_off = le16_to_cpu(req->utrd.response_upiu_offset);
+        uint16_t prdt_len = le16_to_cpu(req->utrd.prd_table_length);
+        uint16_t prdt_off = le16_to_cpu(req->utrd.prd_table_offset);
+        uint8_t status = le32_to_cpu(req->utrd.header.dword_2) & UFS_MASK_OCS;
+
+        ucdba |= req->sq->sqid;
+        req->cqe.utp_addr = cpu_to_le64(ucdba);
+        req->cqe.resp_len = cpu_to_le16(resp_len);
+        req->cqe.resp_off = cpu_to_le16(resp_off);
+        req->cqe.prdt_len = cpu_to_le16(prdt_len);
+        req->cqe.prdt_off = cpu_to_le16(prdt_off);
+        req->cqe.status = status;
         req->cqe.error = 0;
 
         ret = ufs_addr_write(u, cq->addr + tail, &req->cqe, sizeof(req->cqe));
@@ -467,6 +481,12 @@ static void ufs_mcq_process_cq(void *opaque)
 
         tail = (tail + sizeof(req->cqe)) % (cq->size * sizeof(req->cqe));
         ufs_mcq_update_cq_tail(u, cq->cqid, tail);
+
+        if (QTAILQ_EMPTY(&req->sq->req_list) &&
+            !ufs_mcq_sq_empty(u, req->sq->sqid)) {
+            /* Dequeueing from SQ was blocked due to lack of free requests */
+            qemu_bh_schedule(req->sq->bh);
+        }
 
         ufs_clear_req(req);
         QTAILQ_INSERT_TAIL(&req->sq->req_list, req, entry);
@@ -486,6 +506,8 @@ static bool ufs_mcq_create_sq(UfsHc *u, uint8_t qid, uint32_t attr)
     UfsMcqReg *reg = &u->mcq_reg[qid];
     UfsSq *sq;
     uint8_t cqid = FIELD_EX32(attr, SQATTR, CQID);
+    uint16_t qsize =
+        ((FIELD_EX32(attr, SQATTR, SIZE) + 1) << 2) / sizeof(UfsSqEntry);
 
     if (qid >= u->params.mcq_maxq) {
         trace_ufs_err_mcq_create_sq_invalid_sqid(qid);
@@ -497,8 +519,18 @@ static bool ufs_mcq_create_sq(UfsHc *u, uint8_t qid, uint32_t attr)
         return false;
     }
 
+    if (cqid >= u->params.mcq_maxq) {
+        trace_ufs_err_mcq_create_sq_invalid_cqid(cqid);
+        return false;
+    }
+
     if (!u->cq[cqid]) {
-        trace_ufs_err_mcq_create_sq_invalid_cqid(qid);
+        trace_ufs_err_mcq_create_sq_invalid_cqid(cqid);
+        return false;
+    }
+
+    if (!qsize) {
+        trace_ufs_err_mcq_create_sq_invalid_size(qid);
         return false;
     }
 
@@ -507,7 +539,7 @@ static bool ufs_mcq_create_sq(UfsHc *u, uint8_t qid, uint32_t attr)
     sq->sqid = qid;
     sq->cq = u->cq[cqid];
     sq->addr = ((uint64_t)reg->squba << 32) | reg->sqlba;
-    sq->size = ((FIELD_EX32(attr, SQATTR, SIZE) + 1) << 2) / sizeof(UfsSqEntry);
+    sq->size = qsize;
 
     sq->bh = qemu_bh_new_guarded(ufs_mcq_process_sq, sq,
                                  &DEVICE(u)->mem_reentrancy_guard);
@@ -522,6 +554,31 @@ static bool ufs_mcq_create_sq(UfsHc *u, uint8_t qid, uint32_t attr)
 
     trace_ufs_mcq_create_sq(sq->sqid, sq->cq->cqid, sq->addr, sq->size);
     return true;
+}
+
+static bool ufs_mcq_sq_has_outstanding_req(UfsSq *sq)
+{
+    UfsRequest *req;
+    uint16_t free_reqs = 0;
+
+    QTAILQ_FOREACH(req, &sq->req_list, entry)
+    {
+        free_reqs++;
+    }
+
+    return free_reqs != sq->size;
+}
+
+static void ufs_mcq_free_sq(UfsSq *sq)
+{
+    qemu_bh_delete(sq->bh);
+
+    for (int i = 0; i < sq->size; i++) {
+        ufs_clear_req(&sq->req[i]);
+    }
+
+    g_free(sq->req);
+    g_free(sq);
 }
 
 static bool ufs_mcq_delete_sq(UfsHc *u, uint8_t qid)
@@ -540,9 +597,12 @@ static bool ufs_mcq_delete_sq(UfsHc *u, uint8_t qid)
 
     sq = u->sq[qid];
 
-    qemu_bh_delete(sq->bh);
-    g_free(sq->req);
-    g_free(sq);
+    if (ufs_mcq_sq_has_outstanding_req(sq)) {
+        trace_ufs_err_mcq_delete_sq_busy(qid);
+        return false;
+    }
+
+    ufs_mcq_free_sq(sq);
     u->sq[qid] = NULL;
     return true;
 }
@@ -551,6 +611,8 @@ static bool ufs_mcq_create_cq(UfsHc *u, uint8_t qid, uint32_t attr)
 {
     UfsMcqReg *reg = &u->mcq_reg[qid];
     UfsCq *cq;
+    uint16_t qsize =
+        ((FIELD_EX32(attr, CQATTR, SIZE) + 1) << 2) / sizeof(UfsCqEntry);
 
     if (qid >= u->params.mcq_maxq) {
         trace_ufs_err_mcq_create_cq_invalid_cqid(qid);
@@ -562,11 +624,16 @@ static bool ufs_mcq_create_cq(UfsHc *u, uint8_t qid, uint32_t attr)
         return false;
     }
 
+    if (!qsize) {
+        trace_ufs_err_mcq_create_cq_invalid_size(qid);
+        return false;
+    }
+
     cq = g_malloc0(sizeof(*cq));
     cq->u = u;
     cq->cqid = qid;
     cq->addr = ((uint64_t)reg->cquba << 32) | reg->cqlba;
-    cq->size = ((FIELD_EX32(attr, CQATTR, SIZE) + 1) << 2) / sizeof(UfsCqEntry);
+    cq->size = qsize;
 
     cq->bh = qemu_bh_new_guarded(ufs_mcq_process_cq, cq,
                                  &DEVICE(u)->mem_reentrancy_guard);
@@ -576,6 +643,12 @@ static bool ufs_mcq_create_cq(UfsHc *u, uint8_t qid, uint32_t attr)
 
     trace_ufs_mcq_create_cq(cq->cqid, cq->addr, cq->size);
     return true;
+}
+
+static void ufs_mcq_free_cq(UfsCq *cq)
+{
+    qemu_bh_delete(cq->bh);
+    g_free(cq);
 }
 
 static bool ufs_mcq_delete_cq(UfsHc *u, uint8_t qid)
@@ -601,8 +674,7 @@ static bool ufs_mcq_delete_cq(UfsHc *u, uint8_t qid)
 
     cq = u->cq[qid];
 
-    qemu_bh_delete(cq->bh);
-    g_free(cq);
+    ufs_mcq_free_cq(cq);
     u->cq[qid] = NULL;
     return true;
 }
@@ -755,6 +827,11 @@ static void ufs_mcq_process_db(UfsHc *u, uint8_t qid, uint32_t db)
     }
 
     sq = u->sq[qid];
+    if (!sq) {
+        trace_ufs_err_mcq_db_wr_invalid_sqid(qid);
+        return;
+    }
+
     if (sq->size * sizeof(UfsSqEntry) <= db) {
         trace_ufs_err_mcq_db_wr_invalid_db(qid, db);
         return;
@@ -768,7 +845,14 @@ static void ufs_write_mcq_op_reg(UfsHc *u, hwaddr offset, uint32_t data,
                                  unsigned size)
 {
     int qid = offset / sizeof(UfsMcqOpReg);
-    UfsMcqOpReg *opr = &u->mcq_op_reg[qid];
+    UfsMcqOpReg *opr;
+
+    if (qid >= u->params.mcq_maxq) {
+        trace_ufs_err_invalid_register_offset(offset);
+        return;
+    }
+
+    opr = &u->mcq_op_reg[qid];
 
     switch (offset % sizeof(UfsMcqOpReg)) {
     case offsetof(UfsMcqOpReg, sq.tp):
@@ -777,10 +861,22 @@ static void ufs_write_mcq_op_reg(UfsHc *u, hwaddr offset, uint32_t data,
         }
         opr->sq.tp = data;
         break;
-    case offsetof(UfsMcqOpReg, cq.hp):
+    case offsetof(UfsMcqOpReg, cq.hp): {
+        UfsCq *cq = u->cq[qid];
+
+        if (!cq) {
+            break;
+        }
+
+        if (ufs_mcq_cq_full(u, qid) && !QTAILQ_EMPTY(&cq->req_list)) {
+            /* Enqueueing to CQ was blocked because it was full */
+            qemu_bh_schedule(cq->bh);
+        }
+
         opr->cq.hp = data;
         ufs_mcq_update_cq_head(u, qid, data);
         break;
+    }
     case offsetof(UfsMcqOpReg, cq_int.is):
         opr->cq_int.is &= ~data;
         break;
@@ -1821,12 +1917,14 @@ static void ufs_exit(PCIDevice *pci_dev)
 
     for (int i = 0; i < ARRAY_SIZE(u->sq); i++) {
         if (u->sq[i]) {
-            ufs_mcq_delete_sq(u, i);
+            ufs_mcq_free_sq(u->sq[i]);
+            u->sq[i] = NULL;
         }
     }
     for (int i = 0; i < ARRAY_SIZE(u->cq); i++) {
         if (u->cq[i]) {
-            ufs_mcq_delete_cq(u, i);
+            ufs_mcq_free_cq(u->cq[i]);
+            u->cq[i] = NULL;
         }
     }
 }

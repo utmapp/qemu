@@ -54,7 +54,8 @@ static uint64_t xive_tctx_accept(XiveTCTX *tctx, uint8_t ring)
         uint8_t *alt_regs;
 
         /* POOL interrupt uses IPB in QW2, POOL ring */
-        if ((ring == TM_QW3_HV_PHYS) && (nsr & (TM_QW3_NSR_HE_POOL << 6))) {
+        if ((ring == TM_QW3_HV_PHYS) &&
+            ((nsr & TM_QW3_NSR_HE) == (TM_QW3_NSR_HE_POOL << 6))) {
             alt_ring = TM_QW2_HV_POOL;
         } else {
             alt_ring = ring;
@@ -326,7 +327,7 @@ static void xive_tm_raw_write(XiveTCTX *tctx, hwaddr offset, uint64_t value,
      */
     if (size < 4 || !mask || ring_offset == TM_QW0_USER) {
         qemu_log_mask(LOG_GUEST_ERROR, "XIVE: invalid write access at TIMA @%"
-                      HWADDR_PRIx"\n", offset);
+                      HWADDR_PRIx" size %d\n", offset, size);
         return;
     }
 
@@ -357,7 +358,7 @@ static uint64_t xive_tm_raw_read(XiveTCTX *tctx, hwaddr offset, unsigned size)
      */
     if (size < 4 || !mask || ring_offset == TM_QW0_USER) {
         qemu_log_mask(LOG_GUEST_ERROR, "XIVE: invalid read access at TIMA @%"
-                      HWADDR_PRIx"\n", offset);
+                      HWADDR_PRIx" size %d\n", offset, size);
         return -1;
     }
 
@@ -688,7 +689,7 @@ void xive_tctx_tm_write(XivePresenter *xptr, XiveTCTX *tctx, hwaddr offset,
         xto = xive_tm_find_op(tctx->xptr, offset, size, true);
         if (!xto) {
             qemu_log_mask(LOG_GUEST_ERROR, "XIVE: invalid write access at TIMA "
-                          "@%"HWADDR_PRIx"\n", offset);
+                          "@%"HWADDR_PRIx" size %d\n", offset, size);
         } else {
             xto->write_handler(xptr, tctx, offset, value, size);
         }
@@ -727,7 +728,7 @@ uint64_t xive_tctx_tm_read(XivePresenter *xptr, XiveTCTX *tctx, hwaddr offset,
         xto = xive_tm_find_op(tctx->xptr, offset, size, false);
         if (!xto) {
             qemu_log_mask(LOG_GUEST_ERROR, "XIVE: invalid read access to TIMA"
-                          "@%"HWADDR_PRIx"\n", offset);
+                          "@%"HWADDR_PRIx" size %d\n", offset, size);
             return -1;
         }
         ret = xto->read_handler(xptr, tctx, offset, size);

@@ -13,12 +13,8 @@
 import logging
 from subprocess import check_call, DEVNULL
 
-from qemu.machine.machine import VMLaunchFailure
-
-from qemu_test import QemuSystemTest, Asset
-from qemu_test import exec_command, exec_command_and_wait_for_pattern
-from qemu_test import wait_for_console_pattern
-from qemu_test import skipIfMissingCommands, get_qemu_img
+from qemu_test import QemuSystemTest, Asset, exec_command_and_wait_for_pattern
+from qemu_test import wait_for_console_pattern, get_qemu_img
 
 
 class Aarch64VirtMachine(QemuSystemTest):
@@ -64,8 +60,7 @@ class Aarch64VirtMachine(QemuSystemTest):
 
 
     ASSET_KERNEL = Asset(
-        ('https://fileserver.linaro.org/s/'
-         'z6B2ARM7DQT3HWN/download'),
+        'https://share.linaro.org/downloadFile?id=3zGlbmXh8pXFewt',
         '12a54d4805cda6ab647cb7c7bbdb16fafb3df400e0d6f16445c1a0436100ef8d')
 
     def common_aarch64_virt(self, machine):
@@ -83,7 +78,7 @@ class Aarch64VirtMachine(QemuSystemTest):
         self.vm.set_console()
         kernel_command_line = (self.KERNEL_COMMON_COMMAND_LINE +
                                'console=ttyAMA0')
-        self.vm.add_args('-cpu', 'max,pauth-impdef=on',
+        self.vm.add_args('-cpu', 'max',
                          '-machine', machine,
                          '-accel', 'tcg',
                          '-kernel', kernel_path,

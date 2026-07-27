@@ -265,6 +265,20 @@ void helper_cbo_inval(CPURISCVState *env, target_ulong address)
     /* We don't emulate the cache-hierarchy, so we're done. */
 }
 
+void helper_sc_probe_write(CPURISCVState *env, target_ulong addr,
+                           target_ulong size)
+{
+    uintptr_t ra = GETPC();
+    int mmu_idx = riscv_env_mmu_index(env, false);
+
+    if (addr & (size - 1)) {
+        env->badaddr = addr;
+        riscv_raise_exception(env, RISCV_EXCP_STORE_AMO_ADDR_MIS, ra);
+    }
+
+    probe_write(env, addr, size, mmu_idx, ra);
+}
+
 #ifndef CONFIG_USER_ONLY
 
 target_ulong helper_sret(CPURISCVState *env)
@@ -353,21 +367,22 @@ target_ulong helper_sret(CPURISCVState *env)
 }
 
 static void check_ret_from_m_mode(CPURISCVState *env, target_ulong retpc,
-                                  target_ulong prev_priv)
+                                  target_ulong prev_priv,
+                                  uintptr_t ra)
 {
     if (!(env->priv >= PRV_M)) {
-        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
+        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);
     }
 
     if (!riscv_cpu_allow_16bit_insn(&env_archcpu(env)->cfg,
                                     env->priv_ver,
                                     env->misa_ext) && (retpc & 0x3)) {
-        riscv_raise_exception(env, RISCV_EXCP_INST_ADDR_MIS, GETPC());
+        riscv_raise_exception(env, RISCV_EXCP_INST_ADDR_MIS, ra);
     }
 
     if (riscv_cpu_cfg(env)->pmp &&
         !pmp_get_num_rules(env) && (prev_priv != PRV_M)) {
-        riscv_raise_exception(env, RISCV_EXCP_INST_ACCESS_FAULT, GETPC());
+        riscv_raise_exception(env, RISCV_EXCP_INST_ACCESS_FAULT, ra);
     }
 }
 static target_ulong ssdbltrp_mxret(CPURISCVState *env, target_ulong mstatus,
@@ -392,8 +407,9 @@ target_ulong helper_mret(CPURISCVState *env)
     target_ulong retpc = env->mepc;
     uint64_t mstatus = env->mstatus;
     target_ulong prev_priv = get_field(mstatus, MSTATUS_MPP);
+    uintptr_t ra = GETPC();
 
-    check_ret_from_m_mode(env, retpc, prev_priv);
+    check_ret_from_m_mode(env, retpc, prev_priv, ra);
 
     target_ulong prev_virt = get_field(env->mstatus, MSTATUS_MPV) &&
                              (prev_priv != PRV_M);
@@ -441,8 +457,9 @@ target_ulong helper_mnret(CPURISCVState *env)
     target_ulong retpc = env->mnepc;
     target_ulong prev_priv = get_field(env->mnstatus, MNSTATUS_MNPP);
     target_ulong prev_virt;
+    uintptr_t ra = GETPC();
 
-    check_ret_from_m_mode(env, retpc, prev_priv);
+    check_ret_from_m_mode(env, retpc, prev_priv, ra);
 
     prev_virt = get_field(env->mnstatus, MNSTATUS_MNPV) &&
                 (prev_priv != PRV_M);
@@ -710,6 +727,55 @@ target_ulong helper_hyp_hlvx_wu(CPURISCVState *env, target_ulong addr)
     MemOpIdx oi = make_memop_idx(MO_TEUL, mmu_idx);
 
     return cpu_ldl_code_mmu(env, addr, oi, ra);
+}
+
+void helper_ssamoswap_disabled(CPURISCVState *env)
+{
+    int exception = RISCV_EXCP_ILLEGAL_INST;
+
+    /*
+     * Here we follow the RISC-V CFI spec [1] to implement the exception type
+     * of ssamoswap* instruction.
+     *
+     * [1] RISC-V CFI spec v1.0, ch2.7 Atomic Swap from a Shadow Stack Location
+     *
+     * Note: We have already checked some conditions in trans_* functions:
+     *   1. The effective priv mode is not M-mode.
+     *   2. The xSSE specific to the effictive priv mode is disabled.
+     */
+    if (!get_field(env->menvcfg, MENVCFG_SSE)) {
+        /*
+         * Disabled M-mode SSE always trigger illegal instruction when
+         * current priv mode is not M-mode.
+         */
+        exception = RISCV_EXCP_ILLEGAL_INST;
+        goto done;
+    }
+
+    if (!riscv_has_ext(env, RVS)) {
+        /* S-mode is not implemented */
+        exception = RISCV_EXCP_ILLEGAL_INST;
+        goto done;
+    } else if (env->virt_enabled) {
+        /*
+         * VU/VS-mode with disabled xSSE will trigger the virtual instruction
+         * exception.
+         */
+        exception = RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+        goto done;
+    } else {
+        /*
+         * U-mode with disabled S-mode SSE will trigger the illegal instruction
+         * exception.
+         *
+         * Note: S-mode is already handled in the disabled M-mode SSE case.
+         */
+        exception = RISCV_EXCP_ILLEGAL_INST;
+        goto done;
+    }
+
+done:
+    riscv_raise_exception(env, exception, GETPC());
 }
 
 #endif /* !CONFIG_USER_ONLY */

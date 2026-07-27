@@ -344,21 +344,15 @@ void virtio_serial_throttle_port(VirtIOSerialPort *port, bool throttle)
 }
 
 /* Guest wants to notify us of some event */
-static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
+static void handle_control_message(VirtIOSerial *vser,
+                                   struct virtio_console_control *gcpkt)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(vser);
     struct VirtIOSerialPort *port;
     VirtIOSerialPortClass *vsc;
-    struct virtio_console_control cpkt, *gcpkt;
+    struct virtio_console_control cpkt;
     uint8_t *buffer;
     size_t buffer_len;
-
-    gcpkt = buf;
-
-    if (len < sizeof(cpkt)) {
-        /* The guest sent an invalid control packet */
-        return;
-    }
 
     cpkt.event = virtio_lduw_p(vdev, &gcpkt->event);
     cpkt.value = virtio_lduw_p(vdev, &gcpkt->value);
@@ -457,41 +451,27 @@ static void control_in(VirtIODevice *vdev, VirtQueue *vq)
 
 static void control_out(VirtIODevice *vdev, VirtQueue *vq)
 {
+    struct virtio_console_control cpkt;
     VirtQueueElement *elem;
     VirtIOSerial *vser;
-    uint8_t *buf;
     size_t len;
 
     vser = VIRTIO_SERIAL(vdev);
 
-    len = 0;
-    buf = NULL;
     for (;;) {
-        size_t cur_len;
-
         elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
         if (!elem) {
             break;
         }
 
-        cur_len = iov_size(elem->out_sg, elem->out_num);
-        /*
-         * Allocate a new buf only if we didn't have one previously or
-         * if the size of the buf differs
-         */
-        if (cur_len > len) {
-            g_free(buf);
-
-            buf = g_malloc(cur_len);
-            len = cur_len;
+        len = iov_to_buf(elem->out_sg, elem->out_num, 0, &cpkt, sizeof(cpkt));
+        if (len == sizeof(cpkt)) {
+            handle_control_message(vser, &cpkt);
         }
-        iov_to_buf(elem->out_sg, elem->out_num, 0, buf, cur_len);
 
-        handle_control_message(vser, buf, cur_len);
         virtqueue_push(vq, elem, 0);
         g_free(elem);
     }
-    g_free(buf);
     virtio_notify(vdev, vq);
 }
 

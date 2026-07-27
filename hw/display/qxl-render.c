@@ -217,21 +217,30 @@ void qxl_render_update_area_done(PCIQXLDevice *qxl, QXLCookie *cookie)
 }
 
 static void qxl_unpack_chunks(void *dest, size_t size, PCIQXLDevice *qxl,
-                              QXLDataChunk *chunk, uint32_t group_id)
+                              QXLDataChunk *chunk, uint32_t group_id,
+                              uint32_t chunk_data_size)
 {
     uint32_t max_chunks = 32;
     size_t offset = 0;
     size_t bytes;
+    QXLPHYSICAL next_chunk_phys = 0;
 
     for (;;) {
-        bytes = MIN(size - offset, chunk->data_size);
+        bytes = MIN(size - offset, chunk_data_size);
         memcpy(dest + offset, chunk->data, bytes);
         offset += bytes;
         if (offset == size) {
             return;
         }
-        chunk = qxl_phys2virt(qxl, chunk->next_chunk, group_id,
-                              sizeof(QXLDataChunk) + chunk->data_size);
+        next_chunk_phys = chunk->next_chunk;
+        chunk = qxl_phys2virt(qxl, next_chunk_phys, group_id,
+                              sizeof(QXLDataChunk));
+        if (!chunk) {
+            return;
+        }
+        chunk_data_size = chunk->data_size;
+        chunk = qxl_phys2virt(qxl, next_chunk_phys, group_id,
+                              sizeof(QXLDataChunk) + chunk_data_size);
         if (!chunk) {
             return;
         }
@@ -243,7 +252,7 @@ static void qxl_unpack_chunks(void *dest, size_t size, PCIQXLDevice *qxl,
 }
 
 static QEMUCursor *qxl_cursor(PCIQXLDevice *qxl, QXLCursor *cursor,
-                              uint32_t group_id)
+                              uint32_t group_id, uint32_t chunk_data_size)
 {
     QEMUCursor *c;
     uint8_t *and_mask, *xor_mask;
@@ -263,9 +272,11 @@ static QEMUCursor *qxl_cursor(PCIQXLDevice *qxl, QXLCursor *cursor,
     case SPICE_CURSOR_TYPE_MONO:
         /* Assume that the full cursor is available in a single chunk. */
         size = 2 * cursor_get_mono_bpl(c) * c->height;
-        if (size != cursor->data_size) {
-            fprintf(stderr, "%s: bad monochrome cursor %ux%u with size %u\n",
-                    __func__, c->width, c->height, cursor->data_size);
+        if (size != cursor->data_size || chunk_data_size < size) {
+            qxl_set_guest_bug(qxl, "%s: bad monochrome cursor %ux%u"
+                              " data_size %u chunk_size %u",
+                              __func__, c->width, c->height,
+                              cursor->data_size, chunk_data_size);
             goto fail;
         }
         and_mask = cursor->chunk.data;
@@ -277,7 +288,8 @@ static QEMUCursor *qxl_cursor(PCIQXLDevice *qxl, QXLCursor *cursor,
         break;
     case SPICE_CURSOR_TYPE_ALPHA:
         size = sizeof(uint32_t) * c->width * c->height;
-        qxl_unpack_chunks(c->data, size, qxl, &cursor->chunk, group_id);
+        qxl_unpack_chunks(c->data, size, qxl, &cursor->chunk, group_id,
+                          chunk_data_size);
         if (qxl->debug > 2) {
             cursor_print_ascii_art(c, "qxl/alpha");
         }
@@ -314,19 +326,23 @@ int qxl_render_cursor(PCIQXLDevice *qxl, QXLCommandExt *ext)
     }
     switch (cmd->type) {
     case QXL_CURSOR_SET:
+    {
+        uint32_t chunk_data_size;
+
         /* First read the QXLCursor to get QXLDataChunk::data_size ... */
         cursor = qxl_phys2virt(qxl, cmd->u.set.shape, ext->group_id,
                                sizeof(QXLCursor));
         if (!cursor) {
             return 1;
         }
+        chunk_data_size = cursor->chunk.data_size;
         /* Then read including the chunked data following QXLCursor. */
         cursor = qxl_phys2virt(qxl, cmd->u.set.shape, ext->group_id,
-                               sizeof(QXLCursor) + cursor->chunk.data_size);
+                               sizeof(QXLCursor) + chunk_data_size);
         if (!cursor) {
             return 1;
         }
-        c = qxl_cursor(qxl, cursor, ext->group_id);
+        c = qxl_cursor(qxl, cursor, ext->group_id, chunk_data_size);
         if (c == NULL) {
             c = cursor_builtin_left_ptr();
         }
@@ -340,6 +356,7 @@ int qxl_render_cursor(PCIQXLDevice *qxl, QXLCommandExt *ext)
         qemu_mutex_unlock(&qxl->ssd.lock);
         qemu_bh_schedule(qxl->ssd.cursor_bh);
         break;
+    }
     case QXL_CURSOR_MOVE:
         qemu_mutex_lock(&qxl->ssd.lock);
         qxl->ssd.mouse_x = cmd->u.position.x;

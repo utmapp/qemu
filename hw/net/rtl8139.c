@@ -2131,6 +2131,26 @@ static int rtl8139_cplus_transmit_one(RTL8139State *s)
                     hlen, ip->ip_sum);
             }
 
+            /*
+             * The code in this function triggers a GCC bug where an
+             * interaction between -fsanitize=address and -Wstringop-overflow
+             * results in a false-positive stringop-overflow warning that is
+             * only emitted when the address sanitizer is enabled:
+             *     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114494
+             *     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=99673
+             * GCC incorrectly thinks that the eth_payload_data buffer has
+             * the type and size of the first field in 'struct ip_header', i.e.
+             * one byte, and then complains about all other attempts to access
+             * data in the buffer.
+             *
+             * Work around this by disabling the warning when building with
+             * GCC and the address sanitizer is enabled.
+             */
+#pragma GCC diagnostic push
+#if !defined(__clang__) && defined(QEMU_SANITIZE_ADDRESS)
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
+
             if ((txdw0 & CP_TX_LGSEN) && ip_protocol == IP_PROTO_TCP)
             {
                 /* Large enough for the TCP header? */
@@ -2314,6 +2334,9 @@ static int rtl8139_cplus_transmit_one(RTL8139State *s)
                 /* restore IP header */
                 memcpy(eth_payload_data, saved_ip_header, hlen);
             }
+
+#pragma GCC diagnostic pop
+
         }
 
 skip_offload:

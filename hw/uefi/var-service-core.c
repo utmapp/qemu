@@ -133,9 +133,8 @@ static uint32_t uefi_vars_cmd_mm(uefi_vars_state *uv, bool dma_mode)
                          uv->buffer, sizeof(*mhdr) + mhdr->length,
                          MEMTXATTRS_UNSPECIFIED);
     } else {
-        memcpy(uv->pio_xfer_buffer + sizeof(*mhdr),
-               uv->buffer + sizeof(*mhdr),
-               sizeof(*mhdr) + mhdr->length);
+        memcpy(uv->pio_xfer_buffer,
+               uv->buffer, sizeof(*mhdr) + mhdr->length);
     }
 
     return retval;
@@ -230,6 +229,10 @@ static uint64_t uefi_vars_read(void *opaque, hwaddr addr, unsigned size)
         uv->pio_xfer_offset += size;
         break;
     case UEFI_VARS_REG_PIO_BUFFER_CRC32C:
+        if (uv->pio_xfer_offset > uv->buf_size) {
+            retval = 0;
+            break;
+        }
         retval = crc32c(0xffffffff, uv->pio_xfer_buffer, uv->pio_xfer_offset);
         break;
     case UEFI_VARS_REG_FLAGS:
@@ -259,8 +262,8 @@ static void uefi_vars_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         uv->buf_size = val;
         g_free(uv->buffer);
         g_free(uv->pio_xfer_buffer);
-        uv->buffer = g_malloc(uv->buf_size);
-        uv->pio_xfer_buffer = g_malloc(uv->buf_size);
+        uv->buffer = g_malloc0(uv->buf_size);
+        uv->pio_xfer_buffer = g_malloc0(uv->buf_size);
         break;
     case UEFI_VARS_REG_DMA_BUFFER_ADDR_LO:
         uv->buf_addr_lo = val;

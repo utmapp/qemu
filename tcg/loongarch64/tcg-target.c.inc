@@ -211,12 +211,24 @@ static bool tcg_target_const_match(int64_t val, int ct,
     if ((ct & TCG_CT_CONST_WSZ) && val == (type == TCG_TYPE_I32 ? 32 : 64)) {
         return true;
     }
-    int64_t vec_val = sextract64(val, 0, 8 << vece);
-    if ((ct & TCG_CT_CONST_VCMP) && -0x10 <= vec_val && vec_val <= 0x1f) {
-        return true;
-    }
-    if ((ct & TCG_CT_CONST_VADD) && -0x1f <= vec_val && vec_val <= 0x1f) {
-        return true;
+    if (ct & (TCG_CT_CONST_VCMP | TCG_CT_CONST_VADD)) {
+        int64_t vec_val = sextract64(val, 0, 8 << vece);
+        if (ct & TCG_CT_CONST_VCMP) {
+            switch (cond) {
+            case TCG_COND_EQ:
+            case TCG_COND_LE:
+            case TCG_COND_LT:
+                return -0x10 <= vec_val && vec_val <= 0x0f;
+            case TCG_COND_LEU:
+            case TCG_COND_LTU:
+                return 0x00 <= vec_val && vec_val <= 0x1f;
+            default:
+                return false;
+            }
+        }
+        if ((ct & TCG_CT_CONST_VADD) && -0x1f <= vec_val && vec_val <= 0x1f) {
+            return true;
+        }
     }
     return false;
 }
@@ -2027,40 +2039,51 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                  * Try vseqi/vslei/vslti
                  */
                 int64_t value = sextract64(a2, 0, 8 << vece);
-                if ((cond == TCG_COND_EQ ||
-                     cond == TCG_COND_LE ||
-                     cond == TCG_COND_LT) &&
-                    (-0x10 <= value && value <= 0x0f)) {
+                switch (cond) {
+                case TCG_COND_EQ:
+                case TCG_COND_LE:
+                case TCG_COND_LT:
                     insn = cmp_vec_imm_insn[cond][lasx][vece];
                     tcg_out32(s, encode_vdvjsk5_insn(insn, a0, a1, value));
                     break;
-                } else if ((cond == TCG_COND_LEU ||
-                            cond == TCG_COND_LTU) &&
-                           (0x00 <= value && value <= 0x1f)) {
+                case TCG_COND_LEU:
+                case TCG_COND_LTU:
                     insn = cmp_vec_imm_insn[cond][lasx][vece];
                     tcg_out32(s, encode_vdvjuk5_insn(insn, a0, a1, value));
                     break;
+                default:
+                    g_assert_not_reached();
                 }
-
-                /*
-                 * Fallback to:
-                 * dupi_vec temp, a2
-                 * cmp_vec a0, a1, temp, cond
-                 */
-                tcg_out_dupi_vec(s, type, vece, TCG_VEC_TMP0, a2);
-                a2 = TCG_VEC_TMP0;
-            }
-
-            insn = cmp_vec_insn[cond][lasx][vece];
-            if (insn == 0) {
-                TCGArg t;
-                t = a1, a1 = a2, a2 = t;
-                cond = tcg_swap_cond(cond);
-                insn = cmp_vec_insn[cond][lasx][vece];
-                tcg_debug_assert(insn != 0);
+            } else {
+                switch (cond) {
+                case TCG_COND_EQ:
+                case TCG_COND_LE:
+                case TCG_COND_LEU:
+                case TCG_COND_LT:
+                case TCG_COND_LTU:
+                    insn = cmp_vec_insn[cond][lasx][vece];
+                    tcg_out32(s, encode_vdvjvk_insn(insn, a0, a1, a2));
+                    break;
+                case TCG_COND_GE:
+                case TCG_COND_GEU:
+                case TCG_COND_GT:
+                case TCG_COND_GTU:
+                    insn = cmp_vec_insn[tcg_swap_cond(cond)][lasx][vece];
+                    tcg_out32(s, encode_vdvjvk_insn(insn, a0, a2, a1));
+                    break;
+                case TCG_COND_NE:
+                    /* ne -> not(eq) */
+                    insn = cmp_vec_insn[TCG_COND_EQ][lasx][vece];
+                    tcg_out32(s, encode_vdvjvk_insn(insn, a0, a1, a2));
+                    insn = lasx ? OPC_XVNOR_V : OPC_VNOR_V;
+                    tcg_out32(s, encode_vdvjvk_insn(insn, a0, a0, a0));
+                    break;
+                default:
+                    g_assert_not_reached();
+                }
             }
         }
-        goto vdvjvk;
+        break;
     case INDEX_op_add_vec:
         tcg_out_addsub_vec(s, lasx, vece, a0, a1, a2, const_args[2], true);
         break;

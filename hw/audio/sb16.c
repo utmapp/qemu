@@ -1287,6 +1287,13 @@ static int sb16_post_load (void *opaque, int version_id)
 {
     SB16State *s = opaque;
 
+
+    if (s->in_index < 0 || s->in_index > (int)sizeof(s->in2_data)) {
+        return -1;
+    }
+    if (s->out_data_len < 0 || s->out_data_len > (int)sizeof(s->out_data)) {
+        return -1;
+    }
     if (s->voice) {
         AUD_close_out (&s->card, s->voice);
         s->voice = NULL;

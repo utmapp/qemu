@@ -200,6 +200,22 @@ static inline bool ufs_mcq_cq_empty(UfsHc *u, uint32_t qid)
     return ufs_mcq_cq_tail(u, qid) == ufs_mcq_cq_head(u, qid);
 }
 
+static inline bool ufs_mcq_cq_full(UfsHc *u, uint32_t qid)
+{
+    uint32_t tail = ufs_mcq_cq_tail(u, qid);
+    UfsCq *cq = u->cq[qid];
+    uint16_t cq_size;
+
+    if (!cq) {
+        return false;
+    }
+
+    cq_size = cq->size;
+
+    tail = (tail + sizeof(UfsCqEntry)) % (sizeof(UfsCqEntry) * cq_size);
+    return tail == ufs_mcq_cq_head(u, qid);
+}
+
 #define TYPE_UFS "ufs"
 #define UFS(obj) OBJECT_CHECK(UfsHc, (obj), TYPE_UFS)
 

@@ -188,12 +188,27 @@ void xive2_eas_pic_print_info(Xive2Eas *eas, uint32_t lisn, GString *buf)
                            (uint32_t) xive_get_field64(EAS2_END_DATA, eas->w));
 }
 
+#define XIVE2_QSIZE_CHUNK_CL    128
+#define XIVE2_QSIZE_CHUNK_4k   4096
+/* Calculate max number of queue entries for an END */
+static uint32_t xive2_end_get_qentries(Xive2End *end)
+{
+    uint32_t w3 = end->w3;
+    uint32_t qsize = xive_get_field32(END2_W3_QSIZE, w3);
+    if (xive_get_field32(END2_W3_CL, w3)) {
+        g_assert(qsize <= 4);
+        return (XIVE2_QSIZE_CHUNK_CL << qsize) / sizeof(uint32_t);
+    } else {
+        g_assert(qsize <= 12);
+        return (XIVE2_QSIZE_CHUNK_4k << qsize) / sizeof(uint32_t);
+    }
+}
+
 void xive2_end_queue_pic_print_info(Xive2End *end, uint32_t width, GString *buf)
 {
     uint64_t qaddr_base = xive2_end_qaddr(end);
-    uint32_t qsize = xive_get_field32(END2_W3_QSIZE, end->w3);
     uint32_t qindex = xive_get_field32(END2_W1_PAGE_OFF, end->w1);
-    uint32_t qentries = 1 << (qsize + 10);
+    uint32_t qentries = xive2_end_get_qentries(end);
     int i;
 
     /*
@@ -223,8 +238,7 @@ void xive2_end_pic_print_info(Xive2End *end, uint32_t end_idx, GString *buf)
     uint64_t qaddr_base = xive2_end_qaddr(end);
     uint32_t qindex = xive_get_field32(END2_W1_PAGE_OFF, end->w1);
     uint32_t qgen = xive_get_field32(END2_W1_GENERATION, end->w1);
-    uint32_t qsize = xive_get_field32(END2_W3_QSIZE, end->w3);
-    uint32_t qentries = 1 << (qsize + 10);
+    uint32_t qentries = xive2_end_get_qentries(end);
 
     uint32_t nvx_blk = xive_get_field32(END2_W6_VP_BLOCK, end->w6);
     uint32_t nvx_idx = xive_get_field32(END2_W6_VP_OFFSET, end->w6);
@@ -341,13 +355,12 @@ void xive2_nvgc_pic_print_info(Xive2Nvgc *nvgc, uint32_t nvgc_idx, GString *buf)
 static void xive2_end_enqueue(Xive2End *end, uint32_t data)
 {
     uint64_t qaddr_base = xive2_end_qaddr(end);
-    uint32_t qsize = xive_get_field32(END2_W3_QSIZE, end->w3);
     uint32_t qindex = xive_get_field32(END2_W1_PAGE_OFF, end->w1);
     uint32_t qgen = xive_get_field32(END2_W1_GENERATION, end->w1);
 
     uint64_t qaddr = qaddr_base + (qindex << 2);
     uint32_t qdata = cpu_to_be32((qgen << 31) | (data & 0x7fffffff));
-    uint32_t qentries = 1 << (qsize + 10);
+    uint32_t qentries = xive2_end_get_qentries(end);
 
     if (dma_memory_write(&address_space_memory, qaddr, &qdata, sizeof(qdata),
                          MEMTXATTRS_UNSPECIFIED)) {
@@ -361,8 +374,8 @@ static void xive2_end_enqueue(Xive2End *end, uint32_t data)
         qgen ^= 1;
         end->w1 = xive_set_field32(END2_W1_GENERATION, end->w1, qgen);
 
-        /* TODO(PowerNV): reset GF bit on a cache watch operation */
-        end->w1 = xive_set_field32(END2_W1_GEN_FLIPPED, end->w1, qgen);
+        /* Set gen flipped to 1, it gets reset on a cache watch operation */
+        end->w1 = xive_set_field32(END2_W1_GEN_FLIPPED, end->w1, 1);
     }
     end->w1 = xive_set_field32(END2_W1_PAGE_OFF, end->w1, qindex);
 }
@@ -822,8 +835,9 @@ static void xive2_tctx_need_resend(Xive2Router *xrtr, XiveTCTX *tctx,
         nvp.w2 = xive_set_field32(NVP2_W2_IPB, nvp.w2, 0);
         xive2_router_write_nvp(xrtr, nvp_blk, nvp_idx, &nvp, 2);
     }
+    /* IPB bits in the backlog are merged with the TIMA IPB bits */
     regs[TM_IPB] |= ipb;
-    backlog_prio = xive_ipb_to_pipr(ipb);
+    backlog_prio = xive_ipb_to_pipr(regs[TM_IPB]);
     backlog_level = 0;
 
     first_group = xive_get_field32(NVP2_W0_PGOFIRST, nvp.w0);
@@ -981,7 +995,9 @@ static void xive2_tctx_set_cppr(XiveTCTX *tctx, uint8_t ring, uint8_t cppr)
             }
         }
     }
-    regs[TM_PIPR] = pipr_min;
+
+    /* PIPR should not be set to a value greater than CPPR */
+    regs[TM_PIPR] = (pipr_min > cppr) ? cppr : pipr_min;
 
     rc = xive2_tctx_get_nvp_indexes(tctx, ring_min, &nvp_blk, &nvp_idx);
     if (rc) {
@@ -1269,7 +1285,7 @@ bool xive2_tm_irq_precluded(XiveTCTX *tctx, int ring, uint8_t priority)
      * priority to know if the thread can take the interrupt now or if
      * it is precluded.
      */
-    if (priority < alt_regs[TM_CPPR]) {
+    if (priority < alt_regs[TM_PIPR]) {
         return false;
     }
     return true;

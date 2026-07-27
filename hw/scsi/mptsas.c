@@ -811,6 +811,10 @@ static void mptsas_soft_reset(MPTSASState *s)
     s->intr_status = 0;
     s->intr_mask = save_mask;
 
+    s->doorbell_state = DOORBELL_NONE;
+    s->doorbell_reply_idx = 0;
+    s->doorbell_reply_size = 0;
+
     s->reply_free_tail = 0;
     s->reply_free_head = 0;
     s->reply_post_tail = 0;

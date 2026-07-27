@@ -190,6 +190,18 @@ static void usb_xhci_pci_exit(PCIDevice *dev)
         && dev->msix_entry_used) {
         msix_uninit(dev, &s->xhci.mem, &s->xhci.mem);
     }
+    /*
+     * The embedded xhci-core child holds a strong "host" link back to this
+     * PCI device (set in usb_xhci_pci_realize()), forming a refcount cycle:
+     * the PCI device owns the child, and the child's strong link pins the PCI
+     * device. On unplug, object_unparent() only drops the parent/bus refs, so
+     * the link ref keeps this device at refcount 1 forever and
+     * device_finalize() never runs. Unrealize the child first (so the
+     * realized-check in set_link passes), then clear the link to break the
+     * cycle.
+     */
+    qdev_unrealize(DEVICE(&s->xhci));
+    object_property_set_link(OBJECT(&s->xhci), "host", NULL, &error_abort);
 }
 
 static const VMStateDescription vmstate_xhci_pci = {
