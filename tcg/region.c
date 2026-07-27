@@ -707,15 +707,10 @@ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error **errp)
 
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
     if (__builtin_available(iOS 26, visionOS 26, watchOS 26, tvOS 26, *)) {
-        if (!is_debugger_attached()) {
-            error_setg(errp, "debugger must be attached for jit workaround");
-            munmap((void *)buf_rx, size);
-            munmap((void *)buf_rw, size);
-            return -1;
+        if (is_debugger_attached()) {
+            /* let debugger modify the page permission */
+            break_prepare_jit_region(buf_rx, size);
         }
-
-        /* give let debugger modify the page permission */
-        break_prepare_jit_region(buf_rx, size);
 
         /* finally mark the read-write portion as RW */
         if (mprotect((void *)buf_rw, size, PROT_READ | PROT_WRITE) != 0) {
