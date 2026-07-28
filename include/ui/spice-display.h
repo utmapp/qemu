@@ -145,6 +145,10 @@ struct SimpleSpiceDisplay {
 #if defined(CONFIG_IOSURFACE)
     IOSurfaceRef iosurface;
     int surface_send_fd;
+    /* last geometry sent via spice_qxl_gl_scanout/monitor_config so we can
+     * skip re-sending the scanout for pure back-buffer flips */
+    uint32_t scanout_last_x, scanout_last_y, scanout_last_w, scanout_last_h;
+    bool scanout_last_y0top;
 #if defined(CONFIG_METAL)
     SpiceDisplayMetalContext metal_context;
 #endif

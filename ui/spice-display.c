@@ -995,18 +995,19 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
     ssd->iosurface = NULL;
 }
 
-static bool spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height)
+/* returns -1 on error, 0 if the surface is unchanged, 1 if (re)created */
+static int spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height)
 {
     if (ssd->iosurface) {
         if (IOSurfaceGetHeight(ssd->iosurface) != height ||
             IOSurfaceGetWidth(ssd->iosurface) != width) {
             spice_iosurface_destroy(ssd);
-            return spice_iosurface_create(ssd, width, height);
+            return spice_iosurface_create(ssd, width, height) ? 1 : -1;
         } else {
-            return true;
+            return 0;
         }
     } else {
-        return spice_iosurface_create(ssd, width, height);
+        return spice_iosurface_create(ssd, width, height) ? 1 : -1;
     }
 }
 
@@ -1277,7 +1278,7 @@ static void spice_gl_switch(DisplayChangeListener *dcl,
             qemu_spice_display_metal_scanout_disable(ssd->metal_context);
         }
 #endif
-        if (spice_iosurface_resize(ssd, width, height)) {
+        if (spice_iosurface_resize(ssd, width, height) >= 0) {
             fd = spice_iosurface_create_fd(ssd, &fourcc);
             if (fd < 0) {
                 error_report("spice_gl_switch: failed to create fd");
@@ -1390,13 +1391,12 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
 #if defined(CONFIG_GBM)
     fd = egl_get_fd_for_texture(tex_id, &stride, &fourcc, NULL);
 #elif defined(CONFIG_IOSURFACE)
-    if (spice_iosurface_resize(ssd, backing_width, backing_height)) {
-        ssd->tex_id = tex_id;
-        ssd->y_0_top = y_0_top;
-        fd = spice_iosurface_create_fd(ssd, &fourcc);
-    } else {
-        fd = -1;
+    int res = spice_iosurface_resize(ssd, backing_width, backing_height);
+    if (res < 0) {
+        fprintf(stderr, "%s: failed to create IOSurface\n", __func__);
+        return;
     }
+    ssd->tex_id = tex_id;
 #if defined(CONFIG_METAL)
     if (ssd->metal_context && native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL) {
         qemu_spice_display_metal_scanout_texture(ssd->metal_context,
@@ -1406,6 +1406,26 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
         qemu_spice_display_metal_scanout_disable(ssd->metal_context);
     }
 #endif
+    /*
+     * Guests using flip-model presentation issue a set_scanout for every
+     * frame with a different backing buffer of the same dimensions. The
+     * IOSurface (and its ID) is unchanged in that case, so avoid spamming
+     * the SPICE client with gl_scanout/monitors_config messages (which
+     * would also close the previous pipe and trigger the client's
+     * stale-POLLHUP protection). Frame content is delivered by gl_draw.
+     */
+    if (res == 0 && ssd->have_scanout &&
+        ssd->y_0_top == y_0_top &&
+        ssd->scanout_last_x == x && ssd->scanout_last_y == y &&
+        ssd->scanout_last_w == w && ssd->scanout_last_h == h) {
+        return;
+    }
+    ssd->y_0_top = y_0_top;
+    ssd->scanout_last_x = x;
+    ssd->scanout_last_y = y;
+    ssd->scanout_last_w = w;
+    ssd->scanout_last_h = h;
+    fd = spice_iosurface_create_fd(ssd, &fourcc);
 #endif
     if (fd < 0) {
         fprintf(stderr, "%s: failed to get fd for texture\n", __func__);
