@@ -1242,7 +1242,21 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 
 void hvf_kick_vcpu_thread(CPUState *cpu)
 {
-    cpus_kick_thread(cpu);
+    /*
+     * Do not use cpus_kick_thread(): its thread_kicked dedup races with
+     * hvf_wait_for_ipi() clearing thread_kicked right before an unbounded
+     * pselect(). A kick that is skipped because thread_kicked was still set
+     * from an already-consumed kick is lost forever: the vCPU sleeps in WFI
+     * with the interrupt (or stop request) pending, which delays guest
+     * interrupts indefinitely and deadlocks pause_all_vcpus() on guest
+     * reset (zombie VM). Always send the signal.
+     */
+    qatomic_set(&cpu->thread_kicked, true);
+    int err = pthread_kill(cpu->thread->thread, SIG_IPI);
+    if (err && err != ESRCH) {
+        fprintf(stderr, "qemu:%s: %s", __func__, strerror(err));
+        exit(1);
+    }
     hv_vcpus_exit(&cpu->accel->fd, 1);
 }
 
@@ -1968,12 +1982,27 @@ static uint64_t hvf_vtimer_val(void)
 static void hvf_wait_for_ipi(CPUState *cpu, struct timespec *ts)
 {
     /*
+     * Cap open-ended waits so that a lost kick degrades to a short delay
+     * instead of an unbounded sleep (defense in depth on top of the
+     * unconditional signal in hvf_kick_vcpu_thread()).
+     */
+    struct timespec bounded = { .tv_sec = 0, .tv_nsec = 10 * SCALE_MS };
+
+    /*
      * Use pselect to sleep so that other threads can IPI us while we're
      * sleeping.
      */
     qatomic_set_mb(&cpu->thread_kicked, false);
+    /*
+     * A kick sent before thread_kicked was cleared may have been deduped;
+     * re-check the conditions it would have signalled before sleeping.
+     */
+    if (qatomic_read(&cpu->stop) ||
+        (cpu->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ))) {
+        return;
+    }
     bql_unlock();
-    pselect(0, 0, 0, 0, ts, &cpu->accel->unblock_ipi_mask);
+    pselect(0, 0, 0, 0, ts ? ts : &bounded, &cpu->accel->unblock_ipi_mask);
     bql_lock();
 }
 
