@@ -166,32 +166,7 @@ void qemu_console_co_wait_update(QemuConsole *con)
 
 static void graphic_hw_gl_unblock_timer(void *opaque)
 {
-    QemuConsole *con = opaque;
-
-    /*
-     * The display's GL render did not release the block within the timeout
-     * (e.g. the gtk window is occluded, the host compositor throttled the
-     * frame callback, or the host GPU stalled). The device's command queue is
-     * gated on this block (virtio-gpu: renderer_blocked), so a stuck display
-     * stalls the guest GPU scheduler into a TDR (dxgmms1 0x7E) ~2 s later.
-     * Force the unblock so guest command/fence processing resumes well before
-     * the guest's TdrDelay; the worst case is one stale/torn displayed frame,
-     * never a guest crash. A late real release is absorbed in
-     * graphic_hw_gl_block() (con->gl_block already 0 -> no-op).
-     */
-    /* Rate-limited: this can fire repeatedly when the display fence is
-     * persistently slow; an occasional line is enough to know it's active. */
-    static unsigned _ub;
-    if ((_ub++ % 60u) == 0u) {
-        warn_report("console: gl-unblock fallback firing (display GL fence slow); "
-                    "forcing unblock to keep the guest cmdq moving");
-    }
-    if (con->gl_block > 0) {
-        con->gl_block = 0;
-        if (con->hw_ops->gl_block) {
-            con->hw_ops->gl_block(con->hw, false);
-        }
-    }
+    warn_report("console: no gl-unblock within one second");
 }
 
 void graphic_hw_gl_block(QemuConsole *con, bool block)
@@ -202,13 +177,6 @@ void graphic_hw_gl_block(QemuConsole *con, bool block)
     if (block) {
         con->gl_block++;
     } else {
-        /*
-         * A late release after graphic_hw_gl_unblock_timer() force-cleared the
-         * block (con->gl_block already 0) must be a safe no-op, not underflow.
-         */
-        if (con->gl_block == 0) {
-            return;
-        }
         con->gl_block--;
     }
     assert(con->gl_block >= 0);
@@ -222,16 +190,7 @@ void graphic_hw_gl_block(QemuConsole *con, bool block)
 
     if (block) {
         timeout = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-        /* Safety net only.  The display samples (blits + fences) the guest
-         * buffer directly at flush time, so the block lifetime is the GPU
-         * fence latency -- not the host compositor's frame clock -- and
-         * releasing the guest early TEARS: it re-renders into the buffer
-         * while the queued blit still reads it (scaled/shifted frame
-         * artifacts under present storms).  500ms is correct backpressure
-         * for a slow (shared, possibly saturated) GPU while still
-         * recovering a genuinely stuck fence well inside the guest's ~2s
-         * TDR budget. */
-        timeout += 500;
+        timeout += 1000; /* one sec */
         timer_mod(con->gl_unblock_timer, timeout);
     } else {
         timer_del(con->gl_unblock_timer);
