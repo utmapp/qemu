@@ -144,6 +144,9 @@ struct SimpleSpiceDisplay {
 #endif
 #if defined(CONFIG_IOSURFACE)
     IOSurfaceRef iosurface;
+    /* IOSurface pixel format ('BGRA'/'RGBA') the surface was created with;
+     * a guest scanout in a different channel order forces a recreate. */
+    uint32_t iosurface_fourcc;
     int surface_send_fd;
     /* last geometry sent via spice_qxl_gl_scanout/monitor_config so we can
      * skip re-sending the scanout for pure back-buffer flips */
@@ -220,6 +223,8 @@ SpiceDisplayMetalContext qemu_spice_display_metal_create_context(IOSurfaceRef su
                                                                  uint32_t width,
                                                                  uint32_t height);
 void qemu_spice_display_metal_destroy_context(SpiceDisplayMetalContext ctx);
+/* IOSurface pixel format matching a scanout MTLTexture, 0 if unsupported. */
+uint32_t qemu_spice_display_metal_texture_fourcc(void *texture);
 void qemu_spice_display_metal_scanout_texture(SpiceDisplayMetalContext ctx,
                                               MTLTexture_id tex, uint32_t x, uint32_t y,
                                               uint32_t w, uint32_t h);

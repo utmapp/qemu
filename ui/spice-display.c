@@ -818,9 +818,10 @@ static void AddIntegerValue(CFMutableDictionaryRef dictionary, const CFStringRef
     CFRelease(number);
 }
 
-static bool spice_iosurface_create_egl(SimpleSpiceDisplay *ssd, int width, int height,
-                                       IOSurfaceRef surface)
+static bool spice_iosurface_create_egl_fmt(SimpleSpiceDisplay *ssd, int width, int height,
+                                           IOSurfaceRef surface, uint32_t fourcc)
 {
+    const GLenum egl_internal_format = (fourcc == 'RGBA') ? GL_RGBA : GL_BGRA_EXT;
 #if defined(CONFIG_EGL)
     EGLint target = 0;
     GLenum tex_target = 0;
@@ -845,7 +846,7 @@ static bool spice_iosurface_create_egl(SimpleSpiceDisplay *ssd, int width, int h
         EGL_HEIGHT,                        height,
         EGL_IOSURFACE_PLANE_ANGLE,         0,
         EGL_TEXTURE_TARGET,                target,
-        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, GL_BGRA_EXT,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, egl_internal_format,
         EGL_TEXTURE_FORMAT,                EGL_TEXTURE_RGBA,
         EGL_TEXTURE_TYPE_ANGLE,            GL_UNSIGNED_BYTE,
         EGL_IOSURFACE_USAGE_HINT_ANGLE,    EGL_IOSURFACE_WRITE_HINT_ANGLE,
@@ -872,10 +873,22 @@ static bool spice_iosurface_create_egl(SimpleSpiceDisplay *ssd, int width, int h
 }
 
 static bool spice_iosurface_create_cgl(SimpleSpiceDisplay *ssd, int width, int height,
-                                       IOSurfaceRef surface)
+                                       IOSurfaceRef surface, uint32_t fourcc)
 {
 #if defined(HAVE_SPICE_MAC_CGL)
     GLuint tex;
+
+    /*
+     * CGLTexImageIOSurface2D accepts only GL_BGRA/GL_UNSIGNED_INT_8_8_8_8_REV
+     * for 8-bit colour (see the table in <OpenGL/CGLIOSurface.h>; anything else
+     * returns kCGLBadValue), and that combination reads the surface as BGRA
+     * whatever its fourcc says. So this path cannot carry a differently-ordered
+     * scanout at all, and must refuse rather than silently transpose.
+     */
+    if (fourcc != 'BGRA') {
+        error_report("spice_iosurface_create: CGL supports BGRA surfaces only");
+        return false;
+    }
 
     CGLSetCurrentContext(spice_gl_ctx);
     glGenTextures(1, &tex);
@@ -904,14 +917,15 @@ static bool spice_iosurface_create_cgl(SimpleSpiceDisplay *ssd, int width, int h
 #endif
 }
 
-static bool spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height)
+static bool spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int height,
+                                   uint32_t fourcc)
 {
     IOSurfaceRef surface;
     CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     AddIntegerValue(dict, kIOSurfaceWidth, width);
     AddIntegerValue(dict, kIOSurfaceHeight, height);
-    AddIntegerValue(dict, kIOSurfacePixelFormat, 'BGRA');
+    AddIntegerValue(dict, kIOSurfacePixelFormat, (int)fourcc);
     AddIntegerValue(dict, kIOSurfaceBytesPerElement, 4);
 #if TARGET_OS_OSX
     CFDictionaryAddValue(dict, kIOSurfaceIsGlobal, kCFBooleanTrue);
@@ -926,18 +940,19 @@ static bool spice_iosurface_create(SimpleSpiceDisplay *ssd, int width, int heigh
     }
 
     if (spice_opengl == DISPLAY_GL_MODE_CORE) {
-        if (!spice_iosurface_create_cgl(ssd, width, height, surface)) {
+        if (!spice_iosurface_create_cgl(ssd, width, height, surface, fourcc)) {
             CFRelease(surface);
             return false;
         }
     } else {
-        if (!spice_iosurface_create_egl(ssd, width, height, surface)) {
+        if (!spice_iosurface_create_egl_fmt(ssd, width, height, surface, fourcc)) {
             CFRelease(surface);
             return false;
         }
     }
 
     ssd->iosurface = surface;
+    ssd->iosurface_fourcc = fourcc;
 
 #if defined(CONFIG_METAL)
     ssd->metal_context = qemu_spice_display_metal_create_context(surface, width, height);
@@ -996,18 +1011,20 @@ static void spice_iosurface_destroy(SimpleSpiceDisplay *ssd)
 }
 
 /* returns -1 on error, 0 if the surface is unchanged, 1 if (re)created */
-static int spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height)
+static int spice_iosurface_resize(SimpleSpiceDisplay *ssd, int width, int height,
+                                  uint32_t fourcc)
 {
     if (ssd->iosurface) {
         if (IOSurfaceGetHeight(ssd->iosurface) != height ||
-            IOSurfaceGetWidth(ssd->iosurface) != width) {
+            IOSurfaceGetWidth(ssd->iosurface) != width ||
+            ssd->iosurface_fourcc != fourcc) {
             spice_iosurface_destroy(ssd);
-            return spice_iosurface_create(ssd, width, height) ? 1 : -1;
+            return spice_iosurface_create(ssd, width, height, fourcc) ? 1 : -1;
         } else {
             return 0;
         }
     } else {
-        return spice_iosurface_create(ssd, width, height) ? 1 : -1;
+        return spice_iosurface_create(ssd, width, height, fourcc) ? 1 : -1;
     }
 }
 
@@ -1031,7 +1048,7 @@ static int spice_iosurface_create_fd(SimpleSpiceDisplay *ssd, int *fourcc)
     // when we close it, POLLHUP will be seen by the other side and know that
     // the surface ID is stale and should not be used
     ssd->surface_send_fd = fds[1];
-    *fourcc = 'BGRA';
+    *fourcc = (int)ssd->iosurface_fourcc;
     surfaceid = IOSurfaceGetID(ssd->iosurface);
     write(ssd->surface_send_fd, &surfaceid, sizeof(surfaceid));
     return fds[0];
@@ -1278,7 +1295,7 @@ static void spice_gl_switch(DisplayChangeListener *dcl,
             qemu_spice_display_metal_scanout_disable(ssd->metal_context);
         }
 #endif
-        if (spice_iosurface_resize(ssd, width, height) >= 0) {
+        if (spice_iosurface_resize(ssd, width, height, 'BGRA') >= 0) {
             fd = spice_iosurface_create_fd(ssd, &fourcc);
             if (fd < 0) {
                 error_report("spice_gl_switch: failed to create fd");
@@ -1391,7 +1408,25 @@ static void qemu_spice_gl_scanout_texture(DisplayChangeListener *dcl,
 #if defined(CONFIG_GBM)
     fd = egl_get_fd_for_texture(tex_id, &stride, &fourcc, NULL);
 #elif defined(CONFIG_IOSURFACE)
-    int res = spice_iosurface_resize(ssd, backing_width, backing_height);
+    /*
+     * The surface is shared with the client verbatim, so it has to be in the
+     * guest scanout's channel order: a fullscreen D3D swapchain can be
+     * R8G8B8A8 while the desktop is B8G8R8A8. Only the Metal path can honour
+     * a non-BGRA order end to end, so everything else stays BGRA.
+     */
+    uint32_t want_fourcc = 'BGRA';
+#if defined(CONFIG_METAL)
+    if (native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL &&
+        spice_opengl != DISPLAY_GL_MODE_CORE) {
+        uint32_t native_fourcc =
+            qemu_spice_display_metal_texture_fourcc(native.handle);
+        if (native_fourcc) {
+            want_fourcc = native_fourcc;
+        }
+    }
+#endif
+    int res = spice_iosurface_resize(ssd, backing_width, backing_height,
+                                     want_fourcc);
     if (res < 0) {
         fprintf(stderr, "%s: failed to create IOSurface\n", __func__);
         return;

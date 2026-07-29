@@ -38,7 +38,10 @@
 {
     if (self = [super init]) {
         MTLTextureDescriptor *textureDescriptor = [[MTLTextureDescriptor alloc] init];
-        textureDescriptor.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        /* must match the surface, which follows the guest scanout's order */
+        textureDescriptor.pixelFormat =
+            IOSurfaceGetPixelFormat(surface) == 'RGBA' ? MTLPixelFormatRGBA8Unorm
+                                                       : MTLPixelFormatBGRA8Unorm;
         textureDescriptor.width = width;
         textureDescriptor.height = height;
         textureDescriptor.usage = MTLTextureUsageRenderTarget;
@@ -111,6 +114,24 @@
 }
 
 @end
+
+uint32_t qemu_spice_display_metal_texture_fourcc(void *texture)
+{
+    id<MTLTexture> tex = (id<MTLTexture>)texture;
+
+    if (!tex) {
+        return 0;
+    }
+    switch (tex.pixelFormat) {
+    case MTLPixelFormatBGRA8Unorm:
+        return 'BGRA';
+    case MTLPixelFormatRGBA8Unorm:
+        return 'RGBA';
+    default:
+        /* no IOSurface equivalent wired up; caller keeps its default */
+        return 0;
+    }
+}
 
 SpiceDisplayMetalContext qemu_spice_display_metal_create_context(IOSurfaceRef surface,
                                                                  uint32_t width,
