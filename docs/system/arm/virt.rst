@@ -145,8 +145,11 @@ highmem-mmio
   The default is ``on``.
 
 highmem-mmio-size
-  Set the high memory region size for PCI MMIO. Must be a power of 2 and
-  greater than or equal to the default size (512G).
+  Set the high memory region size for PCI MMIO. Must be a power of 2 and at
+  least 1G. The default is 512G. If the requested window does not fit in the
+  guest physical address space, it is shrunk to the largest power of 2 that
+  does (but no smaller than 1G) and a warning is emitted; if even that does
+  not fit, the window is disabled.
 
 gic-version
   Specify the version of the Generic Interrupt Controller (GIC) to provide.
