@@ -1283,7 +1283,6 @@ void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g)
 static void virtio_gpu_virgl_async_fence_bh(void *opaque)
 {
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
-    struct virtio_gpu_ctrl_command *cmd, *tmp;
     struct virtio_gpu_virgl_context_fence *f;
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
@@ -1299,33 +1298,23 @@ static void virtio_gpu_virgl_async_fence_bh(void *opaque)
 
         QSLIST_REMOVE_HEAD(&async_fenceq, next);
 
-        QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
-            /*
-             * the guest can end up emitting fences out of order
-             * so we should check all fenced cmds not just the first one.
-             */
-            if (cmd->cmd_hdr.fence_id > f->fence_id) {
-                continue;
-            }
-            if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
-                if (cmd->cmd_hdr.ring_idx != f->ring_idx) {
-                    continue;
-                }
-                if (cmd->cmd_hdr.ctx_id != f->ctx_id) {
-                    continue;
-                }
-            }
-            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
-            QTAILQ_REMOVE(&g->fenceq, cmd, next);
-            g_free(cmd);
+        /*
+         * Delegate to the same completion logic the synchronous callbacks
+         * use: virgl_write_fence() completes only global (non-ring) fenced
+         * cmds and virgl_write_context_fence() only ring fences matching
+         * ctx/ring, each with per-cmd inflight accounting.  Upstream's BH
+         * matched more loosely (a context fence could complete a global
+         * fenced cmd with a numerically smaller id from an unrelated id
+         * space); global and per-context fence ids are separate counters
+         * here, so keep the strict matching.
+         */
+        if (f->ring_idx == UINT32_MAX) {
+            virgl_write_fence(g, (uint32_t)f->fence_id);
+        } else {
+            virgl_write_context_fence(g, f->ctx_id, f->ring_idx, f->fence_id);
         }
 
-        trace_virtio_gpu_fence_resp(f->fence_id);
         g_free(f);
-        g->inflight--;
-        if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
-            trace_virtio_gpu_dec_inflight_fences(g->inflight);
-        }
     }
 }
 
@@ -1440,16 +1429,38 @@ static void virtio_gpu_fence_poll(void *opaque)
     virtio_gpu_process_cmdq(g);
     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
         /*
-         * On the render-server path virgl_renderer_poll() is the only place a
-         * retired renderer fence is discovered: virgl_renderer_get_poll_fd()
-         * is vrend-only and VIRGL_RENDERER_ASYNC_FENCE_CB is not enabled, so
-         * nothing wakes QEMU when a fence signals.  This period is therefore a
-         * hard floor under every guest operation that blocks on a fence, so
-         * keep it at the millisecond-timer granularity.  The timer only
-         * re-arms while cmdq/fenceq are non-empty, so it costs nothing at
-         * idle.
+         * Without async fencing, virgl_renderer_poll() is the only place a
+         * retired renderer fence is discovered, so this period is a hard
+         * floor under every guest operation that blocks on a fence -- keep
+         * it at the millisecond-timer granularity.
+         *
+         * With async fencing, ring (venus/neptune context) fences retire
+         * through the proxy sync thread and async_fence_bh; the poll's job
+         * shrinks to discovering vrend/global fences, which still retire
+         * only from virgl_renderer_poll() (vrend's async path is EGL-only
+         * and disabled here).  While only ring fences are pending, relax to
+         * a slow tick -- it still runs process_cmdq and catches any global
+         * fence that appears; virgl_renderer_poll() skips proxy contexts
+         * under ASYNC_FENCE_CB, so it cannot rescue a missed ring-fence
+         * wake (the sync thread's poll on the worker socket covers worker
+         * death instead).  Any pending global fence keeps the 1 ms rate.
          */
-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+        uint64_t period_ms = 1;
+        if (gl->async_fence_enabled) {
+            struct virtio_gpu_ctrl_command *cmd;
+            bool poll_needed = !QTAILQ_EMPTY(&g->cmdq);
+            QTAILQ_FOREACH(cmd, &g->fenceq, next) {
+                if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)) {
+                    poll_needed = true;
+                    break;
+                }
+            }
+            if (!poll_needed) {
+                period_ms = 100;
+            }
+        }
+        timer_mod(gl->fence_poll,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + period_ms);
     }
 }
 
@@ -1510,6 +1521,27 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_NEPTUNE;
         flags |= VIRGL_RENDERER_RENDER_SERVER;
+    }
+#endif
+
+#if VIRGL_CHECK_VERSION(1, 1, 2)
+    if (flags & VIRGL_RENDERER_RENDER_SERVER) {
+        /*
+         * Async fencing needs no EGL on the render-server path: the proxy
+         * retires fences on its own sync thread, fed by an eventfd/pipe the
+         * render worker writes per retire.  Upstream's qemu_egl_display gate
+         * above exists for vrend, whose async path does need EGL.  Without
+         * this, the only retire discovery for venus/neptune fences is the
+         * fence_poll timer below -- a 1 ms floor under every guest fence
+         * wait.
+         */
+        virtio_gpu_3d_cbs.write_fence         = virgl_write_async_fence;
+        virtio_gpu_3d_cbs.write_context_fence = virgl_write_async_context_fence;
+        flags |= VIRGL_RENDERER_ASYNC_FENCE_CB;
+        flags |= VIRGL_RENDERER_THREAD_SYNC;
+        gl->async_fence_enabled = true;
+        fprintf(stderr, "virtio-gpu: async fence delivery enabled "
+                "(render-server proxy)\n");
     }
 #endif
 

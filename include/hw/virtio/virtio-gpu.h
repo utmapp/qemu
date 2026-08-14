@@ -272,6 +272,8 @@ struct VirtIOGPUGL {
 
     QEMUBH *async_fence_bh;
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
+    /* fences retire via async_fence_bh; fence_poll is only a watchdog */
+    bool async_fence_enabled;
 };
 
 struct VhostUserGPU {
