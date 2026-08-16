@@ -142,6 +142,12 @@ struct virtio_gpu_ctrl_command {
     bool finished;
     /* Set if process_cmd deferred completion; keep at cmdq head for resume. */
     bool suspended;
+    /*
+     * Set if process_cmd took ownership of the command to complete it later
+     * (a mapped blob's teardown waits for the memory region to finalize):
+     * it leaves cmdq without a response and without blocking the queue.
+     */
+    bool deferred;
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
 
@@ -260,6 +266,8 @@ typedef enum {
     RS_RESET,       /* inited and reset pending, moves to start after reset */
 } RenderState;
 
+struct virtio_gpu_virgl_hostmem_region;
+
 struct VirtIOGPUGL {
     struct VirtIOGPU parent_obj;
 
@@ -269,6 +277,9 @@ struct VirtIOGPUGL {
     QEMUTimer *print_stats;
 
     QEMUBH *cmdq_resume_bh;
+    /* Hostmem regions whose MemoryRegion finalized; cmdq_resume_bh finishes
+     * their unmap (and any deferred unref) on the main loop. */
+    QTAILQ_HEAD(, virtio_gpu_virgl_hostmem_region) unmap_done_list;
 
     QEMUBH *async_fence_bh;
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;

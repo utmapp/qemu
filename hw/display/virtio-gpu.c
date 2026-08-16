@@ -1062,6 +1062,16 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
         vgc->process_cmd(g, cmd);
 
         /*
+         * A deferred command is owned by whoever deferred it, which responds
+         * and frees it once its host-side work lands.  Unlike a suspended
+         * command it must not hold up the queue behind it.
+         */
+        if (cmd->deferred) {
+            QTAILQ_REMOVE(&g->cmdq, cmd, next);
+            continue;
+        }
+
+        /*
          * A suspended command has not registered its fence (if any) yet
          * and must be re-processed at the cmdq head after resume, so it
          * must not be moved to fenceq like a normal in-flight fence.
@@ -1132,6 +1142,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->error = 0;
         cmd->finished = false;
         cmd->suspended = false;
+        cmd->deferred = false;
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
