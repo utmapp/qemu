@@ -111,6 +111,8 @@ static QemuCocoaPasteboardTypeOwner *cbowner;
 @interface QemuCGLLayer : CAOpenGLLayer
 @end
 
+/* Consumed on the QEMU IO thread, re-armed from the Cocoa main thread by
+ * drawFrame: every access must be atomic. */
 static bool gl_dirty;
 static uint32_t gl_scanout_id;
 static bool gl_scanout_y0_top;
@@ -1378,7 +1380,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
              * dropped and the display keeps the stale image until the guest
              * flushes again.
              */
-            gl_dirty = true;
+            qatomic_set(&gl_dirty, true);
             return;
         }
 
@@ -2357,7 +2359,7 @@ static void cocoa_gl_update(DisplayChangeListener *dcl,
 {
     with_gl_view_ctx(^{
         surface_gl_update_texture(dgc.gls, surface, x, y, w, h);
-        gl_dirty = true;
+        qatomic_set(&gl_dirty, true);
     });
 }
 
@@ -2370,7 +2372,7 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
     });
 
     cocoa_switch(dcl, new_surface);
-    gl_dirty = true;
+    qatomic_set(&gl_dirty, true);
 }
 
 static void cocoa_gl_render(void)
@@ -2396,9 +2398,7 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
 {
     cocoa_refresh(dcl);
 
-    if (gl_dirty) {
-        gl_dirty = false;
-
+    if (qatomic_xchg(&gl_dirty, false)) {
 #ifdef CONFIG_EGL
 #ifdef USE_METAL
         if (cocoaView.scanout == QemuCocoaViewScanoutMetal) {
@@ -2427,7 +2427,7 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
 static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
 {
     gl_scanout_id = 0;
-    gl_dirty = true;
+    qatomic_set(&gl_dirty, true);
     dispatch_async(dispatch_get_main_queue(), ^{
         cocoaView.scanout = QemuCocoaViewScanoutNone;
     });
@@ -2444,7 +2444,7 @@ static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
 {
     gl_scanout_id = backing_id;
     gl_scanout_y0_top = backing_y_0_top;
-    gl_dirty = true;
+    qatomic_set(&gl_dirty, true);
 #ifdef USE_METAL
     if (native.type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL) {
         id<MTLTexture> mtlTexture = [(id<MTLTexture>)native.handle retain];
@@ -2470,7 +2470,7 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
                                    uint32_t x, uint32_t y,
                                    uint32_t w, uint32_t h)
 {
-    gl_dirty = true;
+    qatomic_set(&gl_dirty, true);
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
