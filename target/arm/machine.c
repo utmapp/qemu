@@ -1,6 +1,7 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "qemu/error-report.h"
+#include "system/hvf.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "kvm_arm.h"
@@ -339,6 +340,55 @@ static const VMStateDescription vmstate_serror = {
         VMSTATE_UINT8(env.serror.pending, ARMCPU),
         VMSTATE_UINT8(env.serror.has_esr, ARMCPU),
         VMSTATE_UINT64(env.serror.esr, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool pmu_sysregs_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    /*
+     * Under HVF the cpreg list is rebuilt to hold only the sysregs the
+     * hypervisor can get/set directly (hvf_arch_init_vcpu()), which
+     * excludes the fully-emulated PMU: the cpreg_vmstate arrays that
+     * normally carry the PMU registers omit them, so send the raw fields.
+     * Other accelerators keep migrating them via the cpreg list.
+     */
+    return hvf_enabled() && arm_feature(&cpu->env, ARM_FEATURE_PMU);
+}
+
+static int pmu_sysregs_post_load(void *opaque, int version_id)
+{
+    ARMCPU *cpu = opaque;
+
+    /*
+     * cpu_pre_load() ran pmu_op_start() before the event types above were
+     * loaded, so the delta baselines may be for the wrong events; redo
+     * them so the pmu_op_finish() in cpu_post_load() converts the loaded
+     * counter values with the right baselines.
+     */
+    pmu_evcntr_delta_rebaseline(&cpu->env);
+    return 0;
+}
+
+static const VMStateDescription vmstate_pmu_sysregs = {
+    .name = "cpu/pmu-sysregs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = pmu_sysregs_needed,
+    .post_load = pmu_sysregs_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.cp15.c15_ccnt, ARMCPU),
+        VMSTATE_UINT64(env.cp15.pmccfiltr_el0, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pmcr, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pmcnten, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pmovsr, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pminten, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pmselr, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c9_pmuserenr, ARMCPU),
+        VMSTATE_UINT64_ARRAY(env.cp15.c14_pmevcntr, ARMCPU, 31),
+        VMSTATE_UINT64_ARRAY(env.cp15.c14_pmevtyper, ARMCPU, 31),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1106,6 +1156,7 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_za,
 #endif
         &vmstate_serror,
+        &vmstate_pmu_sysregs,
         &vmstate_irq_line_state,
         &vmstate_wfxt_timer,
         NULL

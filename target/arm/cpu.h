@@ -1314,6 +1314,18 @@ static inline bool is_a64(CPUARMState *env)
 void pmu_op_start(CPUARMState *env);
 void pmu_op_finish(CPUARMState *env);
 
+/**
+ * pmu_evcntr_delta_rebaseline
+ * @env: CPUARMState
+ *
+ * Recompute the event-counter delta baselines from the current contents of
+ * c14_pmevtyper[].  Required after event types have been loaded raw behind
+ * the back of an enclosing pmu_op_start(), whose baselines were computed
+ * with the pre-load event types, so that the closing pmu_op_finish()
+ * converts the loaded counter values using the right events.
+ */
+void pmu_evcntr_delta_rebaseline(CPUARMState *env);
+
 /*
  * Called when a PMU counter is due to overflow
  */

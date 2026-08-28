@@ -38,6 +38,7 @@
 #if !defined(CONFIG_USER_ONLY)
 #include "hw/loader.h"
 #include "hw/boards.h"
+#include "hw/irq.h"
 #ifdef CONFIG_TCG
 #include "hw/intc/armv7m_nvic.h"
 #endif /* CONFIG_TCG */
@@ -238,6 +239,17 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
 
     g_hash_table_foreach(cpu->cp_regs, cp_reg_reset, cpu);
     g_hash_table_foreach(cpu->cp_regs, cp_reg_check_reset, cpu);
+
+#ifndef CONFIG_USER_ONLY
+    /*
+     * The PMU overflow PPI is level-triggered and a per-CPU reset (a
+     * CPU_OFF/CPU_ON cycle) does not reset the GIC, so a latched assert
+     * must be dropped here now that the PMU state that raised it is gone,
+     * or the re-onlined CPU takes a spurious overflow interrupt with
+     * PMOVSCLR_EL0 == 0.
+     */
+    qemu_set_irq(cpu->pmu_interrupt, 0);
+#endif
 
     env->vfp.xregs[ARM_VFP_FPSID] = cpu->reset_fpsid;
     env->vfp.xregs[ARM_VFP_MVFR0] = cpu->isar.mvfr0;
