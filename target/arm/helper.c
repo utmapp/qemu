@@ -1264,6 +1264,17 @@ static void pmevcntr_op_finish(CPUARMState *env, uint8_t counter)
 void pmu_op_start(CPUARMState *env)
 {
     unsigned int i;
+
+    /*
+     * The HVF PMCCNTR_EL0 read fast path reads the counter state from the
+     * vCPU thread without the BQL, while pmccntr_op_start() transiently
+     * stores the raw cycle count in c15_ccnt_delta and arm_pmu_timer_cb()
+     * runs this on the main-loop thread.  Flag the whole span -- including
+     * whatever the caller mutates before pmu_op_finish() -- as a write in
+     * progress so the reader can detect it and retry.  Every caller holds
+     * the BQL, which serializes the write side.
+     */
+    seqlock_write_begin(&env_archcpu(env)->pmu_op_lock);
     pmccntr_op_start(env);
     for (i = 0; i < pmu_num_counters(env); i++) {
         pmevcntr_op_start(env, i);
@@ -1277,6 +1288,7 @@ void pmu_op_finish(CPUARMState *env)
     for (i = 0; i < pmu_num_counters(env); i++) {
         pmevcntr_op_finish(env, i);
     }
+    seqlock_write_end(&env_archcpu(env)->pmu_op_lock);
 }
 
 void pmu_evcntr_delta_rebaseline(CPUARMState *env)

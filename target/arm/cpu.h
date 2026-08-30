@@ -22,6 +22,7 @@
 
 #include "kvm-consts.h"
 #include "qemu/cpu-float.h"
+#include "qemu/seqlock.h"
 #include "hw/registerfields.h"
 #include "cpu-qom.h"
 #include "exec/cpu-defs.h"
@@ -900,6 +901,14 @@ struct ArchCPU {
      * pmu_op_finish() - it does not need other handling during migration
      */
     QEMUTimer *pmu_timer;
+    /*
+     * Write side is taken (by pmu_op_start/finish) around every span that
+     * transiently holds the PMU counter state in a mixed form, so BQL-free
+     * readers of that state (the HVF PMCCNTR_EL0 read fast path) can
+     * detect a concurrent update by arm_pmu_timer_cb() on the main-loop
+     * thread and fall back to the locked path.  All writers hold the BQL.
+     */
+    QemuSeqLock pmu_op_lock;
     /* Timer used for WFxT timeouts */
     QEMUTimer *wfxt_timer;
 

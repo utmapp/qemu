@@ -1502,6 +1502,8 @@ static void arm_cpu_initfn(Object *obj)
     QLIST_INIT(&cpu->pre_el_change_hooks);
     QLIST_INIT(&cpu->el_change_hooks);
 
+    seqlock_init(&cpu->pmu_op_lock);
+
 #ifdef CONFIG_USER_ONLY
 # ifdef TARGET_AARCH64
     /*

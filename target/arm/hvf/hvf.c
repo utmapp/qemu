@@ -2082,6 +2082,86 @@ static void hvf_sync_pstate(CPUState *cpu)
     pstate_write(&ARM_CPU(cpu)->env, cpsr);
 }
 
+/*
+ * PMCCNTR_EL0 read fast path.
+ *
+ * HVF cannot virtualize the PMU, so every guest read of the cycle counter
+ * is a full VM exit.  Windows on Arm reads it constantly -- its x64
+ * emulator implements RDTSC on it -- at hundreds of thousands of reads per
+ * second under an emulated game.  The general exit path takes the BQL,
+ * syncs the vtimer and returns to the vCPU thread loop for every one of
+ * them.  Serve the common case without any of that: the counter is
+ * enabled, unfiltered and 64-bit (no overflow interrupt to raise), so its
+ * value is a pure function of the virtual clock and this vCPU's own cp15
+ * state.  The only other writer of that state is arm_pmu_timer_cb() on the
+ * main-loop thread; pmu_op_start/finish flag its update spans via
+ * pmu_op_lock, which is checked before committing.  Returns false to take
+ * the general path.
+ */
+static bool hvf_pmccntr_read_fast(CPUState *cpu, uint64_t syndrome)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    hv_return_t r;
+    unsigned seq;
+
+    if (!(syndrome & 1) || (syndrome & SYSREG_MASK) != SYSREG_PMCCNTR_EL0) {
+        return false;
+    }
+    if (cpu->singlestep_enabled || cpu->accel->dirty ||
+        cpu->accel->vtimer_masked) {
+        return false;
+    }
+
+    seq = seqlock_read_begin(&arm_cpu->pmu_op_lock);
+
+    if (!arm_feature(env, ARM_FEATURE_PMU) ||
+        (env->cp15.c9_pmcr & (PMCRE | PMCRLC)) != (PMCRE | PMCRLC) ||
+        !(env->cp15.c9_pmcnten & (1u << 31)) ||
+        (env->cp15.pmccfiltr_el0 & (PMXEVTYPER_P | PMXEVTYPER_U))) {
+        return false;
+    }
+
+    /*
+     * EL0 reads need PMUSERENR_EL0.{EN,CR}; when neither is set, bail if
+     * we are at EL0 so the general path can raise the access trap.
+     */
+    if (!(env->cp15.c9_pmuserenr & 0x5)) {
+        uint64_t cpsr;
+
+        r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+        assert_hvf_ok(r);
+        if (((cpsr >> 2) & 3) == 0) {
+            return false;
+        }
+    }
+
+    /*
+     * Same value pmccntr_op_start would compute for the enabled counter
+     * (helper.c's cycles_get_count: 1 GHz on the virtual clock).
+     */
+    const uint64_t cycles = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     1000000000, NANOSECONDS_PER_SECOND);
+    const uint64_t val = cycles - env->cp15.c15_ccnt_delta;
+    const uint32_t rt = (syndrome >> 5) & 0x1f;
+    uint64_t pc;
+
+    if (seqlock_read_retry(&arm_cpu->pmu_op_lock, seq)) {
+        /* Raced an update; the general path will read a settled value */
+        return false;
+    }
+
+    if (rt < 31) {
+        r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_X0 + rt, val);
+        assert_hvf_ok(r);
+    }
+    r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_PC, &pc);
+    assert_hvf_ok(r);
+    r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_PC, pc + 4);
+    assert_hvf_ok(r);
+    return true;
+}
+
 int hvf_vcpu_exec(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -2102,13 +2182,31 @@ int hvf_vcpu_exec(CPUState *cpu)
 
     flush_cpu_state(cpu);
 
+    uint64_t exit_reason, syndrome;
+    uint32_t ec;
     bql_unlock();
+run_again:
     assert_hvf_ok(hv_vcpu_run(cpu->accel->fd));
 
     /* handle VMEXIT */
-    uint64_t exit_reason = hvf_exit->reason;
-    uint64_t syndrome = hvf_exit->exception.syndrome;
-    uint32_t ec = syn_get_ec(syndrome);
+    exit_reason = hvf_exit->reason;
+    syndrome = hvf_exit->exception.syndrome;
+    ec = syn_get_ec(syndrome);
+
+    if (exit_reason == HV_EXIT_REASON_EXCEPTION &&
+        ec == EC_SYSTEMREGISTERTRAP && hvf_pmccntr_read_fast(cpu, syndrome)) {
+        /*
+         * Served without the BQL.  Go straight back into the guest unless
+         * something is pending for the general path; a kick that raced us
+         * is sticky in HVF and surfaces as a CANCELED exit on the next run.
+         */
+        if (!qatomic_read(&cpu->interrupt_request) &&
+            !qatomic_read(&cpu->exit_request) && !cpu->halted) {
+            goto run_again;
+        }
+        bql_lock();
+        return 0;
+    }
 
     ret = 0;
     bql_lock();
