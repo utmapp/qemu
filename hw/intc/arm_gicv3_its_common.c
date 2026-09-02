@@ -25,6 +25,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "system/kvm.h"
+#include "system/hvf.h"
 
 static int gicv3_its_pre_save(void *opaque)
 {
@@ -164,6 +165,9 @@ const char *its_class_name(void)
 {
     if (kvm_irqchip_in_kernel()) {
         return "arm-its-kvm";
+    } else if (hvf_irqchip_in_kernel()) {
+        /* MSIs come from a GICv2m frame; the hypervisor GIC has no ITS */
+        return NULL;
     } else {
         /* Software emulation based model */
         return "arm-gicv3-its";

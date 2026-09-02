@@ -219,6 +219,11 @@ void hvf_kick_vcpu_thread(CPUState *cpu)
     hv_vcpu_interrupt(&cpu->accel->fd, 1);
 }
 
+bool hvf_arch_kernel_irqchip_available(void)
+{
+    return false;
+}
+
 int hvf_arch_init(void)
 {
     return 0;

@@ -66,6 +66,9 @@
 
 HVFState *hvf_state;
 bool hvf_tso_mode = 0;
+/* in-kernel GIC: -accel hvf,kernel-irqchip=on|off (default on where the host offers it) */
+static bool hvf_kernel_irqchip_allowed = true;
+bool hvf_kernel_irqchip;
 uint32_t hvf_ipa_granule_size = 0;
 
 /* Memory slots */
@@ -397,6 +400,9 @@ static int hvf_accel_init(MachineState *ms)
     ret = hvf_arch_vm_create(ms, (uint32_t)pa_range, hvf_ipa_granule_size);
     assert_hvf_ok(ret);
 
+    hvf_kernel_irqchip = hvf_kernel_irqchip_allowed &&
+                         hvf_arch_kernel_irqchip_available();
+
     s = g_new0(HVFState, 1);
 
     success = hvf_slots_grow(s, HVF_MEMSLOTS_NUM_ALLOC_DEFAULT);
@@ -457,6 +463,16 @@ static void hvf_set_ipa_granule_size(Object *obj, Visitor *v,
     hvf_ipa_granule_size = value;
 }
 
+static bool hvf_get_kernel_irqchip(Object *obj, Error **errp)
+{
+    return hvf_kernel_irqchip_allowed;
+}
+
+static void hvf_set_kernel_irqchip(Object *obj, bool value, Error **errp)
+{
+    hvf_kernel_irqchip_allowed = value;
+}
+
 static void hvf_accel_class_init(ObjectClass *oc, void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -477,6 +493,11 @@ static void hvf_accel_class_init(ObjectClass *oc, void *data)
         NULL, NULL);
     object_class_property_set_description(oc, "ipa-granule-size",
         "Size of a single guest page");
+
+    object_class_property_add_bool(oc, "kernel-irqchip",
+        hvf_get_kernel_irqchip, hvf_set_kernel_irqchip);
+    object_class_property_set_description(oc, "kernel-irqchip",
+        "Use the Hypervisor.framework in-kernel GICv3 (macOS 15+)");
 }
 
 static const TypeInfo hvf_accel_type = {

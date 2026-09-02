@@ -85,6 +85,9 @@ struct AccelCPUState {
     sigset_t unblock_ipi_mask;
     bool guest_debug_enabled;
     bool dirty;
+    /* PPIs to pend/unpend in this vCPU's in-kernel redistributor (owning thread only) */
+    uint32_t gic_ppi_set;
+    uint32_t gic_ppi_clear;
 };
 
 void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
@@ -92,6 +95,7 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
 #define assert_hvf_ok(EX) assert_hvf_ok_impl((EX), __FILE__, __LINE__, #EX)
 const char *hvf_return_string(hv_return_t ret);
 int hvf_arch_init(void);
+bool hvf_arch_kernel_irqchip_available(void);
 hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
                                uint32_t ipa_granule_size);
 int hvf_arch_init_vcpu(CPUState *cpu);

@@ -929,7 +929,8 @@ static void create_gic(VirtMachineState *vms, MemoryRegion *mem)
 
     if (vms->gic_version != VIRT_GIC_VERSION_2 && vms->its) {
         create_its(vms);
-    } else if (vms->gic_version == VIRT_GIC_VERSION_2) {
+    } else if (vms->gic_version == VIRT_GIC_VERSION_2 ||
+               hvf_irqchip_in_kernel()) {
         create_v2m(vms);
     }
 }
@@ -2102,6 +2103,10 @@ static void finalize_gic_version(VirtMachineState *vms)
         /* KVM w/o kernel irqchip can only deal with GICv2 */
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         accel_name = "KVM with kernel-irqchip=off";
+    } else if (hvf_enabled() && hvf_irqchip_in_kernel()) {
+        /* the Hypervisor.framework GIC is a GICv3 without EL2 support */
+        gics_supported |= VIRT_GIC_VERSION_3_MASK;
+        accel_name = "HVF with kernel-irqchip=on";
     } else if (tcg_enabled() || hvf_enabled() || qtest_enabled())  {
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         if (module_object_class_by_name("arm-gicv3")) {
@@ -2239,6 +2244,21 @@ static void machvirt_init(MachineState *machine)
      * KVM is not available yet
      */
     finalize_gic_version(vms);
+
+    if (hvf_irqchip_in_kernel()) {
+        /*
+         * hv_gic_create() must precede vCPU creation, which happens when
+         * the CPUs are realized below; the "hvf-arm-gicv3" device created
+         * by create_gic() only wires lines to it.  The hypervisor GIC has
+         * no ITS, so PCI MSIs come from a GICv2m frame instead.
+         */
+        hvf_arm_gic_create(vms->memmap[VIRT_GIC_DIST].base,
+                           vms->memmap[VIRT_GIC_REDIST].base,
+                           vms->memmap[VIRT_GIC_REDIST].size,
+                           machine->smp.max_cpus, NUM_IRQS, &error_fatal);
+        vms->its = false;
+        vms->tcg_its = false;
+    }
 
     if (vms->secure) {
         /*
