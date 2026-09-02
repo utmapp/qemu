@@ -11,6 +11,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
+#include "hw/intc/arm_gic_common.h"
 #include "qemu/log.h"
 #include <dlfcn.h>
 #include <AvailabilityMacros.h>
@@ -1223,6 +1225,196 @@ cleanup:
     return ret;
 }
 
+/*
+ * Hypervisor.framework in-kernel GICv3 (macOS 15+).  With it, SGIs, the
+ * timer PPIs and every GIC register access stay in the kernel; QEMU only
+ * feeds SPIs in and pends the PPIs it raises itself (the emulated PMU).
+ */
+static struct {
+    bool created;
+    hwaddr dist_base;
+    hwaddr redist_base;
+} hvf_gic;
+
+bool hvf_arch_kernel_irqchip_available(void)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        return true;
+    }
+    return false;
+}
+
+bool hvf_arm_gic_created(void)
+{
+    return hvf_gic.created;
+}
+
+void hvf_arm_gic_create(hwaddr dist_base, hwaddr redist_base,
+                        hwaddr redist_size, unsigned max_cpus,
+                        unsigned num_spi, Error **errp)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        size_t dist_align, redist_align, redist_stride;
+        uint32_t spi_base, spi_count;
+        hv_gic_config_t config;
+        hv_return_t ret;
+
+        if (hvf_gic.created) {
+            error_setg(errp, "the HVF in-kernel GIC was already created");
+            return;
+        }
+        assert_hvf_ok(hv_gic_get_distributor_base_alignment(&dist_align));
+        assert_hvf_ok(hv_gic_get_redistributor_base_alignment(&redist_align));
+        assert_hvf_ok(hv_gic_get_redistributor_size(&redist_stride));
+        assert_hvf_ok(hv_gic_get_spi_interrupt_range(&spi_base, &spi_count));
+
+        if (dist_base & (dist_align - 1)) {
+            error_setg(errp, "GIC distributor base 0x%" HWADDR_PRIx
+                       " is not %zu-byte aligned", dist_base, dist_align);
+            return;
+        }
+        if (redist_base & (redist_align - 1)) {
+            error_setg(errp, "GIC redistributor base 0x%" HWADDR_PRIx
+                       " is not %zu-byte aligned", redist_base, redist_align);
+            return;
+        }
+        if ((hwaddr)max_cpus * redist_stride > redist_size) {
+            error_setg(errp, "GIC redistributor region (0x%" HWADDR_PRIx
+                       " bytes) holds %" HWADDR_PRIu " of the %u vCPUs",
+                       redist_size, redist_size / redist_stride, max_cpus);
+            return;
+        }
+        if (spi_base > GIC_INTERNAL ||
+            spi_base + spi_count < GIC_INTERNAL + num_spi) {
+            error_setg(errp, "HVF in-kernel GIC supports SPIs %u-%u, the "
+                       "board needs %u-%u", spi_base, spi_base + spi_count - 1,
+                       GIC_INTERNAL, GIC_INTERNAL + num_spi - 1);
+            return;
+        }
+
+        config = hv_gic_config_create();
+        assert_hvf_ok(hv_gic_config_set_distributor_base(config, dist_base));
+        assert_hvf_ok(hv_gic_config_set_redistributor_base(config,
+                                                           redist_base));
+        ret = hv_gic_create(config);
+        os_release(config);
+        if (ret != HV_SUCCESS) {
+            error_setg(errp, "hv_gic_create failed: 0x%x", (unsigned)ret);
+            return;
+        }
+        hvf_gic.created = true;
+        hvf_gic.dist_base = dist_base;
+        hvf_gic.redist_base = redist_base;
+        info_report("HVF: in-kernel GICv3 (dist 0x%" HWADDR_PRIx ", redist 0x%"
+                    HWADDR_PRIx ", SPIs %u-%u)", dist_base, redist_base,
+                    GIC_INTERNAL, GIC_INTERNAL + num_spi - 1);
+        return;
+    }
+    error_setg(errp, "the HVF in-kernel GIC needs macOS 15 or newer");
+}
+
+/*
+ * hv_gic_set_spi() makes the interrupt pending but does not force a vCPU
+ * that is currently running guest code to re-evaluate its pending state:
+ * the interrupt is only taken at that vCPU's next exit, which for a guest
+ * busy in user code can be a timer tick away.  Look up the SPI's affinity
+ * route and exit that vCPU so it re-enters with the interrupt; a 1-of-N
+ * route (IRM set) exits every vCPU.
+ */
+static void hvf_arm_gic_kick_spi_target(uint32_t intid)
+{
+    const uint64_t aff_mask = 0xff00ffffffULL;   /* Aff3 | Aff2 | Aff1 | Aff0 */
+    hv_vcpu_t ids[128];
+    unsigned n = 0;
+    uint64_t router = 1ULL << 31;
+    CPUState *cs;
+
+    if (__builtin_available(macOS 15.0, *)) {
+        hv_gic_get_distributor_reg(HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32 +
+                                   (intid - GIC_INTERNAL) * 8, &router);
+    }
+    CPU_FOREACH(cs) {
+        if (!cs->accel || n == ARRAY_SIZE(ids)) {
+            continue;
+        }
+        if ((router & (1ULL << 31)) ||
+            ARM_CPU(cs)->mp_affinity == (router & aff_mask)) {
+            ids[n++] = cs->accel->fd;
+        }
+    }
+    if (n) {
+        hv_vcpus_exit(ids, n);
+    }
+}
+
+void hvf_arm_gic_set_spi(uint32_t intid, int level)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        assert_hvf_ok(hv_gic_set_spi(intid, level != 0));
+        if (level) {
+            hvf_arm_gic_kick_spi_target(intid);
+        }
+    }
+}
+
+/*
+ * A PPI's redistributor is only writable from the owning vCPU thread, so
+ * record the change and let hvf_arm_gic_flush_ppis() apply it right before
+ * the next hv_vcpu_run().
+ */
+void hvf_arm_gic_set_ppi(CPUState *cpu, uint32_t intid, int level)
+{
+    AccelCPUState *acc = cpu->accel;
+    uint32_t bit = 1u << intid;
+
+    if (!acc) {
+        return;
+    }
+    if (level) {
+        qatomic_and(&acc->gic_ppi_clear, ~bit);
+        qatomic_or(&acc->gic_ppi_set, bit);
+    } else {
+        qatomic_and(&acc->gic_ppi_set, ~bit);
+        qatomic_or(&acc->gic_ppi_clear, bit);
+    }
+    if (cpu != current_cpu) {
+        qemu_cpu_kick(cpu);
+    }
+}
+
+static void hvf_arm_gic_flush_ppis(CPUState *cpu)
+{
+    AccelCPUState *acc = cpu->accel;
+    uint32_t set, clear;
+
+    if (!hvf_irqchip_in_kernel() ||
+        (!qatomic_read(&acc->gic_ppi_set) &&
+         !qatomic_read(&acc->gic_ppi_clear))) {
+        return;
+    }
+    set = qatomic_xchg(&acc->gic_ppi_set, 0);
+    clear = qatomic_xchg(&acc->gic_ppi_clear, 0);
+    if (__builtin_available(macOS 15.0, *)) {
+        if (clear) {
+            assert_hvf_ok(hv_gic_set_redistributor_reg(acc->fd,
+                              HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, clear));
+        }
+        if (set) {
+            assert_hvf_ok(hv_gic_set_redistributor_reg(acc->fd,
+                              HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, set));
+        }
+    }
+}
+
+void hvf_arm_gic_reset(void)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        if (hvf_gic.created) {
+            assert_hvf_ok(hv_gic_reset());
+        }
+    }
+}
+
 int hvf_arch_init_vcpu(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -1280,7 +1472,7 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 
     ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, &pfr);
     assert_hvf_ok(ret);
-    pfr |= env->gicv3state ? (1 << 24) : 0;
+    pfr |= (env->gicv3state || hvf_irqchip_in_kernel()) ? (1 << 24) : 0;
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, pfr);
     assert_hvf_ok(ret);
 
@@ -2181,6 +2373,7 @@ int hvf_vcpu_exec(CPUState *cpu)
     }
 
     flush_cpu_state(cpu);
+    hvf_arm_gic_flush_ppis(cpu);
 
     uint64_t exit_reason, syndrome;
     uint32_t ec;
@@ -2215,6 +2408,10 @@ run_again:
         /* This is the main one, handle below. */
         break;
     case HV_EXIT_REASON_VTIMER_ACTIVATED:
+        if (hvf_irqchip_in_kernel()) {
+            /* the in-kernel GIC owns the timer PPI; this exit is not expected */
+            warn_report_once("HVF: VTIMER_ACTIVATED exit with the in-kernel GIC");
+        }
         qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
         cpu->accel->vtimer_masked = true;
         return 0;

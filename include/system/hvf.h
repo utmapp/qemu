@@ -30,6 +30,10 @@ extern bool hvf_allowed;
 
 #define TYPE_HVF_ACCEL ACCEL_CLASS_NAME("hvf")
 
+/* Set once the accelerator decided to use the Hypervisor.framework in-kernel GIC. */
+extern bool hvf_kernel_irqchip;
+#define hvf_irqchip_in_kernel() (hvf_kernel_irqchip)
+
 typedef struct HVFState HVFState;
 DECLARE_INSTANCE_CHECKER(HVFState, HVF_STATE,
                          TYPE_HVF_ACCEL)
