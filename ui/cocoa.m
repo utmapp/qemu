@@ -718,7 +718,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     /* Must be called with the BQL, i.e. via updateUIInfo */
     NSSize frameSize;
-    QemuUIInfo info;
+    QemuUIInfo info = { 0 };
 
     if (!qemu_console_is_graphic(dcl.con)) {
         return;
@@ -792,6 +792,15 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [self resizeWindow];
         [self updateScale];
     }
+
+    /* The window now matches the guest's surface (resizeWindow suppresses
+     * windowDidResize's report), so this is the point where the guest
+     * learns the window's backing-pixel size, physical size and the host
+     * display's refresh rate; it feeds the virtio-gpu EDID. Reporting a
+     * size equal to the mode the guest just set cannot start a resize
+     * loop.
+     */
+    [self updateUIInfo];
 }
 
 - (void) setFullGrab:(id)sender
@@ -1514,6 +1523,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
     allow_events = true;
+    /* Deliver the UI info that updateUIInfo dropped while events were
+     * disallowed during startup.
+     */
+    [cocoaView updateUIInfo];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
@@ -1546,6 +1559,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 }
 
 - (void)windowDidChangeScreen:(NSNotification *)notification
+{
+    [cocoaView updateUIInfo];
+}
+
+/* Refresh rate or scale of the current display changed (System Settings,
+ * display replug) without the window moving to another screen.
+ */
+- (void)applicationDidChangeScreenParameters:(NSNotification *)notification
 {
     [cocoaView updateUIInfo];
 }
