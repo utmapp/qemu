@@ -11,7 +11,7 @@ typedef struct qemu_edid_info {
     uint32_t    prefy;
     uint32_t    maxx;
     uint32_t    maxy;
-    uint32_t    refresh_rate;
+    uint32_t    refresh_rate; /* mHz, 0 = unknown */
 } qemu_edid_info;
 
 void qemu_edid_generate(uint8_t *edid, size_t size,

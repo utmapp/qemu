@@ -8,6 +8,13 @@
 #include "qemu/bswap.h"
 #include "hw/display/edid.h"
 
+/*
+ * The established timing bits (.byte), the additional standard timings 3
+ * bits (.xtra3) and the CTA video data block VICs (.dta) each name a fixed
+ * refresh rate. Everything else, including .xtra3 entries while a standard
+ * timing slot is still free, goes into the standard timings, which carry
+ * the host's refresh rate.
+ */
 static const struct edid_mode {
     uint32_t xres;
     uint32_t yres;
@@ -48,6 +55,13 @@ static const struct edid_mode {
     { .xres =  640,   .yres =  480,   .byte  = 35,   .bit = 5 },
 };
 
+/*
+ * The most a display range limits descriptor can express: a byte plus the
+ * EDID 1.4 +255 offset for the rates, a byte of 10 MHz for the clock.
+ */
+#define EDID_RANGE_MAX_RATE     510     /* Hz and kHz */
+#define EDID_RANGE_MAX_CLOCK    2550    /* MHz */
+
 typedef struct Timings {
     uint32_t xfront;
     uint32_t xsync;
@@ -57,24 +71,76 @@ typedef struct Timings {
     uint32_t ysync;
     uint32_t yblank;
 
-    uint64_t clock;
+    uint64_t clock;     /* 10 kHz */
+
+    /* as a guest derives them from the fields above */
+    uint32_t hfreq;     /* line rate, Hz */
+    uint32_t vfreq;     /* refresh rate, mHz */
 } Timings;
 
+/* the display range limits, base block units */
+typedef struct Ranges {
+    uint32_t vmin;      /* Hz */
+    uint32_t vmax;
+    uint32_t hmin;      /* kHz */
+    uint32_t hmax;
+} Ranges;
+
 static void generate_timings(Timings *timings, uint32_t refresh_rate,
-                             uint32_t xres, uint32_t yres)
+                             uint32_t xres, uint32_t yres, bool reduced)
 {
-    /* pull some realistic looking timings out of thin air */
-    timings->xfront = xres * 25 / 100;
-    timings->xsync  = xres *  3 / 100;
-    timings->xblank = xres * 35 / 100;
+    uint32_t xtotal, ytotal;
+
+    if (reduced) {
+        /*
+         * The horizontal blanking of CVT reduced blanking v2, which is what
+         * a flat panel drives. It keeps the pixel clock of a fast timing
+         * inside the fields that carry it: 655.35 MHz in a detailed timing,
+         * 2550 MHz in the range limits.
+         */
+        timings->xfront = 8;
+        timings->xsync  = 32;
+        timings->xblank = 80;
+    } else {
+        /* pull some realistic looking timings out of thin air */
+        timings->xfront = xres * 25 / 100;
+        timings->xsync  = xres *  3 / 100;
+        timings->xblank = xres * 35 / 100;
+    }
+    xtotal = xres + timings->xblank;
 
     timings->yfront = yres *  5 / 1000;
     timings->ysync  = yres *  5 / 1000;
     timings->yblank = yres * 35 / 1000;
+    ytotal = yres + timings->yblank;
 
-    timings->clock  = ((uint64_t)refresh_rate *
-                       (xres + timings->xblank) *
-                       (yres + timings->yblank)) / 10000000;
+    timings->clock = ((uint64_t)refresh_rate * xtotal * ytotal) / 10000000;
+
+    /*
+     * Derive the rates from the published clock rather than from
+     * refresh_rate: the clock lost up to 10 kHz to rounding, and the guest
+     * only ever sees the clock.
+     */
+    timings->hfreq = timings->clock * 10000 / xtotal;
+    timings->vfreq = timings->clock * 10000 * 1000 /
+                     ((uint64_t)xtotal * ytotal);
+}
+
+/*
+ * The range has to contain every listed timing, the preferred one included
+ * (E-EDID 1.4, display range limits descriptor). A guest that finds its
+ * preferred timing outside the declared range treats the EDID as invalid
+ * and falls back to a default mode list. Widen the range QEMU has always
+ * declared to the preferred timing, rounding its minimum down and its
+ * maximum up, so the timing stays inside however the guest rounds its own
+ * computation of the rate. Zero is reserved.
+ */
+static void generate_ranges(Ranges *ranges, const Timings *timings)
+{
+    ranges->vmin = MIN(50, MAX(timings->vfreq / 1000, 1));
+    ranges->vmax = MAX(125, DIV_ROUND_UP(timings->vfreq, 1000));
+    ranges->hmin = MIN(30, MAX(timings->hfreq / 1000, 1));
+    ranges->hmax = MAX(160, DIV_ROUND_UP(timings->hfreq, 1000));
 }
 
 static void edid_ext_dta(uint8_t *dta)
@@ -95,7 +161,8 @@ static void edid_ext_dta_mode(uint8_t *dta, uint8_t nr)
     dta[4]++;
 }
 
-static int edid_std_mode(uint8_t *mode, uint32_t xres, uint32_t yres)
+static int edid_std_mode(uint8_t *mode, uint32_t xres, uint32_t yres,
+                         uint32_t hz)
 {
     uint32_t aspect;
 
@@ -120,13 +187,20 @@ static int edid_std_mode(uint8_t *mode, uint32_t xres, uint32_t yres)
         return -1;
     }
 
+    /*
+     * The 6-bit field spans 60..123 Hz. Saturate rather than fall back to
+     * 60 Hz, so a guest that builds its mode list from these entries gets
+     * the closest rate the field can express to the preferred timing.
+     */
+    hz = MIN(MAX(hz, 60), 123);
+
     mode[0] = (xres / 8) - 31;
-    mode[1] = ((aspect << 6) | (60 - 60));
+    mode[1] = ((aspect << 6) | (hz - 60));
     return 0;
 }
 
 static void edid_fill_modes(uint8_t *edid, uint8_t *xtra3, uint8_t *dta,
-                            uint32_t maxx, uint32_t maxy)
+                            uint32_t maxx, uint32_t maxy, uint32_t hz)
 {
     const struct edid_mode *mode;
     int std = 38;
@@ -143,7 +217,7 @@ static void edid_fill_modes(uint8_t *edid, uint8_t *xtra3, uint8_t *dta,
         if (mode->byte) {
             edid[mode->byte] |= (1 << mode->bit);
         } else if (std < 54) {
-            rc = edid_std_mode(edid + std, mode->xres, mode->yres);
+            rc = edid_std_mode(edid + std, mode->xres, mode->yres, hz);
             if (rc == 0) {
                 std += 2;
             }
@@ -157,7 +231,7 @@ static void edid_fill_modes(uint8_t *edid, uint8_t *xtra3, uint8_t *dta,
     }
 
     while (std < 54) {
-        edid_std_mode(edid + std, 0, 0);
+        edid_std_mode(edid + std, 0, 0, hz);
         std += 2;
     }
 }
@@ -220,27 +294,91 @@ static void edid_desc_text(uint8_t *desc, uint8_t type,
     desc[5 + len] = '\n';
 }
 
-static void edid_desc_ranges(uint8_t *desc)
+/* the preferred aspect ratio code of the CVT support bytes */
+static uint8_t edid_cvt_aspect(uint32_t xres, uint32_t yres)
 {
+    if (xres * 3 == yres * 4) {
+        return 0;
+    } else if (xres * 10 == yres * 16) {
+        return 2;
+    } else if (xres * 4 == yres * 5) {
+        return 3;
+    } else if (xres * 9 == yres * 15) {
+        return 4;
+    }
+    return 1; /* 16:9 */
+}
+
+/*
+ * cvt_hz is the refresh rate the standard timings carry when it is not one
+ * the VESA DMT modes have, and zero when it is.
+ */
+static void edid_desc_ranges(uint8_t *desc, const Ranges *ranges,
+                             uint32_t cvt_hz, uint32_t xres, uint32_t yres)
+{
+    uint32_t vmax = MIN(ranges->vmax, EDID_RANGE_MAX_RATE);
+    uint32_t hmax = MIN(ranges->hmax, EDID_RANGE_MAX_RATE);
+
     edid_desc_type(desc, 0xfd);
 
-    /* vertical (50 -> 125 Hz) */
-    desc[5] =  50;
-    desc[6] = 125;
+    /*
+     * EDID 1.4 offset flags: a maximum above 255 is stored less 255. The
+     * minima only ever shrink from their defaults, so they never need one.
+     */
+    if (vmax > 255) {
+        desc[4] |= 0x02;
+        vmax -= 255;
+    }
+    if (hmax > 255) {
+        desc[4] |= 0x08;
+        hmax -= 255;
+    }
 
-    /* horizontal (30 -> 160 kHz) */
-    desc[7] =  30;
-    desc[8] = 160;
+    /* vertical (Hz) */
+    desc[5] = ranges->vmin;
+    desc[6] = vmax;
 
-    /* max dot clock (2550 MHz) */
-    desc[9] = 2550 / 10;
+    /* horizontal (kHz) */
+    desc[7] = ranges->hmin;
+    desc[8] = hmax;
 
-    /* no extended timing information */
-    desc[10] = 0x01;
+    /* max dot clock: 2550 MHz, the most the field can express */
+    desc[9] = EDID_RANGE_MAX_CLOCK / 10;
 
-    /* padding */
-    desc[11] = '\n';
-    memset(desc + 12, ' ', 6);
+    if (!cvt_hz) {
+        /* range limits only */
+        desc[10] = 0x01;
+
+        /* padding */
+        desc[11] = '\n';
+        memset(desc + 12, ' ', 6);
+        return;
+    }
+
+    /*
+     * A standard timing at a rate no DMT mode has asks the guest to derive
+     * its raster from a formula, so declare one; GTF is deprecated in
+     * EDID 1.4. The continuous frequency bit of the feature byte has to
+     * accompany this.
+     */
+    desc[10] = 0x04;
+    desc[11] = 0x11; /* CVT 1.1 */
+
+    /* no dot clock correction, no limit on active pixels per line */
+    desc[12] = 0;
+    desc[13] = 0;
+
+    /* the aspect ratios a standard timing can express: 4:3 16:9 16:10 5:4 */
+    desc[14] = 0xf0;
+
+    /* preferred aspect ratio, reduced blanking */
+    desc[15] = (edid_cvt_aspect(xres, yres) << 5) | 0x10;
+
+    /* no scaling */
+    desc[16] = 0;
+
+    /* preferred refresh rate (Hz) */
+    desc[17] = MIN(cvt_hz, 255);
 }
 
 /* additional standard timings 3 */
@@ -337,43 +475,101 @@ uint32_t qemu_edid_dpi_to_mm(uint32_t dpi, uint32_t res)
     return res * 254 / 10 / dpi;
 }
 
-static void init_displayid(uint8_t *did)
+/*
+ * The range limits descriptor stops at 510 Hz, 510 kHz per line and
+ * 2550 MHz. A timing past any of those needs the room a DisplayID 2.0
+ * range block has, and only then is it worth asking a guest to read one:
+ * type VII timings have been understood since Linux 5.18, type I since
+ * long before.
+ */
+static bool displayid_needs_2_0(const Timings *timings, const Ranges *ranges)
 {
-    did[0] = 0x70; /* display id extension */
-    did[1] = 0x13; /* version 1.3 */
-    did[2] = 4;    /* length */
-    did[3] = 0x03; /* product type (0x03 == standalone display device) */
-    edid_checksum(did + 1, did[2] + 4);
+    return ranges->vmax > EDID_RANGE_MAX_RATE ||
+           ranges->hmax > EDID_RANGE_MAX_RATE ||
+           timings->clock > EDID_RANGE_MAX_CLOCK * 100;
 }
 
-static void qemu_displayid_generate(uint8_t *did, const Timings *timings,
-                                    uint32_t xres, uint32_t yres,
-                                    uint32_t xmm, uint32_t ymm)
+/* every DisplayID field is stored one less than it counts */
+static void displayid_clock(uint8_t *dst, uint32_t clock)
+{
+    clock--;
+    dst[0] = clock & 0xff;
+    dst[1] = (clock & 0xff00) >> 8;
+    dst[2] = (clock & 0xff0000) >> 16;
+}
+
+/*
+ * A type I (DisplayID 1.3) or type VII (DisplayID 2.0) timing; the two are
+ * laid out alike and differ only in the unit of the clock.
+ */
+static void displayid_timing(uint8_t *timing, const Timings *timings,
+                             uint32_t xres, uint32_t yres, uint32_t clock)
+{
+    displayid_clock(timing, clock);
+
+    timing[3] = 0x88; /* preferred timing, aspect ratio undefined */
+
+    stw_le_p(timing + 4,  0xffff & (xres - 1));
+    stw_le_p(timing + 6,  0xffff & (timings->xblank - 1));
+    stw_le_p(timing + 8,  0xffff & (timings->xfront - 1));
+    stw_le_p(timing + 10, 0xffff & (timings->xsync - 1));
+
+    stw_le_p(timing + 12, 0xffff & (yres - 1));
+    stw_le_p(timing + 14, 0xffff & (timings->yblank - 1));
+    stw_le_p(timing + 16, 0xffff & (timings->yfront - 1));
+    stw_le_p(timing + 18, 0xffff & (timings->ysync - 1));
+}
+
+static void displayid_generate_1_3(uint8_t *did, const Timings *timings,
+                                   uint32_t xres, uint32_t yres)
 {
     did[0] = 0x70; /* display id extension */
     did[1] = 0x13; /* version 1.3 */
     did[2] = 23;   /* length */
     did[3] = 0x03; /* product type (0x03 == standalone display device) */
 
-    did[5] = 0x03; /* Detailed Timings Data Block */
+    did[5] = 0x03; /* Type I Detailed Timing Data Block */
     did[6] = 0x00; /* revision */
     did[7] = 0x14; /* block length */
 
-    did[8]  = timings->clock  & 0xff;
-    did[9]  = (timings->clock & 0xff00) >> 8;
-    did[10] = (timings->clock & 0xff0000) >> 16;
+    displayid_timing(did + 8, timings, xres, yres, timings->clock);
 
-    did[11] = 0x88; /* leave aspect ratio undefined */
+    edid_checksum(did + 1, did[2] + 4);
+}
 
-    stw_le_p(did + 12, 0xffff & (xres - 1));
-    stw_le_p(did + 14, 0xffff & (timings->xblank - 1));
-    stw_le_p(did + 16, 0xffff & (timings->xfront - 1));
-    stw_le_p(did + 18, 0xffff & (timings->xsync - 1));
+static void displayid_generate_2_0(uint8_t *did, const Timings *timings,
+                                   const Ranges *ranges,
+                                   uint32_t xres, uint32_t yres)
+{
+    uint32_t clock_khz = timings->clock * 10;
+    uint32_t vmax = MIN(ranges->vmax, 1023);
+    uint8_t *block;
 
-    stw_le_p(did + 20, 0xffff & (yres - 1));
-    stw_le_p(did + 22, 0xffff & (timings->yblank - 1));
-    stw_le_p(did + 24, 0xffff & (timings->yfront - 1));
-    stw_le_p(did + 26, 0xffff & (timings->ysync - 1));
+    did[0] = 0x70; /* display id extension */
+    did[1] = 0x20; /* version 2.0 */
+    did[2] = 35;   /* length */
+    did[3] = 0x04; /* primary use case: desktop productivity display */
+
+    block = did + 5;
+    block[0] = 0x22; /* Type VII Timing Data Block */
+    block[1] = 0x00; /* revision */
+    block[2] = 0x14; /* block length */
+
+    displayid_timing(block + 3, timings, xres, yres, clock_khz);
+
+    block += 3 + block[2];
+    block[0] = 0x25; /* Dynamic Video Timing Range Limits Data Block */
+    block[1] = 0x01; /* revision 1: the vertical maximum has ten bits */
+    block[2] = 0x09; /* block length */
+
+    /* pixel clock (kHz): a scanout the host composites has no lower limit */
+    displayid_clock(block + 3, 1);
+    displayid_clock(block + 6, clock_khz);
+
+    /* vertical (Hz) */
+    block[9]  = ranges->vmin;
+    block[10] = vmax & 0xff;
+    block[11] = (vmax & 0x300) >> 8;
 
     edid_checksum(did + 1, did[2] + 4);
 }
@@ -382,14 +578,29 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
                         qemu_edid_info *info)
 {
     Timings timings;
+    Ranges ranges;
     uint8_t *desc = edid + 54;
     uint8_t *xtra3 = NULL;
     uint8_t *dta = NULL;
     uint8_t *did = NULL;
     uint32_t width_mm, height_mm;
+    /*
+     * Without a host rate the detailed timing is synthesised at 75 Hz to
+     * give it a plausible pixel clock, while the standard timings keep the
+     * 60 Hz VESA DMT modes.
+     */
     uint32_t refresh_rate = info->refresh_rate ? info->refresh_rate : 75000;
+    uint32_t std_hz = info->refresh_rate ?
+        ((uint64_t)info->refresh_rate + 500) / 1000 : 60;
+    /*
+     * A rate the standard timings end up carrying, once saturated to the
+     * 60..123 Hz their field spans, pulls in the formula declaration and
+     * the raster that goes with it. Anything else generates the EDID QEMU
+     * always has, byte for byte.
+     */
+    bool host_rate = info->refresh_rate && std_hz > 60;
     uint32_t dpi = 100; /* if no width_mm/height_mm */
-    uint32_t large_screen = 0;
+    bool large_screen;
 
     /* =============== set defaults  =============== */
 
@@ -414,10 +625,19 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
         height_mm = qemu_edid_dpi_to_mm(dpi, info->prefy);
     }
 
-    generate_timings(&timings, refresh_rate, info->prefx, info->prefy);
-    if (info->prefx >= 4096 || info->prefy >= 4096 || timings.clock >= 65536) {
-        large_screen = 1;
-    }
+    generate_timings(&timings, refresh_rate, info->prefx, info->prefy,
+                     host_rate);
+    generate_ranges(&ranges, &timings);
+
+    /*
+     * The base block describes the preferred timing only while its detailed
+     * timing descriptor holds the resolution and the pixel clock, and its
+     * range limits descriptor holds the rates. Past that the DisplayID
+     * extension carries it.
+     */
+    large_screen = info->prefx >= 4096 || info->prefy >= 4096 ||
+                   timings.clock >= 65536 ||
+                   displayid_needs_2_0(&timings, &ranges);
 
     /* =============== extensions  =============== */
 
@@ -430,7 +650,6 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
     if (size >= 384 && large_screen) {
         did = edid + 256;
         edid[126]++;
-        init_displayid(did);
     }
 
     /* =============== header information =============== */
@@ -476,8 +695,11 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
     /* display gamma: 2.2 */
     edid[23] = 220 - 100;
 
-    /* supported features bitmap: std sRGB, preferred timing */
-    edid[24] = 0x06;
+    /*
+     * supported features bitmap: preferred timing, std sRGB, and continuous
+     * frequency when the range limits declare a formula
+     */
+    edid[24] = host_rate ? 0x07 : 0x06;
 
 
     /* =============== chromaticity coordinates =============== */
@@ -498,7 +720,6 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
     /* =============== descriptor blocks =============== */
 
     if (!large_screen) {
-        /* The DTD section has only 12 bits to store the resolution */
         edid_desc_timing(desc, &timings, info->prefx, info->prefy,
                          width_mm, height_mm);
         desc = edid_desc_next(edid, dta, desc);
@@ -507,13 +728,14 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
     xtra3 = desc;
     edid_desc_xtra3_std(xtra3);
     desc = edid_desc_next(edid, dta, desc);
-    edid_fill_modes(edid, xtra3, dta, info->maxx, info->maxy);
+    edid_fill_modes(edid, xtra3, dta, info->maxx, info->maxy, std_hz);
     /*
      * dta video data block is finished at thus point,
      * so dta descriptor offsets don't move any more.
      */
 
-    edid_desc_ranges(desc);
+    edid_desc_ranges(desc, &ranges, host_rate ? std_hz : 0,
+                     info->prefx, info->prefy);
     desc = edid_desc_next(edid, dta, desc);
 
     if (desc && info->name) {
@@ -533,9 +755,13 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
 
     /* =============== display id extensions =============== */
 
-    if (did && large_screen) {
-        qemu_displayid_generate(did, &timings, info->prefx, info->prefy,
-                                width_mm, height_mm);
+    if (did) {
+        if (displayid_needs_2_0(&timings, &ranges)) {
+            displayid_generate_2_0(did, &timings, &ranges,
+                                   info->prefx, info->prefy);
+        } else {
+            displayid_generate_1_3(did, &timings, info->prefx, info->prefy);
+        }
     }
 
     /* =============== finish up =============== */

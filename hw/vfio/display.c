@@ -55,7 +55,8 @@ err:
 }
 
 static void vfio_display_edid_update(VFIOPCIDevice *vdev, bool enabled,
-                                     int prefx, int prefy)
+                                     int prefx, int prefy,
+                                     uint32_t refresh_rate)
 {
     VFIODisplay *dpy = vdev->dpy;
     int fd = vdev->vbasedev.fd;
@@ -64,6 +65,7 @@ static void vfio_display_edid_update(VFIOPCIDevice *vdev, bool enabled,
         .maxy  = dpy->edid_regs->max_yres,
         .prefx = prefx ?: vdev->display_xres,
         .prefy = prefy ?: vdev->display_yres,
+        .refresh_rate = refresh_rate,
     };
 
     timer_del(dpy->edid_link_timer);
@@ -118,9 +120,10 @@ static void vfio_display_edid_ui_info(void *opaque, uint32_t idx,
     }
 
     if (info->width && info->height) {
-        vfio_display_edid_update(vdev, true, info->width, info->height);
+        vfio_display_edid_update(vdev, true, info->width, info->height,
+                                 info->refresh_rate);
     } else {
-        vfio_display_edid_update(vdev, false, 0, 0);
+        vfio_display_edid_update(vdev, false, 0, 0, 0);
     }
 }
 
@@ -167,7 +170,7 @@ static bool vfio_display_edid_init(VFIOPCIDevice *vdev, Error **errp)
     dpy->edid_link_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                         vfio_display_edid_link_up, vdev);
 
-    vfio_display_edid_update(vdev, true, 0, 0);
+    vfio_display_edid_update(vdev, true, 0, 0, 0);
     return true;
 
 err:

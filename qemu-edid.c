@@ -35,6 +35,7 @@ static void usage(FILE *out)
             "    -y <prefy>     set preferred height\n"
             "    -X <maxx>      set maximum width\n"
             "    -Y <maxy>      set maximum height\n"
+            "    -r <rate>      set refresh rate in Hz (0 = unknown)\n"
             "\n");
 }
 
@@ -44,10 +45,11 @@ int main(int argc, char *argv[])
     uint8_t blob[512];
     size_t size;
     uint32_t dpi = 100;
+    double rate;
     int rc;
 
     for (;;) {
-        rc = getopt(argc, argv, "ho:x:y:X:Y:d:v:n:s:");
+        rc = getopt(argc, argv, "ho:x:y:X:Y:d:r:v:n:s:");
         if (rc == -1) {
             break;
         }
@@ -96,6 +98,13 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "cannot be zero: %s\n", optarg);
                 exit(1);
             }
+            break;
+        case 'r':
+            if (qemu_strtod_finite(optarg, NULL, &rate) < 0 || rate < 0) {
+                fprintf(stderr, "not a refresh rate: %s\n", optarg);
+                exit(1);
+            }
+            info.refresh_rate = rate * 1000 + 0.5;
             break;
         case 'v':
             info.vendor = optarg;
