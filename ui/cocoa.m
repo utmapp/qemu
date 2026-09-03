@@ -114,6 +114,15 @@ static QemuCocoaPasteboardTypeOwner *cbowner;
 /* Consumed on the QEMU IO thread, re-armed from the Cocoa main thread by
  * drawFrame: every access must be atomic. */
 static bool gl_dirty;
+#ifdef USE_METAL
+/* One display read of a scanout texture; see cocoa_gl_read_dispatch. */
+typedef struct CocoaGLRead {
+    id<MTLTexture> texture;
+    MTLOrigin origin;
+    MTLSize size;
+} CocoaGLRead;
+static void cocoa_gl_read_done(CocoaGLRead *read);
+#endif
 static uint32_t gl_scanout_id;
 static bool gl_scanout_y0_top;
 static QEMUGLContext gl_view_ctx;
@@ -318,12 +327,9 @@ typedef NS_ENUM(NSInteger, QemuCocoaViewScanout) {
 #ifdef USE_METAL
 @property (nonatomic,readonly) CAMetalLayer* metalLayer;
 @property (nonatomic,readonly) id<MTLCommandQueue> commandQueue;
-@property (nonatomic,retain) id<MTLTexture> fbTexture;
-@property (nonatomic,assign) MTLOrigin fbOrigin;
-@property (nonatomic,assign) MTLSize fbSize;
 
-- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture origin:(MTLOrigin)origin size:(MTLSize)size;
-- (void)drawFrame;
+- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture size:(MTLSize)size;
+- (void)drawFrame:(CocoaGLRead *)read;
 #endif
 @end
 
@@ -426,7 +432,6 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [_glLayer release];
 #endif
 #ifdef USE_METAL
-    [_fbTexture release];
     [_commandQueue release];
     [_metalLayer release];
 #endif
@@ -1311,9 +1316,6 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 #endif
 #ifdef USE_METAL
         [self.metalLayer removeFromSuperlayer];
-        if (scanout != QemuCocoaViewScanoutMetal) {
-            self.fbTexture = nil;
-        }
 #endif
         switch (scanout) {
 #ifdef CONFIG_OPENGL
@@ -1334,14 +1336,10 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 }
 
 #ifdef USE_METAL
-- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture origin:(MTLOrigin)origin size:(MTLSize)size
+- (void)scanoutMetalTexture:(id<MTLTexture>)metalTexture size:(MTLSize)size
 {
-    COCOA_DEBUG("QemuCocoaView: scanoutMetalTexture(%p) origin:(%d, %d) size:(%d, %d)\n",
-                metalTexture, origin.x, origin.y, size.width, size.height);
-    self.fbTexture = metalTexture;
-    self.fbOrigin = origin;
-    self.fbSize = size;
-
+    COCOA_DEBUG("QemuCocoaView: scanoutMetalTexture(%p) size:(%d, %d)\n",
+                metalTexture, size.width, size.height);
     if (metalTexture) {
         CGFloat scale = self.window.backingScaleFactor;
         CGRect frame = CGRectMake(0, 0, size.width / scale, size.height / scale);
@@ -1366,12 +1364,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 
-- (void)drawFrame
+- (void)drawFrame:(CocoaGLRead *)read
 {
     @autoreleasepool {
-        if (!self.fbTexture) {
-            return;
-        }
         id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
         if (!drawable) {
             /*
@@ -1381,17 +1376,18 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
              * flushes again.
              */
             qatomic_set(&gl_dirty, true);
+            cocoa_gl_read_done(read);
             return;
         }
 
         id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
 
-        [blit copyFromTexture:self.fbTexture
+        [blit copyFromTexture:read->texture
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:self.fbOrigin
-                   sourceSize:self.fbSize
+                 sourceOrigin:read->origin
+                   sourceSize:read->size
                     toTexture:drawable.texture
              destinationSlice:0
              destinationLevel:0
@@ -1399,6 +1395,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
         [blit endEncoding];
 
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            cocoa_gl_read_done(read);
+        }];
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
     }
@@ -2354,6 +2353,68 @@ static void cocoa_gl_destroy_context(DisplayGLCtx *dgc, QEMUGLContext ctx)
     CGLDestroyContext(ctx);
 }
 
+#ifdef USE_METAL
+/*
+ * The Metal scanout is the guest's own buffer.  A flip-model guest hands
+ * the displaced buffer back to its application as soon as the flip is
+ * submitted and orders the application's next writes behind the flip on
+ * the GPU, so the buffer is only guaranteed intact from RESOURCE_FLUSH
+ * until the next flip.  The display therefore reads (blits and presents)
+ * at the flush.  One read is in flight at a time so a guest flipping
+ * faster than the display refreshes never exhausts the drawable pool; a
+ * flush that finds one in flight is served as soon as it completes, and
+ * the refresh tick only retries a read that found no drawable.  All
+ * state below belongs to the main loop.
+ */
+static id<MTLTexture> gl_scanout_src;
+static MTLOrigin gl_scanout_origin;
+static MTLSize gl_scanout_size;
+static bool gl_read_inflight;
+
+static void cocoa_gl_read_dispatch(void);
+
+static void cocoa_gl_read_done_bh(void *opaque)
+{
+    CocoaGLRead *read = opaque;
+
+    gl_read_inflight = false;
+    [read->texture release];
+    g_free(read);
+
+    if (gl_scanout_src && qatomic_xchg(&gl_dirty, false)) {
+        cocoa_gl_read_dispatch();
+    }
+}
+
+static void cocoa_gl_read_done(CocoaGLRead *read)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), cocoa_gl_read_done_bh,
+                            read);
+}
+
+static void cocoa_gl_read_dispatch(void)
+{
+    CocoaGLRead *read = g_new(CocoaGLRead, 1);
+
+    read->texture = [gl_scanout_src retain];
+    read->origin = gl_scanout_origin;
+    read->size = gl_scanout_size;
+    gl_read_inflight = true;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [cocoaView drawFrame:read];
+    });
+}
+
+static void cocoa_gl_scanout_set(id<MTLTexture> texture,
+                                 MTLOrigin origin, MTLSize size)
+{
+    [gl_scanout_src release];
+    gl_scanout_src = [texture retain];
+    gl_scanout_origin = origin;
+    gl_scanout_size = size;
+}
+#endif
+
 static void cocoa_gl_update(DisplayChangeListener *dcl,
                             int x, int y, int w, int h)
 {
@@ -2402,9 +2463,13 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
 #ifdef CONFIG_EGL
 #ifdef USE_METAL
         if (cocoaView.scanout == QemuCocoaViewScanoutMetal) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [cocoaView drawFrame];
-            });
+            if (gl_scanout_src) {
+                if (gl_read_inflight) {
+                    qatomic_set(&gl_dirty, true);
+                } else {
+                    cocoa_gl_read_dispatch();
+                }
+            }
         } else
 #endif
         if (egl_surface) {
@@ -2427,6 +2492,9 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
 static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
 {
     gl_scanout_id = 0;
+#ifdef USE_METAL
+    cocoa_gl_scanout_set(nil, MTLOriginMake(0, 0, 0), MTLSizeMake(0, 0, 0));
+#endif
     qatomic_set(&gl_dirty, true);
     dispatch_async(dispatch_get_main_queue(), ^{
         cocoaView.scanout = QemuCocoaViewScanoutNone;
@@ -2450,8 +2518,9 @@ static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
         id<MTLTexture> mtlTexture = [(id<MTLTexture>)native.handle retain];
         MTLOrigin mtlOrigin = MTLOriginMake(x, y, 0);
         MTLSize mtlSize = MTLSizeMake(w, h, 1);
+        cocoa_gl_scanout_set(mtlTexture, mtlOrigin, mtlSize);
         dispatch_async(dispatch_get_main_queue(), ^{
-            [cocoaView scanoutMetalTexture:mtlTexture origin:mtlOrigin size:mtlSize];
+            [cocoaView scanoutMetalTexture:mtlTexture size:mtlSize];
             [mtlTexture release];
         });
     } else
@@ -2470,6 +2539,13 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
                                    uint32_t x, uint32_t y,
                                    uint32_t w, uint32_t h)
 {
+#ifdef USE_METAL
+    if (gl_scanout_src && !gl_read_inflight) {
+        qatomic_set(&gl_dirty, false);
+        cocoa_gl_read_dispatch();
+        return;
+    }
+#endif
     qatomic_set(&gl_dirty, true);
 }
 
