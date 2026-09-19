@@ -43,6 +43,7 @@
 /*#define OHCI_TIME_WARP 1*/
 
 #define ED_LINK_LIMIT 32
+#define TD_FRAME_LIMIT 256
 
 static int64_t usb_frame_time;
 static int64_t usb_bit_time;
@@ -1154,7 +1155,21 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
             continue;
         }
 
+        uint32_t td_cnt = 0;
         while ((ed.head & OHCI_DPTR_MASK) != ed.tail) {
+            /*
+             * Bound the TDs serviced per ED per frame.  This loop runs with
+             * the BQL held, so a TD list the guest has left circular (seen
+             * with Mac OS X and OpenBIOS when the vCPU is starved) would
+             * otherwise spin forever and the guest could never repair it.
+             * Resume at the next frame instead.
+             */
+            if (++td_cnt > TD_FRAME_LIMIT) {
+                trace_usb_ohci_ed_pkt(cur, 1, 1, ed.head & OHCI_DPTR_MASK,
+                                      ed.tail & OHCI_DPTR_MASK,
+                                      ed.next & OHCI_DPTR_MASK);
+                break;
+            }
             trace_usb_ohci_ed_pkt(cur, (ed.head & OHCI_ED_H) != 0,
                     (ed.head & OHCI_ED_C) != 0, ed.head & OHCI_DPTR_MASK,
                     ed.tail & OHCI_DPTR_MASK, ed.next & OHCI_DPTR_MASK);
@@ -1202,7 +1217,18 @@ static void ohci_eof_timer(OHCIState *ohci)
 /* Set a timer for EOF and generate a SOF event */
 static void ohci_sof(OHCIState *ohci)
 {
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
     ohci->sof_time += usb_frame_time;
+    /*
+     * After a host stall, do not replay every missed 1 ms frame back to
+     * back: when the host is slow enough that a frame costs more than 1 ms
+     * this never catches up, and the timer livelocks the main loop while
+     * holding the BQL.  Drop missed frames, as real hardware would.
+     */
+    if (now - ohci->sof_time > 10 * usb_frame_time) {
+        ohci->sof_time = now;
+    }
     ohci_eof_timer(ohci);
     ohci_set_interrupt(ohci, OHCI_INTR_SF);
 }
