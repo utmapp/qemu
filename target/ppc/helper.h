@@ -116,6 +116,8 @@ DEF_HELPER_2(frip, i64, env, i64)
 DEF_HELPER_2(frim, i64, env, i64)
 
 DEF_HELPER_3(FADD, f64, env, f64, f64)
+DEF_HELPER_4(fastfp_ab, i64, env, i64, i64, i32)
+DEF_HELPER_5(fastfp_acb, i64, env, i64, i64, i64, i32)
 DEF_HELPER_3(FADDS, f64, env, f64, f64)
 DEF_HELPER_3(FSUB, f64, env, f64, f64)
 DEF_HELPER_3(FSUBS, f64, env, f64, f64)

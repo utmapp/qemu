@@ -30,6 +30,27 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 #endif
 
 /***                       Floating-Point arithmetic                       ***/
+/* Op codes for helper_fastfp_ab/acb (fpu_helper.c). */
+static int fastfp_op(void *helper)
+{
+    static const struct { void *h; int op; } map[] = {
+        { gen_helper_FADD, 0 }, { gen_helper_FADDS, 1 },
+        { gen_helper_FSUB, 2 }, { gen_helper_FSUBS, 3 },
+        { gen_helper_FMUL, 4 }, { gen_helper_FMULS, 5 },
+        { gen_helper_FDIV, 6 }, { gen_helper_FDIVS, 7 },
+        { gen_helper_FMADD, 16 }, { gen_helper_FMADDS, 17 },
+        { gen_helper_FMSUB, 18 }, { gen_helper_FMSUBS, 19 },
+        { gen_helper_FNMADD, 20 }, { gen_helper_FNMADDS, 21 },
+        { gen_helper_FNMSUB, 22 }, { gen_helper_FNMSUBS, 23 },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
+        if (map[i].h == helper) {
+            return map[i].op;
+        }
+    }
+    return -1;
+}
+
 static bool do_helper_acb(DisasContext *ctx, arg_A *a,
                           void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
                                          TCGv_i64, TCGv_i64))
@@ -41,13 +62,23 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
     t3 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
-    get_fpr(t0, a->fra);
-    get_fpr(t1, a->frc);
-    get_fpr(t2, a->frb);
-    helper(t3, tcg_env, t0, t1, t2);
-    set_fpr(a->frt, t3);
-    gen_compute_fprf_float64(t3);
+    int op = fastfp_op((void *)helper);
+    if (op >= 0) {
+        /* one call: fast host FP, or the full softfloat sequence */
+        get_fpr(t0, a->fra);
+        get_fpr(t1, a->frc);
+        get_fpr(t2, a->frb);
+        gen_helper_fastfp_acb(t3, tcg_env, t0, t1, t2, tcg_constant_i32(op));
+        set_fpr(a->frt, t3);
+    } else {
+        gen_reset_fpstatus();
+        get_fpr(t0, a->fra);
+        get_fpr(t1, a->frc);
+        get_fpr(t2, a->frb);
+        helper(t3, tcg_env, t0, t1, t2);
+        set_fpr(a->frt, t3);
+        gen_compute_fprf_float64(t3);
+    }
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -64,12 +95,18 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
+    int op = fastfp_op((void *)helper);
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frb);
-    helper(t2, tcg_env, t0, t1);
-    set_fpr(a->frt, t2);
-    gen_compute_fprf_float64(t2);
+    if (op >= 0) {
+        gen_helper_fastfp_ab(t2, tcg_env, t0, t1, tcg_constant_i32(op));
+        set_fpr(a->frt, t2);
+    } else {
+        gen_reset_fpstatus();
+        helper(t2, tcg_env, t0, t1);
+        set_fpr(a->frt, t2);
+        gen_compute_fprf_float64(t2);
+    }
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -86,12 +123,18 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
+    int op = fastfp_op((void *)helper);
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
-    helper(t2, tcg_env, t0, t1);
-    set_fpr(a->frt, t2);
-    gen_compute_fprf_float64(t2);
+    if (op >= 0) {
+        gen_helper_fastfp_ab(t2, tcg_env, t0, t1, tcg_constant_i32(op));
+        set_fpr(a->frt, t2);
+    } else {
+        gen_reset_fpstatus();
+        helper(t2, tcg_env, t0, t1);
+        set_fpr(a->frt, t2);
+        gen_compute_fprf_float64(t2);
+    }
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
