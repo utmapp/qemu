@@ -290,6 +290,23 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     }
 }
 
+/*
+ * Whether tlbie flushes the whole TLB, as the architecture allows and QEMU
+ * has always done, or only the page it names (PPC_TLBIE=page).  Flushing
+ * just the named pages sounds better and measures the same once emptying
+ * the TB jump cache is O(1), so the faithful behaviour stays the default.
+ */
+static bool ppc_tlbie_flushes_all(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *s = getenv("PPC_TLBIE");
+        mode = !(s && !strcmp(s, "page"));
+    }
+    return mode;
+}
+
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 {
 #if !defined(FLUSH_ALL_TLBS)
@@ -314,10 +331,19 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         /*
          * Actual CPUs invalidate entire congruence classes based on
          * the geometry of their TLBs and some OSes take that into
-         * account, we just mark the TLB to be flushed later (context
-         * synchronizing event or sync instruction on 32-bit).
+         * account.  Remember the page this tlbie named instead, and flush
+         * just those at the next context-synchronizing event; an OS that
+         * leans on congruence-class behaviour (rather than naming every
+         * page it changes, as Darwin and Linux do) needs the default.
          */
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        if (ppc_tlbie_flushes_all()) {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        } else if (env->tlb_flush_npages < PPC_TLB_PENDING_PAGES) {
+            env->tlb_flush_pages[env->tlb_flush_npages++] = addr;
+            env->tlb_need_flush |= TLB_NEED_PAGE_FLUSH;
+        } else {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        }
         break;
     default:
         /* Should never reach here with other MMU models */

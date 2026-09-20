@@ -381,6 +381,8 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
+        env->tlb_flush_npages = 0;
         tlb_flush_all_cpus_synced(cs);
         return;
     }
@@ -388,7 +390,19 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
+        env->tlb_flush_npages = 0;
         tlb_flush(cs);
+        return;
+    }
+
+    /* Otherwise only the pages tlbie named have to go. */
+    if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
+        env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
+        for (int i = 0; i < env->tlb_flush_npages; i++) {
+            tlb_flush_page(cs, env->tlb_flush_pages[i]);
+        }
+        env->tlb_flush_npages = 0;
     }
 }
 #endif /* !CONFIG_USER_ONLY */

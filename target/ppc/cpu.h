@@ -1288,6 +1288,17 @@ struct CPUArchState {
     uint32_t tlb_need_flush; /* Delayed flush needed */
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
+#define TLB_NEED_PAGE_FLUSH    0x4
+/*
+ * Pages named by tlbie since the last flush.  A 32-bit hash MMU guest
+ * (Mac OS X) invalidates single pages constantly; turning each of those
+ * into a whole-TLB flush, as the architecture's congruence-class wording
+ * would allow, costs far more than flushing the pages it actually named.
+ * Past this many pending pages a full flush is cheaper anyway.
+ */
+#define PPC_TLB_PENDING_PAGES 64
+    target_ulong tlb_flush_pages[PPC_TLB_PENDING_PAGES];
+    int tlb_flush_npages;
 #endif
 
     /* Other registers */
