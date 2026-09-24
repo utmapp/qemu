@@ -1302,12 +1302,60 @@ static const struct AtapiCmd {
     /* [1] handler detects and reports not ready condition itself */
 };
 
+/*
+ * Names of the packet commands, for the ide_atapi_cmd_name trace event, so
+ * that a command the drive does not implement shows up by name, and in the
+ * order the guest wanted it, rather than as a number.
+ */
+static const char *atapi_cmd_name(uint8_t op)
+{
+    switch (op) {
+    case 0x00: return "TEST UNIT READY";
+    case 0x03: return "REQUEST SENSE";
+    case 0x12: return "INQUIRY";
+    case 0x1b: return "START/STOP UNIT";
+    case 0x1e: return "PREVENT/ALLOW REMOVAL";
+    case 0x23: return "READ FORMAT CAPACITIES";
+    case 0x25: return "READ CAPACITY";
+    case 0x28: return "READ(10)";
+    case 0x2a: return "WRITE(10)";
+    case 0x2b: return "SEEK";
+    case 0x2e: return "WRITE AND VERIFY(10)";
+    case 0x35: return "SYNCHRONIZE CACHE";
+    case 0x3b: return "WRITE BUFFER";
+    case 0x43: return "READ TOC/PMA/ATIP";
+    case 0x46: return "GET CONFIGURATION";
+    case 0x4a: return "GET EVENT STATUS NOTIFICATION";
+    case 0x51: return "READ DISC INFORMATION";
+    case 0x52: return "READ TRACK INFORMATION";
+    case 0x53: return "RESERVE TRACK";
+    case 0x54: return "SEND OPC INFORMATION";
+    case 0x55: return "MODE SELECT(10)";
+    case 0x5a: return "MODE SENSE(10)";
+    case 0x5b: return "CLOSE TRACK/SESSION";
+    case 0x5c: return "READ BUFFER CAPACITY";
+    case 0x5d: return "SEND CUE SHEET";
+    case 0xa1: return "BLANK";
+    case 0xa8: return "READ(12)";
+    case 0xaa: return "WRITE(12)";
+    case 0xad: return "READ DVD STRUCTURE";
+    case 0xbb: return "SET CD SPEED";
+    case 0xbd: return "MECHANISM STATUS";
+    case 0xbe: return "READ CD";
+    default:   return "?";
+    }
+}
+
 void ide_atapi_cmd(IDEState *s)
 {
     uint8_t *buf = s->io_buffer;
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
 
     trace_ide_atapi_cmd(s, s->io_buffer[0]);
+    if (trace_event_get_state_backends(TRACE_IDE_ATAPI_CMD_NAME)) {
+        trace_ide_atapi_cmd_name(s, buf[0], atapi_cmd_name(buf[0]),
+                                 cmd->handler != NULL);
+    }
 
     if (trace_event_get_state_backends(TRACE_IDE_ATAPI_CMD_PACKET)) {
         g_autoptr(GString) str =
