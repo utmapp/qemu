@@ -107,6 +107,7 @@ struct Core99MachineState {
     MachineState parent;
 
     Core99ViaConfig via_config;
+    bool osx_nvram;         /* NVRAM layout Mac OS X can read (osx-nvram) */
     uint32_t cpu_mhz;       /* CPU speed reported to the guest, not emulated */
 };
 
@@ -453,12 +454,26 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    if (core99_machine->osx_nvram) {
+        /*
+         * 16 KB of byte-addressed storage: an Open Firmware bank and a
+         * Mac OS X bank, laid out by pmac_format_nvram_banks, which explains
+         * why the chip is addressed this way rather than with a stride.
+         */
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE * 2);
+        qdev_prop_set_uint32(dev, "it_shift", 0);
+    } else {
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 1);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    if (core99_machine->osx_nvram) {
+        pmac_format_nvram_banks(nvr, MACIO_NVRAM_SIZE);
+    } else {
+        pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    }
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
@@ -593,6 +608,16 @@ static void core99_set_cpu_mhz(Object *obj, Visitor *v, const char *name,
     cms->cpu_mhz = mhz;
 }
 
+static bool core99_get_osx_nvram(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->osx_nvram;
+}
+
+static void core99_set_osx_nvram(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->osx_nvram = value;
+}
+
 static void core99_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -605,6 +630,11 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
     object_class_property_set_description(oc, "cpu-mhz",
         "CPU speed in MHz reported to the guest (100-4000, default 900); "
         "only the reported value changes, not the emulation speed");
+    object_class_property_add_bool(oc, "osx-nvram", core99_get_osx_nvram,
+                                   core99_set_osx_nvram);
+    object_class_property_set_description(oc, "osx-nvram",
+        "NVRAM layout Mac OS X can read (needed by nvram and bless, so by "
+        "the last step of an install); changes the saved-state layout");
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
     /* SMP is not supported currently */
