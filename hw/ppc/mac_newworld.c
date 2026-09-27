@@ -50,6 +50,7 @@
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/ppc/ppc.h"
 #include "hw/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
@@ -106,6 +107,7 @@ struct Core99MachineState {
     MachineState parent;
 
     Core99ViaConfig via_config;
+    uint32_t cpu_mhz;       /* CPU speed reported to the guest, not emulated */
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -502,8 +504,13 @@ static void ppc_core99_init(MachineState *machine)
         fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_KVM_PID, getpid());
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
-    /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
+    /*
+     * Mac OS X requires a "known good" clock-frequency value; pass it one.
+     * It is only reported (About This Mac, hw.cpufrequency, apps' minimum
+     * requirement checks): guest timing runs off the timebase (TBFREQ).
+     */
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ,
+                   core99_machine->cpu_mhz * 1000000U);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
@@ -562,12 +569,42 @@ static int core99_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+static void core99_get_cpu_mhz(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    visit_type_uint32(v, name, &cms->cpu_mhz, errp);
+}
+
+static void core99_set_cpu_mhz(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+    uint32_t mhz;
+
+    if (!visit_type_uint32(v, name, &mhz, errp)) {
+        return;
+    }
+    if (mhz < 100 || mhz > 4000) {
+        error_setg(errp, "cpu-mhz must be between 100 and 4000");
+        return;
+    }
+    cms->cpu_mhz = mhz;
+}
+
 static void core99_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     FWPathProviderClass *fwc = FW_PATH_PROVIDER_CLASS(oc);
 
     mc->desc = "Mac99 based PowerMac";
+
+    object_class_property_add(oc, "cpu-mhz", "uint32", core99_get_cpu_mhz,
+                              core99_set_cpu_mhz, NULL, NULL);
+    object_class_property_set_description(oc, "cpu-mhz",
+        "CPU speed in MHz reported to the guest (100-4000, default 900); "
+        "only the reported value changes, not the emulation speed");
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
     /* SMP is not supported currently */
@@ -630,6 +667,8 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+
+    cms->cpu_mhz = CLOCKFREQ / 1000000;
 
     return;
 }
