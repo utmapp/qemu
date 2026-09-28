@@ -166,8 +166,18 @@ void ppc_translate_init(void)
 }
 
 /* internal defines */
+/* A deferred slow path of an inline FP op (fp-impl.c.inc) */
+typedef struct NativeFPSlow {
+    TCGLabel *slow;
+    target_ulong next;      /* address of the following instruction */
+    int op, frt, x, y, z;
+} NativeFPSlow;
+
 struct DisasContext {
     DisasContextBase base;
+    bool fp_fast;           /* HFLAGS_FP_FAST */
+    int n_nfp;
+    NativeFPSlow nfp[64];
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -6540,6 +6550,8 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     uint32_t hflags = ctx->base.tb->flags;
 
     ctx->spr_cb = env->spr_cb;
+    ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
+    ctx->n_nfp = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     ctx->dr = (hflags >> HFLAGS_DR) & 1;
@@ -6644,7 +6656,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     }
 }
 
-static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
+static void ppc_tr_tb_exit(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     DisasJumpType is_jmp = ctx->base.is_jmp;
@@ -6719,6 +6731,15 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     default:
         g_assert_not_reached();
     }
+}
+
+static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
+{
+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    ppc_tr_tb_exit(dcbase, cs);
+    /* out of line, after the TB's exit, so the fast paths never branch */
+    native_fp_emit_slow_paths(ctx);
 }
 
 static const TranslatorOps ppc_tr_ops = {

@@ -274,6 +274,18 @@ DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 /* r[i] = idx[i] < 16 ? a[idx[i]] : idx[i] < 32 ? b[idx[i] - 16] : 0 */
 DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
+/*
+ * Scalar IEEE binary floating point in the low element of a V64: a double
+ * for vece MO_64, a single for MO_32.  Round to nearest even, no
+ * exception flags; results for NaN operands are the host's.
+ * fop_vec r = a op b, constant op: 0 add, 1 sub, 2 mul, 3 div.
+ * ffma_vec r = a*c + b with one rounding, constant: 0 a*c+b, 1 a*c-b,
+ * 2 -(a*c+b), 3 -(a*c-b) (the negated forms negate the rounded result).
+ * fcvt_vec: constant 0 double -> single (rounding), 1 single -> double.
+ */
+DEF(fop_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(ffma_vec, 1, 3, 1, TCG_OPF_VECTOR)
+DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

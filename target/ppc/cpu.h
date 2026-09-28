@@ -811,6 +811,7 @@ enum {
     HFLAGS_PMC_OTHER = 18, /* PMC other than PMC5-6 is enabled */
     HFLAGS_INSN_CNT = 19, /* PMU instruction count enabled */
     HFLAGS_BHRB_ENABLE = 20, /* Summary flag for enabling BHRB */
+    HFLAGS_FP_FAST = 21, /* FPSCR: no FP exception enabled, NI=0, RN=0 */
     HFLAGS_VSX = 23, /* MSR_VSX if cpu has VSX */
     HFLAGS_VR = 25,  /* MSR_VR if cpu has VRE */
 
@@ -1232,6 +1233,12 @@ struct CPUArchState {
     target_ulong ca;
     target_ulong ov32;
     target_ulong ca32;
+    /*
+     * The result of the last inline FP op (fp-impl.c.inc), whose FPRF is
+     * not in fpscr yet, or PPC_FPRF_NONE; see ppc_fprf_sync().  Up here
+     * so translated code reaches it with a single store.
+     */
+    uint64_t fprf_res;
 
     target_ulong reserve_addr;   /* Reservation address */
     target_ulong reserve_length; /* Reservation larx op size (bytes) */
@@ -1651,6 +1658,25 @@ void cpu_ppc_set_1lpar(PowerPCCPU *cpu);
 #endif
 
 void ppc_store_fpscr(CPUPPCState *env, target_ulong val);
+
+/*
+ * The inline FP ops leave FPSCR[FPRF] to be computed from their result
+ * when it is needed: code that reads FPRF, or changes only part of it,
+ * calls ppc_fprf_sync() first; code that sets all of FPRF calls
+ * ppc_fprf_clear().  The sentinel is a NaN, which an inline op never keeps.
+ */
+#define PPC_FPRF_NONE UINT64_MAX
+void ppc_fprf_sync_slow(CPUPPCState *env);
+static inline void ppc_fprf_sync(CPUPPCState *env)
+{
+    if (unlikely(env->fprf_res != PPC_FPRF_NONE)) {
+        ppc_fprf_sync_slow(env);
+    }
+}
+static inline void ppc_fprf_clear(CPUPPCState *env)
+{
+    env->fprf_res = PPC_FPRF_NONE;
+}
 void helper_hfscr_facility_check(CPUPPCState *env, uint32_t bit,
                                  const char *caller, uint32_t cause);
 

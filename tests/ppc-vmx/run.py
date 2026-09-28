@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [path/to/qemu-system-ppc]
+usage: run.py [--fpdiff | --fpdiff-strict] [path/to/qemu-system-ppc]
+
+--fpdiff runs the scalar FP cases with the inline FP ops off and on and
+compares results and FPSCR; --fpdiff-strict compares the inline results
+with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -15,7 +19,8 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-QEMU = (sys.argv[1] if len(sys.argv) > 1 else
+ARGS = [a for a in sys.argv[1:] if not a.startswith('--')]
+QEMU = (ARGS[0] if ARGS else
         os.path.join(HERE, '..', '..', 'build', 'qemu-system-ppc'))
 RESULTS = 0x10000
 OPS = """vperm vperm(d=a) vperm(d=c) vperm(a=b) vsldoi vsldoi(d=b)
@@ -88,9 +93,66 @@ class Monitor:
         return [int(x, 16) for x in re.findall(r'0x([0-9a-f]{8})(?!:)', out)][:n]
 
 
+FPD_BASE = 0x01000000
+FPD_REC = 6 * 8
+FPD_OPS = ['fadd', 'fadds', 'fsub', 'fsubs', 'fmul', 'fmuls', 'fdiv', 'fdivs',
+           'fmadd', 'fmadds', 'fmsub', 'fmsubs', 'fnmadd', 'fnmadds',
+           'fnmsub', 'fnmsubs', 'frsp']
+
+
+def fpdiff(img, out, strict=False):
+    """Run the scalar FP cases as the reference and inline; compare them."""
+    import struct
+    ref = 'softfloat' if strict else 'helper'
+    dumps = []
+    for native in ('0', '1'):
+        sock = os.path.join(out, f'mon{native}.sock')
+        env = dict(os.environ, PPC_NATIVE_FP=native)
+        if strict and native == '0':
+            env['PPC_STRICT_FP'] = '1'
+        q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
+                              '-bios', img, '-display', 'none',
+                              '-serial', 'none', '-monitor',
+                              f'unix:{sock},server=on,wait=off'],
+                             stdout=subprocess.DEVNULL, env=env)
+        try:
+            mon = Monitor(sock)
+            for _ in range(1200):
+                if mon.words(RESULTS, 1) == [0x564d5854]:
+                    break
+                time.sleep(0.25)
+            else:
+                sys.exit('test did not finish')
+            n = mon.words(RESULTS + 0x283 * 4, 1)[0]
+            path = os.path.join(out, f'fpd{native}.bin')
+            mon.cmd(f'pmemsave {FPD_BASE:#x} {n * FPD_REC} "{path}"')
+            dumps.append(open(path, 'rb').read())
+        finally:
+            q.kill()
+    n = len(dumps[0]) // FPD_REC
+    bad = 0
+    for i in range(n):
+        r0 = struct.unpack_from('>6Q', dumps[0], i * FPD_REC)
+        r1 = struct.unpack_from('>6Q', dumps[1], i * FPD_REC)
+        if r0[:4] != r1[:4] or (not strict and r0 != r1):
+            bad += 1
+            if bad <= 10:
+                st, op, form = (r0[5] >> 16) & 15, (r0[5] >> 8) & 0xff, r0[5] & 0xff
+                follow = ('mffs', 'fcmpu', 'mtfsb1', 'mcrfs')[(r0[5] >> 20) & 15]
+                print(f'MISMATCH {FPD_OPS[op]} form {form} fpscr_in {st} then {follow} '
+                      f'(cr {r0[5] >> 32:08x}/{r1[5] >> 32:08x}): '
+                      f'a={r0[0]:016x} c={r0[1]:016x} b={r0[2]:016x}')
+                print(f'   {ref}: {r0[3]:016x} fpscr {r0[4] & 0xffffffff:08x}'
+                      f'   native: {r1[3]:016x} fpscr {r1[4] & 0xffffffff:08x}')
+    print(f'{n} FP cases compared (native vs {ref}), {bad} mismatches')
+    return bad
+
+
 def main():
     out = tempfile.mkdtemp(prefix='ppc-vmx-')
     img = build(out)
+    if '--fpdiff' in sys.argv or '--fpdiff-strict' in sys.argv:
+        sys.exit(1 if fpdiff(img, out, '--fpdiff-strict' in sys.argv) else 0)
     sock = os.path.join(out, 'mon.sock')
     q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
                           '-bios', img, '-display', 'none', '-serial', 'none',

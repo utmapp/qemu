@@ -584,6 +584,487 @@ static void bench(void)
                      : "+v"(a.v) : "v"(b.v), "v"(c.v));
     }
     res[0x204] = tb() - t0;
+
+    /* lfs; fmadds; stfs on an array of normal singles, x4 per iteration */
+    {
+        float buf[64];
+        float k = 1.0f;
+        for (i = 0; i < 64; i++) {
+            buf[i] = 1.0f + i * 0.125f;
+        }
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            float *p = &buf[(i * 4) & 63];
+            asm volatile("lfs 1,0(%0)\n\tfmadds 1,1,%1,%1\n\tstfs 1,0(%0)\n\t"
+                         "lfs 2,4(%0)\n\tfmadds 2,2,%1,%1\n\tstfs 2,4(%0)\n\t"
+                         "lfs 3,8(%0)\n\tfmadds 3,3,%1,%1\n\tstfs 3,8(%0)\n\t"
+                         "lfs 4,12(%0)\n\tfmadds 4,4,%1,%1\n\tstfs 4,12(%0)"
+                         : : "b"(p), "f"(k) : "fr1", "fr2", "fr3", "fr4", "memory");
+            k = k * 0.5f + 0.25f;
+        }
+        res[0x205] = tb() - t0;
+    }
+
+    /* scalar FP latency: dependent chains vs independent vs integer */
+    {
+        double x = 1.0, y = 1.0, z = 1.0, w = 1.0, h = 0.5, q = 0.25;
+        uint32_t r = 1, k = 3;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadd %0,%0,%1,%2\n\tfmadd %0,%0,%1,%2\n\t"
+                         "fmadd %0,%0,%1,%2\n\tfmadd %0,%0,%1,%2"
+                         : "+f"(x) : "f"(h), "f"(q));
+        }
+        res[0x206] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadd %0,%0,%4,%5\n\tfmadd %1,%1,%4,%5\n\t"
+                         "fmadd %2,%2,%4,%5\n\tfmadd %3,%3,%4,%5"
+                         : "+f"(x), "+f"(y), "+f"(z), "+f"(w) : "f"(h), "f"(q));
+        }
+        res[0x207] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fadd %0,%0,%1\n\tfadd %0,%0,%1\n\t"
+                         "fadd %0,%0,%1\n\tfadd %0,%0,%1"
+                         : "+f"(x) : "f"(q));
+        }
+        res[0x208] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("add %0,%0,%1\n\tadd %0,%0,%1\n\t"
+                         "add %0,%0,%1\n\tadd %0,%0,%1"
+                         : "+r"(r) : "r"(k));
+        }
+        res[0x209] = tb() - t0;
+        res[0x20a] = r ^ (uint32_t)(x + y + z + w);
+    }
+
+    /* Mandelbrot escape loop, as compiled C: fcmpu decides every exit */
+    {
+        uint32_t total = 0;
+        int px, py, n;
+
+        t0 = tb();
+        for (py = 0; py < 48; py++) {
+            for (px = 0; px < 64; px++) {
+                double cr = -2.0 + px * (2.5 / 64), ci = -1.25 + py * (2.5 / 48);
+                double zr = 0, zi = 0, zr2 = 0, zi2 = 0;
+                for (n = 0; n < 256 && zr2 + zi2 <= 4.0; n++) {
+                    zi = 2.0 * zr * zi + ci;
+                    zr = zr2 - zi2 + cr;
+                    zr2 = zr * zr;
+                    zi2 = zi * zi;
+                }
+                total += n;
+            }
+        }
+        res[0x20b] = tb() - t0;
+        res[0x20c] = total;
+    }
+
+    /* Geekbench 2.2's Mandelbrot inner loop (GCC 4.0), instruction for
+       instruction, points that never escape: 255 iterations each */
+    {
+        double c[4] = { 0.25, 0.0, 4.0, 0.0 };  /* cr, ci, escape radius^2 */
+        uint32_t n = 0;
+
+        t0 = tb();
+        for (i = 0; i < 1000; i++) {
+            if (i == 500) {
+                res[0x20f] = tb() - t0;     /* first half: never escapes */
+                c[0] = 1.5;                 /* then: escapes after 2 */
+                c[1] = 0.5;
+            }
+            if (i >= 500) {
+                int j;
+                for (j = 0; j < 100; j++) {
+                    asm volatile(
+                        "lfd 8,0(%1)\n\tlfd 6,8(%1)\n\tlfd 7,16(%1)\n\t"
+                        "fmr 9,6\n\tfmr 11,8\n\tfmr 10,9\n\t"
+                        "li 0,255\n\tmtctr 0\n"
+                        "1:\tfmul 0,10,10\n\taddi %0,%0,1\n\t"
+                        "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                        "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                        "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                        "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n2:"
+                        : "+r"(n) : "b"(c)
+                        : "fr0", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                          "fr13", "ctr", "cr7", "r0");
+                }
+                continue;
+            }
+            asm volatile(
+                "lfd 8,0(%1)\n\tlfd 6,8(%1)\n\tlfd 7,16(%1)\n\t"
+                "fmr 9,6\n\tfmr 11,8\n\tfmr 10,9\n\t"
+                "li 0,255\n\tmtctr 0\n"
+                "1:\tfmul 0,10,10\n\taddi %0,%0,1\n\t"
+                "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n2:"
+                : "+r"(n) : "b"(c)
+                : "fr0", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                  "fr13", "ctr", "cr7", "r0");
+        }
+        res[0x20d] = tb() - t0;
+        res[0x20e] = n;
+    }
+
+    /* Geekbench 2.2's whole Mandelbrot routine (0x26ac0-0x26b98): rows and
+       columns converted to double through memory (stw, stw, lfd), the
+       loop, and the flop count kept in r27:r28 with addc/adde */
+    {
+        double k[5] = {
+            0.0, -2.0, 4.0, 1.25, 0.0,  /* magic (set below), cr0, esc, ci0 */
+        };
+        uint32_t buf[4];
+        uint32_t lo = 0, hi = 0;
+        union { uint64_t u; double d; } magic = { 0x4330000080000000ull };
+
+        k[0] = magic.d;
+        k[4] = 0.046875;                    /* 3/64: rows and columns */
+        t0 = tb();
+        for (i = 0; i < 4; i++) {
+            asm volatile(
+                "lfd 5,32(%[k])\n\t"            /* row scale */
+                "lfd 6,32(%[k])\n\t"            /* column scale */
+                "li 10,0\n\tli 26,48\n\tli 30,64\n\t"
+                "cmpwi 6,30,0\n"
+                "3:\txoris 2,10,0x8000\n\tlis 0,0x4330\n\tlfd 13,0(%[k])\n\t"
+                "li 9,0\n\tstw 2,12(%[b])\n\tstw 0,8(%[b])\n\t"
+                "lfd 0,8(%[b])\n\tfsub 0,0,13\n\tlfd 13,24(%[k])\n\t"
+                "fmsub 8,5,0,13\n"
+                "4:\txoris 2,9,0x8000\n\tlis 0,0x4330\n\tlfd 13,0(%[k])\n\t"
+                "lfd 12,8(%[k])\n\tfmr 11,8\n\tstw 0,0(%[b])\n\tstw 2,4(%[b])\n\t"
+                "li 0,0xff\n\tmtctr 0\n\tlfd 7,16(%[k])\n\tli 2,0\n\t"
+                "lfd 0,0(%[b])\n\tfsub 0,0,13\n\tfmadd 9,6,0,12\n\tfmr 10,9\n"
+                "1:\tfmul 0,10,10\n\taddi 2,2,1\n\t"
+                "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n"
+                "2:\taddi 9,9,1\n\tmulli 2,2,14\n\tcmpw 7,30,9\n\tmr 3,2\n\t"
+                "li 2,0\n\taddc %[lo],%[lo],3\n\tadde %[hi],%[hi],2\n\t"
+                "bne 7,4b\n\t"
+                "addi 10,10,1\n\tcmpw 7,26,10\n\tbeq 7,5f\n\t"
+                "ble 6,3b\n\tb 3b\n"
+                "5:"
+                : [lo] "+r"(lo), [hi] "+r"(hi)
+                : [k] "b"(k), [b] "b"(buf)
+                : "r0", "r2", "r3", "r9", "r10", "r26", "r30",
+                  "fr0", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11",
+                  "fr12", "fr13", "ctr", "cr6", "cr7", "xer", "memory");
+            k[4] = 0.046875 + i * 0.001;    /* a slightly different image each time */
+        }
+        res[0x210] = tb() - t0;
+        res[0x211] = lo;
+    }
+}
+
+/*
+ * Scalar lfs/stfs: single <-> double conversion, which the translator
+ * inlines for normal numbers (target/ppc/translate/fp-impl.c.inc).  The
+ * references are helper_todouble/helper_tosingle's logic in integer code.
+ * lfd/stfd move the 64-bit register image in and out unconverted.
+ */
+static uint64_t ref_todouble(uint32_t a)
+{
+    uint32_t abs = a & 0x7fffffff, e = (a >> 23) & 0xff;
+    uint64_t r = (uint64_t)(a >> 31) << 63;
+
+    if (abs >= 0x00800000) {
+        if (e == 0xff) {
+            return r | (0x7ffULL << 52) | (uint64_t)(a & 0x7fffff) << 29;
+        }
+        return r | (uint64_t)(e + 896) << 52 | (uint64_t)(a & 0x7fffff) << 29;
+    }
+    if (abs) {
+        int shift = __builtin_clz(abs) - 8;
+        r |= (uint64_t)(-126 - shift + 1023 - 1) << 52;
+        r += (uint64_t)abs << (52 - 23 + shift);
+    }
+    return r;
+}
+
+static uint32_t ref_tosingle(uint64_t a)
+{
+    int e = (a >> 52) & 0x7ff;
+    uint32_t r;
+
+    if (e > 896) {
+        return (uint32_t)(a >> 62) << 30 | (uint32_t)((a >> 29) & 0x3fffffff);
+    }
+    r = (uint32_t)(a >> 63) << 31;
+    if (e >= 874) {
+        r |= ((1ULL << 52) | (a & 0xfffffffffffffULL)) >> (896 + 30 - e);
+    }
+    return r;
+}
+
+static uint64_t hw_lfs(uint32_t s)
+{
+    volatile uint32_t in = s;
+    volatile uint64_t out;
+    double f;
+    asm volatile("lfs %0,0(%1)" : "=f"(f) : "b"(&in) : "memory");
+    asm volatile("stfd %0,0(%1)" : : "f"(f), "b"(&out) : "memory");
+    return out;
+}
+
+static uint32_t hw_stfs(uint64_t d)
+{
+    volatile uint64_t in = d;
+    volatile uint32_t out;
+    double f;
+    asm volatile("lfd %0,0(%1)" : "=f"(f) : "b"(&in) : "memory");
+    asm volatile("stfs %0,0(%1)" : : "f"(f), "b"(&out) : "memory");
+    return out;
+}
+
+static void fp_log(uint32_t kind, uint64_t in, uint64_t got, uint64_t exp)
+{
+    volatile uint32_t *p = res + 0x2a0 + (res[0x281] - 1) * 8;
+    if (res[0x281] > 4) {
+        return;
+    }
+    p[0] = kind;
+    p[1] = in >> 32;  p[2] = in;
+    p[3] = got >> 32; p[4] = got;
+    p[5] = exp >> 32; p[6] = exp;
+}
+
+static void check_lfs(uint32_t s)
+{
+    uint64_t got = hw_lfs(s), exp = ref_todouble(s);
+    res[0x280]++;
+    if (got != exp) {
+        res[0x281]++;
+        fp_log(0, s, got, exp);
+    }
+}
+
+static void check_stfs(uint64_t d)
+{
+    uint32_t got = hw_stfs(d), exp = ref_tosingle(d);
+    res[0x280]++;
+    if (got != exp) {
+        res[0x281]++;
+        fp_log(1, d, got, exp);
+    }
+}
+
+static void scalar_ldst(uint32_t *seed)
+{
+    static const uint32_t s_edge[] = {
+        0x00000000, 0x80000000, 0x00000001, 0x807fffff, 0x00400000,
+        0x00800000, 0x80800000, 0x3f800000, 0xbf800000, 0x7f7fffff,
+        0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x7f800001,
+        0xffbfffff, 0x40000000, 0x3fffffff, 0x7f000000, 0x00ffffff,
+    };
+    int i, e;
+
+    for (i = 0; i < (int)(sizeof(s_edge) / sizeof(s_edge[0])); i++) {
+        check_lfs(s_edge[i]);
+        check_stfs(ref_todouble(s_edge[i]));
+    }
+    /* stfs around its exponent boundaries (874, 896/897, 0x7ff) */
+    for (e = 860; e < 910; e++) {
+        for (i = 0; i < 20; i++) {
+            uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+            check_stfs((m & 0x800fffffffffffffULL) | (uint64_t)e << 52);
+        }
+    }
+    for (i = 0; i < 20; i++) {
+        uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+        check_stfs(m | 0x7ff0000000000000ULL);
+        check_stfs(m & 0x800fffffffffffffULL);
+    }
+    for (i = 0; i < 20000; i++) {
+        uint32_t s = rnd(seed);
+        check_lfs(s);
+        check_stfs((uint64_t)rnd(seed) << 32 | rnd(seed));
+    }
+}
+
+
+/*
+ * Differential test for the inline scalar FP ops (fp-impl.c.inc
+ * native_fp_op()): every A-form arithmetic op, with the target distinct
+ * from or equal to each input, on operands from all the classes that
+ * decide between the inline path and the helper (zeros, denormals,
+ * infinities, quiet and signalling NaNs, exact and inexact singles,
+ * cancellation, overflow).  Each case stores the result and FPSCR at
+ * FPD_BASE; run.py --fpdiff runs this with PPC_NATIVE_FP=0 and =1 and
+ * compares the two memory images.
+ */
+#define FPD_BASE    0x01000000u
+#define FPD_BUF     0x00100000u
+#define FPD_REC     6           /* a, c, b, result, fpscr, case id (u64) */
+/* the case id: FPSCR state << 16 | op << 8 | form, follow-up << 20, CR << 32 */
+
+static uint64_t fpd_pool(uint32_t *seed)
+{
+    static const uint64_t special[] = {
+        0x0000000000000000ull, 0x8000000000000000ull,  /* +-0 */
+        0x0000000000000001ull, 0x800fffffffffffffull,  /* denormals */
+        0x0010000000000000ull, 0x8010000000000000ull,  /* min normal */
+        0x3ff0000000000000ull, 0xbff0000000000000ull,  /* +-1 */
+        0x7fefffffffffffffull, 0xffefffffffffffffull,  /* max */
+        0x7ff0000000000000ull, 0xfff0000000000000ull,  /* +-inf */
+        0x7ff8000000000000ull, 0xfff8000000000123ull,  /* qNaN */
+        0x7ff0000000000001ull, 0xfff4000000000000ull,  /* sNaN */
+        0x3810000000000000ull, 0x36a0000000000000ull,  /* single min normal, single denormal */
+        0x47efffffe0000000ull, 0x4800000000000000ull,  /* single max, just above */
+        0x3ff0000000000001ull, 0x4000000010000000ull,  /* inexact singles */
+        0x4059000000000000ull, 0xc059000000000000ull,  /* +-100 */
+        0x8000000000000001ull, 0x000fffffffffffffull,  /* -min, +max denormal */
+        0x380fffffffffffffull, 0xb80ffffff0000000ull,  /* just under 2^-126 */
+        0x47efffffefffffffull, 0xc7effffff0000000ull,  /* near single max */
+        0x3ff0000010000000ull, 0x3ff0000030000000ull,  /* single ties */
+    };
+    uint32_t r = rnd(seed);
+    uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+
+    switch (r & 7) {
+    case 0: case 1:
+        return special[(r >> 3) % (sizeof(special) / sizeof(special[0]))];
+    case 2: case 3:     /* exact single, moderate exponent */
+        return (m & 0x800fffffe0000000ull) | (uint64_t)(1000 + (r >> 8) % 46) << 52;
+    case 4:             /* double, moderate exponent */
+        return (m & 0x800fffffffffffffull) | (uint64_t)(990 + (r >> 8) % 70) << 52;
+    case 5:             /* exact single, full single range */
+        return (m & 0x800fffffe0000000ull) | (uint64_t)(897 + (r >> 8) % 254) << 52;
+    default:            /* anything */
+        return m;
+    }
+}
+
+#define FPD_ASM(insn) \
+    asm volatile("lfd 2,0(%0)\n\tlfd 3,8(%0)\n\tlfd 4,16(%0)\n\tlfd 1,40(%0)\n\t" \
+                 "lfd 5,48(%0)\n\tmtfsf 0xff,5\n\t" insn \
+                 : : "b"(buf) : "fr1", "fr2", "fr3", "fr4", "fr5", "memory")
+#define FPD_OUT(t) asm volatile("stfd " #t ",24(%0)" : : "b"(buf) : "memory")
+
+/* one op, four target choices: f1 (distinct), f2 (=A), f3 (=C), f4 (=B) */
+#define FPD_OP3(m) \
+    case 0: FPD_ASM(m " 1,2,3,4"); FPD_OUT(1); break; \
+    case 1: FPD_ASM(m " 2,2,3,4"); FPD_OUT(2); break; \
+    case 2: FPD_ASM(m " 3,2,3,4"); FPD_OUT(3); break; \
+    case 3: FPD_ASM(m " 4,2,3,4"); FPD_OUT(4); break;
+#define FPD_OPB(m) \
+    case 0: FPD_ASM(m " 1,2,4"); FPD_OUT(1); break; \
+    case 1: FPD_ASM(m " 2,2,4"); FPD_OUT(2); break; \
+    case 2: FPD_ASM(m " 4,4,2"); FPD_OUT(4); break; \
+    case 3: FPD_ASM(m " 4,2,4"); FPD_OUT(4); break;
+#define FPD_OPR(m) \
+    case 0: FPD_ASM(m " 1,4"); FPD_OUT(1); break; \
+    case 1: FPD_ASM(m " 4,4"); FPD_OUT(4); break; \
+    case 2: FPD_ASM(m " 1,2"); FPD_OUT(1); break; \
+    case 3: FPD_ASM(m " 2,2"); FPD_OUT(2); break;
+#define FPD_OPC(m) \
+    case 0: FPD_ASM(m " 1,2,3"); FPD_OUT(1); break; \
+    case 1: FPD_ASM(m " 2,2,3"); FPD_OUT(2); break; \
+    case 2: FPD_ASM(m " 3,2,3"); FPD_OUT(3); break; \
+    case 3: FPD_ASM(m " 3,3,2"); FPD_OUT(3); break;
+
+static void fpd_one(volatile uint64_t *buf, int op, int form)
+{
+    switch (op) {
+    case 0:  switch (form) { FPD_OPB("fadd") }    break;
+    case 1:  switch (form) { FPD_OPB("fadds") }   break;
+    case 2:  switch (form) { FPD_OPB("fsub") }    break;
+    case 3:  switch (form) { FPD_OPB("fsubs") }   break;
+    case 4:  switch (form) { FPD_OPC("fmul") }    break;
+    case 5:  switch (form) { FPD_OPC("fmuls") }   break;
+    case 6:  switch (form) { FPD_OPB("fdiv") }    break;
+    case 7:  switch (form) { FPD_OPB("fdivs") }   break;
+    case 8:  switch (form) { FPD_OP3("fmadd") }   break;
+    case 9:  switch (form) { FPD_OP3("fmadds") }  break;
+    case 10: switch (form) { FPD_OP3("fmsub") }   break;
+    case 11: switch (form) { FPD_OP3("fmsubs") }  break;
+    case 12: switch (form) { FPD_OP3("fnmadd") }  break;
+    case 13: switch (form) { FPD_OP3("fnmadds") } break;
+    case 14: switch (form) { FPD_OP3("fnmsub") }  break;
+    case 15: switch (form) { FPD_OP3("fnmsubs") } break;
+    case 16: switch (form) { FPD_OPR("frsp") }    break;
+    }
+}
+
+/*
+ * What reads FPSCR after the op, in a separate asm (maybe a separate TB):
+ * mffs alone, or after an instruction that changes or reads part of FPRF.
+ * The CR is returned for mcrfs.
+ */
+static uint32_t fpd_tail(volatile uint64_t *buf, int follow)
+{
+    uint32_t cr = 0;
+
+    switch (follow) {
+    case 0:
+        asm volatile("mffs 5\n\tstfd 5,32(%0)"
+                     : : "b"(buf) : "fr5", "memory");
+        break;
+    case 1:     /* FPCC only, C kept */
+        asm volatile("fcmpu 1,2,4\n\tmffs 5\n\tstfd 5,32(%1)\n\tmfcr %0"
+                     : "=r"(cr) : "b"(buf) : "fr5", "cr1", "memory");
+        break;
+    case 2:     /* one FPCC bit (FU) */
+        asm volatile("mtfsb1 19\n\tmffs 5\n\tstfd 5,32(%0)"
+                     : : "b"(buf) : "fr5", "memory");
+        break;
+    default:    /* FPCC to CR1 */
+        asm volatile("mcrfs 1,4\n\tmffs 5\n\tstfd 5,32(%1)\n\tmfcr %0"
+                     : "=r"(cr) : "b"(buf) : "fr5", "cr1", "memory");
+        break;
+    }
+    return cr;
+}
+
+static void fp_diff(uint32_t *seed)
+{
+    volatile uint64_t *buf = (volatile uint64_t *)FPD_BUF;
+    volatile uint64_t *out = (volatile uint64_t *)FPD_BASE;
+    uint32_t n = 0;
+    /* FPSCR states: fast mode, then round-toward-zero (helper only) */
+    static const uint64_t fpscr_in[2] = { 0, 1 };
+
+    for (int st = 0; st < 2; st++) {
+        for (int it = 0; it < (st ? 300 : 3000); it++) {
+            uint64_t a = fpd_pool(seed), c = fpd_pool(seed), b = fpd_pool(seed);
+            uint32_t k = rnd(seed);
+            if ((k & 15) == 0) {
+                b = a;                        /* x - x, x + -x shapes */
+            } else if ((k & 15) == 1) {
+                b = a ^ 0x8000000000000000ull;
+            }
+            for (int op = 0; op < 17; op++) {
+                for (int form = 0; form < 4; form++) {
+                    buf[0] = a; buf[1] = c; buf[2] = b;
+                    buf[5] = 0x7ff8dead0000beefull;   /* old f1 */
+                    buf[6] = fpscr_in[st];
+                    int follow = it & 3;
+                    uint32_t cr;
+
+                    fpd_one(buf, op, form);
+                    cr = fpd_tail(buf, follow);
+                    out[0] = a; out[1] = c; out[2] = b;
+                    out[3] = buf[3]; out[4] = buf[4];
+                    out[5] = (uint64_t)cr << 32 | follow << 20 |
+                             st << 16 | op << 8 | form;
+                    out += FPD_REC;
+                    n++;
+                }
+            }
+        }
+    }
+    res[0x283] = n;
+    /* back to FPSCR 0: round to nearest, as the benchmarks expect */
+    asm volatile("mtfsfi 7,0");
 }
 
 int main(void)
@@ -636,6 +1117,8 @@ int main(void)
     }
     res[1] = checks;
     res[2] = fails;
+    scalar_ldst(&seed);
+    fp_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;

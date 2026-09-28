@@ -181,6 +181,15 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     if (env->spr[SPR_LPCR] & LPCR_GTSE) {
         hflags |= 1 << HFLAGS_GTSE;
     }
+    /*
+     * The FPSCR state in which the A-form FP ops run inline on the host
+     * FPU (see native_fp_op() in translate/fp-impl.c.inc).  Only
+     * ppc_store_fpscr() changes these bits, and it recomputes hflags.
+     */
+    if (!(env->fpscr & (FP_VE | FP_OE | FP_UE | FP_ZE | FP_XE |
+                        FP_NI | FP_RN))) {
+        hflags |= 1 << HFLAGS_FP_FAST;
+    }
     if (env->spr[SPR_LPCR] & LPCR_HR) {
         hflags |= 1 << HFLAGS_HR;
     }

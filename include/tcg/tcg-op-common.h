@@ -461,6 +461,11 @@ void tcg_gen_cmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
 void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
+void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
+                     TCGv_vec a, TCGv_vec b);
+void tcg_gen_ffma_vec(unsigned vece, unsigned kind, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec c, TCGv_vec b);
+void tcg_gen_fcvt_vec(bool to_double, TCGv_vec r, TCGv_vec a);
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d);
 

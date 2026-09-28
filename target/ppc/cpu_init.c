@@ -7303,6 +7303,7 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
     /* clean any pending stop state */
     env->resume_as_sreset = 0;
 #endif
+    ppc_fprf_clear(env);
     hreg_compute_hflags(env);
     env->reserve_addr = (target_ulong)-1ULL;
     /* Be sure no exception or interrupt is pending */
@@ -7662,6 +7663,7 @@ void ppc_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                 qemu_fprintf(f, "\n");
             }
         }
+        ppc_fprf_sync(env);
         qemu_fprintf(f, "FPSCR " TARGET_FMT_lx "\n", env->fpscr);
     }
 

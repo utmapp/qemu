@@ -251,6 +251,7 @@ static void dfp_set_FPRF_from_FRT_with_context(struct PPC_DFP *dfp,
     default:
         g_assert_not_reached();
     }
+    ppc_fprf_clear(dfp->env);
     dfp->env->fpscr &= ~FP_FPRF;
     dfp->env->fpscr |= (fprf << FPSCR_FPRF);
 }
@@ -400,6 +401,7 @@ static void dfp_set_CRBF_from_T(struct PPC_DFP *dfp)
 
 static void dfp_set_FPCC_from_CRBF(struct PPC_DFP *dfp)
 {
+    ppc_fprf_sync(dfp->env);
     dfp->env->fpscr &= ~FP_FPCC;
     dfp->env->fpscr |= (dfp->crbf << FPSCR_FPCC);
 }

@@ -162,6 +162,7 @@ void helper_compute_fprf_##tp(CPUPPCState *env, tp arg)           \
             fprf = 0x11 << FPSCR_FPRF;                            \
         }                                                         \
     }                                                             \
+    ppc_fprf_clear(env);                                          \
     env->fpscr = (env->fpscr & ~FP_FPRF) | fprf;                  \
 }
 
@@ -193,6 +194,7 @@ static void finish_invalid_op_arith(CPUPPCState *env, int op,
     env->fpscr &= ~(FP_FR | FP_FI);
     if (!(env->fpscr & FP_VE)) {
         if (set_fpcc) {
+            ppc_fprf_sync(env);
             env->fpscr &= ~FP_FPCC;
             env->fpscr |= (FP_C | FP_FU);
         }
@@ -253,6 +255,7 @@ static void float_invalid_op_vxvc(CPUPPCState *env, bool set_fpcc,
 {
     env->fpscr |= FP_VXVC;
     if (set_fpcc) {
+        ppc_fprf_sync(env);
         env->fpscr &= ~FP_FPCC;
         env->fpscr |= (FP_C | FP_FU);
     }
@@ -280,6 +283,7 @@ static void float_invalid_op_vxcvi(CPUPPCState *env, bool set_fpcc,
     env->fpscr &= ~(FP_FR | FP_FI);
     if (!(env->fpscr & FP_VE)) {
         if (set_fpcc) {
+            ppc_fprf_sync(env);
             env->fpscr &= ~FP_FPCC;
             env->fpscr |= (FP_C | FP_FU);
         }
@@ -356,9 +360,20 @@ static inline void float_inexact_excp(CPUPPCState *env)
     }
 }
 
+void ppc_fprf_sync_slow(CPUPPCState *env)
+{
+    helper_compute_fprf_float64(env, env->fprf_res);
+}
+
+void helper_fprf_sync(CPUPPCState *env)
+{
+    ppc_fprf_sync(env);
+}
+
 void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 {
     uint32_t mask = 1u << bit;
+    ppc_fprf_sync(env);
     if (env->fpscr & mask) {
         ppc_store_fpscr(env, env->fpscr & ~(target_ulong)mask);
     }
@@ -367,6 +382,7 @@ void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 void helper_fpscr_setbit(CPUPPCState *env, uint32_t bit)
 {
     uint32_t mask = 1u << bit;
+    ppc_fprf_sync(env);
     if (!(env->fpscr & mask)) {
         ppc_store_fpscr(env, env->fpscr | mask);
     }
@@ -377,6 +393,7 @@ void helper_store_fpscr(CPUPPCState *env, uint64_t val, uint32_t nibbles)
     target_ulong mask = 0;
     int i;
 
+    ppc_fprf_sync(env);
     /* TODO: push this extension back to translation time */
     for (i = 0; i < sizeof(target_ulong) * 2; i++) {
         if (nibbles & (1 << i)) {
@@ -893,6 +910,7 @@ void helper_fcmpu(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = ret;
@@ -924,6 +942,7 @@ void helper_fcmpo(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = (uint32_t) ret;
@@ -2190,6 +2209,7 @@ void helper_xscmpexpdp(CPUPPCState *env, uint32_t opcode,
         }
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[BF(opcode)] = cc;
@@ -2219,6 +2239,7 @@ void helper_xscmpexpqp(CPUPPCState *env, uint32_t opcode,
         }
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[BF(opcode)] = cc;
@@ -2265,6 +2286,7 @@ static inline void do_scalar_cmp(CPUPPCState *env, ppc_vsr_t *xa, ppc_vsr_t *xb,
         g_assert_not_reached();
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[crf_idx] = cc;
@@ -2330,6 +2352,7 @@ static inline void do_scalar_cmpq(CPUPPCState *env, ppc_vsr_t *xa,
         g_assert_not_reached();
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[crf_idx] = cc;
@@ -3170,6 +3193,7 @@ static bool not_SP_value(float64 val)
         uint32_t cc, match, sign = TP##_is_neg(b->FLD);                     \
         match = TP##_tstdc(b->FLD, dcmx);                                   \
         cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT;                      \
+        ppc_fprf_sync(env);                                                 \
         env->fpscr &= ~FP_FPCC;                                             \
         env->fpscr |= cc << FPSCR_FPCC;                                     \
         env->crf[bf] = cc;                                                  \
@@ -3187,6 +3211,7 @@ void helper_XSTSTDCSP(CPUPPCState *env, uint32_t bf,
     int not_sp = (int)not_SP_value(b->VsrD(0));
     match = float64_tstdc(b->VsrD(0), dcmx) || (exp > 0 && exp < 0x381);
     cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT | not_sp << CRF_SO_BIT;
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[bf] = cc;
@@ -3731,6 +3756,7 @@ static inline void ff_fprf(CPUPPCState *env, uint64_t r)
     if (likely(exp != 0 && exp != 0x7FF)) {
         target_ulong fprf = (r >> 63) ? (0x08 << FPSCR_FPRF)
                                       : (0x04 << FPSCR_FPRF);
+        ppc_fprf_clear(env);
         env->fpscr = (env->fpscr & ~FP_FPRF) | fprf;
     } else {
         helper_compute_fprf_float64(env, r);
@@ -3809,11 +3835,16 @@ uint64_t helper_fastfp_acb(CPUPPCState *env, uint64_t a, uint64_t c,
         } else {
             r = fma(x, y, zz);
         }
-        if (kind & 2) {
-            r = -r;                                /* nmadd / nmsub */
-        }
         if (likely(ok && !isnan(r))) {
             uint64_t ret = ff_u(r);
+            /*
+             * nmadd / nmsub negate the rounded result, so an exact zero
+             * sum gives -0.  Flip the bit: the compiler would fold -fma()
+             * into AArch64 FNMADD, -(x*y)-z, which gives +0 there.
+             */
+            if (kind & 2) {
+                ret ^= INT64_MIN;
+            }
             ff_fprf(env, ret);
             return ret;
         }

@@ -2835,6 +2835,43 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_fop_vec:
+        /* Scalar FADD/FSUB/FMUL/FDIV; ftype 01 double, 00 single. */
+        {
+            static const uint32_t fop[4] = {
+                0x1e202800, 0x1e203800, 0x1e200800, 0x1e201800,
+            };
+            tcg_out32(s, fop[args[3]] | (vece == MO_64) << 22
+                      | (a2 & 0x1f) << 16 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        }
+        break;
+    case INDEX_op_ffma_vec:
+        /*
+         * r = a*c + b in PowerPC's four forms.  AArch64's FMADD (n*m + a)
+         * and FNMSUB (n*m - a) give the first two with n = a, m = c,
+         * a = b.  PowerPC's negated forms negate the rounded result, so an
+         * exact zero comes out -0; AArch64's FNMADD/FMSUB negate operands
+         * instead (+0), so use FMADD/FNMSUB and then FNEG.
+         */
+        {
+            static const uint32_t fma[2] = { 0x1f000000, 0x1f208000 };
+            uint32_t ft = (vece == MO_64) << 22;
+
+            tcg_out32(s, fma[args[4] & 1] | ft | (a2 & 0x1f) << 16
+                      | (args[3] & 0x1f) << 10 | (a1 & 0x1f) << 5
+                      | (a0 & 0x1f));
+            if (args[4] & 2) {
+                tcg_out32(s, 0x1e214000 | ft | (a0 & 0x1f) << 5
+                          | (a0 & 0x1f));
+            }
+        }
+        break;
+    case INDEX_op_fcvt_vec:
+        /* FCVT Sd, Dn (0x1e624000) or FCVT Dd, Sn (0x1e22c000) */
+        tcg_out32(s, (a2 ? 0x1e22c000 : 0x1e624000)
+                  | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
+
     case INDEX_op_tbl_vec:
         /*
          * Bytes 16-31 come from b by TBL on idx ^ 16 (indexes 0-15 map
@@ -2902,6 +2939,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return vece < MO_64;
     case INDEX_op_tbl_vec:
         return type == TCG_TYPE_V128 && vece == MO_8;
+    case INDEX_op_fop_vec:
+    case INDEX_op_ffma_vec:
+    case INDEX_op_fcvt_vec:
+        return type == TCG_TYPE_V64 && (vece == MO_32 || vece == MO_64);
 
     default:
         return 0;
@@ -3164,8 +3205,13 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I2(w, w, wN);
     case INDEX_op_cmp_vec:
         return C_O1_I2(w, w, wZ);
+    case INDEX_op_fop_vec:
+        return C_O1_I2(w, w, w);
+    case INDEX_op_fcvt_vec:
+        return C_O1_I1(w, w);
     case INDEX_op_bitsel_vec:
     case INDEX_op_tbl_vec:
+    case INDEX_op_ffma_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);

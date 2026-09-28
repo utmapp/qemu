@@ -2423,6 +2423,11 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_tbl_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128
             && TCG_TARGET_HAS_tbl_vec;
+    case INDEX_op_fop_vec:
+    case INDEX_op_ffma_vec:
+    case INDEX_op_fcvt_vec:
+        return type == TCG_TYPE_V64 && TCG_TARGET_HAS_v64
+            && TCG_TARGET_HAS_fp_vec;
 
     default:
         tcg_debug_assert(op > INDEX_op_last_generic && op < NB_OPS);
