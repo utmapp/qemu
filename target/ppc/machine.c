@@ -261,6 +261,9 @@ static int cpu_post_load(void *opaque, int version_id)
 
     ppc_fprf_clear(env);
     post_load_update_msr(env);
+    if (tcg_enabled()) {
+        ppc_mmu_slots_reset(env); /* the QEMU TLB starts empty */
+    }
 
     if (tcg_enabled()) {
         /* Re-set breaks based on regs */

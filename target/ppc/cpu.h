@@ -1289,6 +1289,7 @@ struct CPUArchState {
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
 #define TLB_NEED_PAGE_FLUSH    0x4
+#define TLB_NEED_SR_SWITCH     0x8 /* segment registers changed */
 /*
  * Pages named by tlbie since the last flush.  A 32-bit hash MMU guest
  * (Mac OS X) invalidates single pages constantly; turning each of those
@@ -1299,6 +1300,15 @@ struct CPUArchState {
 #define PPC_TLB_PENDING_PAGES 64
     target_ulong tlb_flush_pages[PPC_TLB_PENDING_PAGES];
     int tlb_flush_npages;
+/*
+ * The segment register sets that have their own QEMU TLB on a 32-bit hash
+ * MMU (see ppc_mmu_slot_sync), each with its last use; 0 means unused.
+ */
+#define PPC_MMU_SLOTS 4
+    target_ulong mmu_slot_sr[PPC_MMU_SLOTS][16];
+    uint64_t mmu_slot_used[PPC_MMU_SLOTS];
+    uint64_t mmu_slot_clock;
+    int mmu_slot; /* the current set's slot */
 #endif
 
     /* Other registers */
@@ -1663,6 +1673,8 @@ void store_40x_tsr(CPUPPCState *env, target_ulong val);
 void store_booke_tcr(CPUPPCState *env, target_ulong val);
 void store_booke_tsr(CPUPPCState *env, target_ulong val);
 void ppc_tlb_invalidate_all(CPUPPCState *env);
+void ppc_mmu_slot_sync(CPUPPCState *env);
+void ppc_mmu_slots_reset(CPUPPCState *env);
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr);
 void cpu_ppc_set_vhyp(PowerPCCPU *cpu, PPCVirtualHypervisor *vhyp);
 void cpu_ppc_set_1lpar(PowerPCCPU *cpu);
@@ -1721,7 +1733,10 @@ static inline int ppc_env_mmu_index(CPUPPCState *env, bool ifetch)
 #ifdef CONFIG_USER_ONLY
     return MMU_USER_IDX;
 #else
-    return (env->hflags >> (ifetch ? HFLAGS_IMMU_IDX : HFLAGS_DMMU_IDX)) & 7;
+    int idx = (env->hflags >> (ifetch ? HFLAGS_IMMU_IDX : HFLAGS_DMMU_IDX)) & 7;
+
+    /* Translated accesses use the current segment register set's TLB. */
+    return idx & 2 ? idx : idx | env->mmu_slot << 2;
 #endif
 }
 
@@ -2796,6 +2811,16 @@ void cpu_write_xer(CPUPPCState *env, target_ulong xer);
  */
 #define is_book3s_arch2x(ctx) (!!((ctx)->insns_flags & PPC_SEGMENT_64B))
 
+/* The TB's memory accesses use its segment register set's TLB. */
+static inline uint64_t ppc_tb_cs_base(CPUPPCState *env)
+{
+#ifdef CONFIG_USER_ONLY
+    return 0;
+#else
+    return env->mmu_slot;
+#endif
+}
+
 #ifdef CONFIG_DEBUG_TCG
 void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
                           uint64_t *cs_base, uint32_t *flags);
@@ -2804,7 +2829,7 @@ static inline void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
                                         uint64_t *cs_base, uint32_t *flags)
 {
     *pc = env->nip;
-    *cs_base = 0;
+    *cs_base = ppc_tb_cs_base(env);
     *flags = env->hflags;
 }
 #endif

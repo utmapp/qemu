@@ -6554,6 +6554,10 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->n_nfp = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
+    if (!(ctx->mem_idx & 2)) {
+        /* As ppc_env_mmu_index(): cs_base is the TLB slot. */
+        ctx->mem_idx |= ctx->base.tb->cs_base << 2;
+    }
     ctx->dr = (hflags >> HFLAGS_DR) & 1;
     ctx->hv = (hflags >> HFLAGS_HV) & 1;
     ctx->insns_flags = env->insns_flags;

@@ -282,12 +282,59 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
+        ppc_mmu_slots_reset(env);
         break;
     default:
         /* XXX: TODO */
         cpu_abort(env_cpu(env), "Unknown MMU model %x\n", env->mmu_model);
         break;
     }
+}
+
+/*
+ * A 32-bit hash MMU's TLB is tagged with the VSID, so reloading the segment
+ * registers keeps it, and Mac OS X reloads them on every exception entry and
+ * exit to switch between the kernel's and the user's address space.  QEMU's
+ * TLB is indexed by effective address instead, and flushing it on each of
+ * those switches made the guest walk its page table millions of times a
+ * second.  So each recently used set of segment register values gets its
+ * own pair of MMU indexes (translated, user and supervisor; see
+ * ppc_env_mmu_index) and switching sets only evicts the least recently used
+ * one.  tlbie and tlbia still flush every set.
+ *
+ * Called at the context-synchronizing event after the segment registers
+ * changed.
+ */
+void ppc_mmu_slot_sync(CPUPPCState *env)
+{
+    int i, victim = 0;
+
+    for (i = 0; i < PPC_MMU_SLOTS; i++) {
+        if (env->mmu_slot_used[i] &&
+            !memcmp(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]))) {
+            break;
+        }
+        if (env->mmu_slot_used[i] < env->mmu_slot_used[victim]) {
+            victim = i;
+        }
+    }
+    if (i == PPC_MMU_SLOTS) {
+        i = victim;
+        memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
+        tlb_flush_by_mmuidx(env_cpu(env), 3 << (4 * i));
+    }
+    env->mmu_slot_used[i] = ++env->mmu_slot_clock;
+    env->mmu_slot = i;
+}
+
+/* After the whole QEMU TLB was flushed: only the current set is cached. */
+void ppc_mmu_slots_reset(CPUPPCState *env)
+{
+    env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
+    memset(env->mmu_slot_used, 0, sizeof(env->mmu_slot_used));
+    memcpy(env->mmu_slot_sr[env->mmu_slot], env->sr,
+           sizeof(env->mmu_slot_sr[0]));
+    env->mmu_slot_used[env->mmu_slot] = ++env->mmu_slot_clock;
 }
 
 /*
@@ -358,6 +405,24 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 /* Special registers manipulation */
 
 /* Segment registers load and store */
+
+/*
+ * The per-segment-register TLB slots are opt-in (PPC_SR_SLOTS=1); by default
+ * a segment register change flushes the whole TLB, as before.  On Mac OS X
+ * 10.4 guests the slots made the Quartz Extreme desktop much slower: opening
+ * a folder took up to 7 s and Dashboard managed under 1 fps instead of ~7
+ * (measured: 4-6 vs 29-41 distinct frames in 12 s with them off).
+ */
+static bool ppc_mmu_slots_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *s = getenv("PPC_SR_SLOTS");
+        on = s && !strcmp(s, "1");
+    }
+    return on;
+}
 target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
@@ -407,7 +472,9 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
             }
         }
 #else
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush |= env->mmu_model == POWERPC_MMU_32B &&
+                               ppc_mmu_slots_on() ?
+                               TLB_NEED_SR_SWITCH : TLB_NEED_LOCAL_FLUSH;
 #endif
     }
 }
@@ -1396,6 +1463,16 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     hwaddr raddr;
     int page_size, prot;
 
+    if (cpu->env.mmu_model == POWERPC_MMU_32B && !(mmu_idx & 2) &&
+        ((cpu->env.tlb_need_flush & TLB_NEED_SR_SWITCH) ||
+         mmu_idx >> 2 != cpu->env.mmu_slot)) {
+        /*
+         * Between a segment register write and the next context
+         * synchronization, entries made from the new values would land in
+         * the old set's TLB; never reuse that one for the old set.
+         */
+        cpu->env.mmu_slot_used[mmu_idx >> 2] = 0;
+    }
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,

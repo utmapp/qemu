@@ -272,7 +272,7 @@ void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
     uint32_t hflags_rebuilt;
 
     *pc = env->nip;
-    *cs_base = 0;
+    *cs_base = ppc_tb_cs_base(env);
     *flags = hflags_current;
 
     hflags_rebuilt = hreg_compute_hflags_value(env);
@@ -384,6 +384,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         env->tlb_flush_npages = 0;
         tlb_flush_all_cpus_synced(cs);
+        ppc_mmu_slots_reset(env);
         return;
     }
 
@@ -393,16 +394,32 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         env->tlb_flush_npages = 0;
         tlb_flush(cs);
+        ppc_mmu_slots_reset(env);
         return;
     }
 
-    /* Otherwise only the pages tlbie named have to go. */
+    /*
+     * Otherwise only the pages tlbie named have to go, in every segment:
+     * tlbie ignores the segment number, and the page may also be mapped
+     * through another segment register, as Mac OS X's copyin window does,
+     * or in another set's TLB (see ppc_mmu_slot_sync).  Real-mode
+     * translations don't depend on the page table.
+     */
     if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         for (int i = 0; i < env->tlb_flush_npages; i++) {
-            tlb_flush_page(cs, env->tlb_flush_pages[i]);
+            for (uint32_t seg = 0; seg < 16; seg++) {
+                tlb_flush_page_by_mmuidx(cs, (seg << 28) |
+                                         (env->tlb_flush_pages[i] & 0x0fffffff),
+                                         0x3333);
+            }
         }
         env->tlb_flush_npages = 0;
+    }
+
+    if (env->tlb_need_flush & TLB_NEED_SR_SWITCH) {
+        env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
+        ppc_mmu_slot_sync(env);
     }
 }
 #endif /* !CONFIG_USER_ONLY */
