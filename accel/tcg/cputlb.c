@@ -606,6 +606,24 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
     tlb_flush_page_by_mmuidx_async_0(cpu, addr, idxmap);
 }
 
+void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
+                                    uint16_t idxmap)
+{
+    assert_cpu_is_self(cpu);
+    addr &= TARGET_PAGE_MASK;
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    for (vaddr i = 0; i < npages; i++) {
+        for (int mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+            if ((idxmap >> mmu_idx) & 1) {
+                tlb_flush_page_locked(cpu, mmu_idx,
+                                      addr + i * TARGET_PAGE_SIZE);
+            }
+        }
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+}
+
 void tlb_flush_page(CPUState *cpu, vaddr addr)
 {
     tlb_flush_page_by_mmuidx(cpu, addr, ALL_MMUIDX_BITS);
