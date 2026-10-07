@@ -68,6 +68,29 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     return container_of(res, struct virtio_gpu_virgl_resource, base);
 }
 
+/*
+ * A guest may reuse a resource id as soon as it has queued the UNREF, but
+ * the UNREF of a mapped blob completes only when its MemoryRegion
+ * finalizes.  Park a create of that id at the cmdq head, as a re-MAP is
+ * parked; the finalizer releases the block, completes the unref and
+ * resumes the queue.  Returns true if the create was parked.
+ */
+static bool
+virtio_gpu_virgl_create_waits_for_unref(VirtIOGPU *g,
+                                        struct virtio_gpu_virgl_resource *res,
+                                        bool *cmd_suspended)
+{
+    if (!res->unref_cmd) {
+        return false;
+    }
+    if (!res->map_blocked) {
+        res->map_blocked = true;
+        VIRTIO_GPU_BASE(g)->renderer_blocked++;
+    }
+    *cmd_suspended = true;
+    return true;
+}
+
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
 static void *
 virgl_get_egl_display(G_GNUC_UNUSED void *cookie)
@@ -384,7 +407,8 @@ void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
 }
 
 static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
-                                         struct virtio_gpu_ctrl_command *cmd)
+                                         struct virtio_gpu_ctrl_command *cmd,
+                                         bool *cmd_suspended)
 {
     struct virtio_gpu_resource_create_2d c2d;
     struct virgl_renderer_resource_create_args args;
@@ -403,6 +427,9 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
 
     res = virtio_gpu_virgl_find_resource(g, c2d.resource_id);
     if (res) {
+        if (virtio_gpu_virgl_create_waits_for_unref(g, res, cmd_suspended)) {
+            return;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c2d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -432,7 +459,8 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
 }
 
 static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
-                                         struct virtio_gpu_ctrl_command *cmd)
+                                         struct virtio_gpu_ctrl_command *cmd,
+                                         bool *cmd_suspended)
 {
     struct virtio_gpu_resource_create_3d c3d;
     struct virgl_renderer_resource_create_args args;
@@ -451,6 +479,9 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
 
     res = virtio_gpu_virgl_find_resource(g, c3d.resource_id);
     if (res) {
+        if (virtio_gpu_virgl_create_waits_for_unref(g, res, cmd_suspended)) {
+            return;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c3d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -899,7 +930,8 @@ static void virgl_cmd_get_capset(VirtIOGPU *g,
 
 #if VIRGL_VERSION_MAJOR >= 1
 static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
-                                           struct virtio_gpu_ctrl_command *cmd)
+                                           struct virtio_gpu_ctrl_command *cmd,
+                                           bool *cmd_suspended)
 {
     struct virgl_renderer_resource_create_blob_args virgl_args = { 0 };
     g_autofree struct virtio_gpu_virgl_resource *res = NULL;
@@ -923,11 +955,18 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
         return;
     }
 
-    if (virtio_gpu_virgl_find_resource(g, cblob.resource_id)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
-                      __func__, cblob.resource_id);
-        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
-        return;
+    {
+        struct virtio_gpu_virgl_resource *old =
+            virtio_gpu_virgl_find_resource(g, cblob.resource_id);
+        if (old) {
+            if (virtio_gpu_virgl_create_waits_for_unref(g, old, cmd_suspended)) {
+                return;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
+                          __func__, cblob.resource_id);
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+            return;
+        }
     }
 
     res = g_new0(struct virtio_gpu_virgl_resource, 1);
@@ -1228,10 +1267,10 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         virgl_cmd_context_destroy(g, cmd);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
-        virgl_cmd_create_resource_2d(g, cmd);
+        virgl_cmd_create_resource_2d(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
-        virgl_cmd_create_resource_3d(g, cmd);
+        virgl_cmd_create_resource_3d(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_SUBMIT_3D:
         virgl_cmd_submit_3d(g, cmd);
@@ -1282,7 +1321,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         break;
 #if VIRGL_VERSION_MAJOR >= 1
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
-        virgl_cmd_resource_create_blob(g, cmd);
+        virgl_cmd_resource_create_blob(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
         virgl_cmd_resource_map_blob(g, cmd, &cmd_suspended);
