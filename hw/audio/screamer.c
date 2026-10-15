@@ -223,27 +223,60 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
 
 }
 
+/*
+ * There is no capture source: RX DMA receives silence. Like real hardware,
+ * an INPUT descriptor completes only after its frames have been sampled,
+ * i.e. after len / frame size / rate seconds.
+ */
+static void screamer_rx_timer_cb(void *opaque)
+{
+    ScreamerState *s = opaque;
+    DBDMA_io *io = &s->rx_io;
+
+    if (!io->len) {
+        return;
+    }
+
+    if (dma_memory_set(&address_space_memory, io->addr, 0, io->len,
+                       MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "screamer: RX DMA write failed at 0x%" HWADDR_PRIx
+                      "\n", io->addr);
+    }
+    io->addr += io->len;
+    io->len = 0;
+    io->dma_end(io);
+}
+
 static void pmac_screamer_rx(DBDMA_io *io)
 {
+    ScreamerState *s = io->opaque;
+    uint64_t frames = io->len >> s->shift;
+
     SCREAMER_DPRINTF("DMA RX transfer: addr %" HWADDR_PRIx
                      " len: %x\n", io->addr, io->len);
 
-    //ScreamerState *s = io->opaque;
-    DBDMA_channel *ch = io->channel;
-        
-    /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
-    ch->regs[DBDMA_STATUS] &= ~RUN;
-
-    io->dma_end(io);
+    memcpy(&s->rx_io, io, sizeof(DBDMA_io));
+    timer_mod(s->rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                           muldiv64(frames, NANOSECONDS_PER_SECOND, s->rate));
 }
 
 static void pmac_screamer_rx_flush(DBDMA_io *io)
 {
+    ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
 
     SCREAMER_DPRINTF("DMA RX flush!\n");
+
+    /* The guest is stopping the channel: abandon the pending transfer */
+    if (((ch->regs[DBDMA_CONTROL] >> 16) & RUN) &&
+        !(ch->regs[DBDMA_CONTROL] & RUN)) {
+        s->rx_io.len = 0;
+        timer_del(s->rx_timer);
+        ch->io.processing = false;
+    }
 #if 1
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
     if (cmd == INPUT_MORE || cmd == INPUT_LAST) {
@@ -334,6 +367,8 @@ static void screamer_reset(DeviceState *dev)
     s->ppos = 0;
 
     timer_del(s->tx_timer);
+    timer_del(s->rx_timer);
+    memset(&s->rx_io, 0, sizeof(DBDMA_io));
     s->tx_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->tx_credit = 0;
     s->wpos = 0;
@@ -355,6 +390,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     s->samples = SCREAMER_BUFFER_SIZE >> s->shift;
     s->mixbuf = g_malloc0(SCREAMER_BUFFER_SIZE);
     s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, screamer_tx_timer_cb, s);
+    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, screamer_rx_timer_cb, s);
 
     s->rate = 44100;
     screamer_update_settings(s);
