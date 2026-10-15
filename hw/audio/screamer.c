@@ -188,8 +188,12 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
         current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
         current->res_count = cpu_to_le16(io->len);
 
-        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                         &ch->current, sizeof(dbdma_cmd),
+        dma_memory_write(&address_space_memory,
+                         ch->regs[DBDMA_CMDPTR_LO] +
+                         offsetof(dbdma_cmd, res_count),
+                         &current->res_count,
+                         sizeof(current->res_count) +
+                         sizeof(current->xfer_status),
                          MEMTXATTRS_UNSPECIFIED);
     }
 #endif
@@ -208,8 +212,12 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
         current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
         current->res_count = cpu_to_le16(io->len);
 
-            dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                         &ch->current, sizeof(dbdma_cmd),
+            dma_memory_write(&address_space_memory,
+                         ch->regs[DBDMA_CMDPTR_LO] +
+                         offsetof(dbdma_cmd, res_count),
+                         &current->res_count,
+                         sizeof(current->res_count) +
+                         sizeof(current->xfer_status),
                          MEMTXATTRS_UNSPECIFIED);
     }
 
@@ -242,8 +250,12 @@ static void pmac_screamer_rx_flush(DBDMA_io *io)
         current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
         current->res_count = cpu_to_le16(io->len);
 
-        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                         &ch->current, sizeof(dbdma_cmd),
+        dma_memory_write(&address_space_memory,
+                         ch->regs[DBDMA_CMDPTR_LO] +
+                         offsetof(dbdma_cmd, res_count),
+                         &current->res_count,
+                         sizeof(current->res_count) +
+                         sizeof(current->xfer_status),
                          MEMTXATTRS_UNSPECIFIED);
     }
 #endif

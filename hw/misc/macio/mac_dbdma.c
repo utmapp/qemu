@@ -103,8 +103,18 @@ static void dbdma_cmdptr_save(DBDMA_channel *ch)
                     ch->regs[DBDMA_CMDPTR_LO],
                     le16_to_cpu(ch->current.xfer_status),
                     le16_to_cpu(ch->current.res_count));
-    dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                     &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
+    /*
+     * Like the real controller, only write back res_count and xfer_status:
+     * the guest may have rewritten the rest of the descriptor since we
+     * loaded it, and restoring our stale copy would undo that.
+     */
+    dma_memory_write(&address_space_memory,
+                     ch->regs[DBDMA_CMDPTR_LO] +
+                     offsetof(dbdma_cmd, res_count),
+                     &ch->current.res_count,
+                     sizeof(ch->current.res_count) +
+                     sizeof(ch->current.xfer_status),
+                     MEMTXATTRS_UNSPECIFIED);
 }
 
 static void kill_channel(DBDMA_channel *ch)
