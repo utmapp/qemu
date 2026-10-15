@@ -65,6 +65,9 @@ struct ScreamerState {
     uint32_t rate;
     DBDMA_io io;
 
+    QEMUTimer *rx_timer;    /* completes RX DMA at the sample rate */
+    DBDMA_io rx_io;
+
     uint32_t regs[6];
     uint32_t codec_ctrl_regs[8];
 };

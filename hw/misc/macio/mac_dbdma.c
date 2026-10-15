@@ -384,6 +384,12 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
     dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
 
+    /* The loaded data goes to the cmdDep field of the command in memory */
+    dma_memory_write(&address_space_memory,
+                     ch->regs[DBDMA_CMDPTR_LO] + offsetof(dbdma_cmd, cmd_dep),
+                     &current->cmd_dep, sizeof(current->cmd_dep),
+                     MEMTXATTRS_UNSPECIFIED);
+
     if (conditional_wait(ch))
         goto wait;
 
@@ -611,6 +617,12 @@ static void dbdma_control_write(DBDMA_channel *ch)
      * We handle ACTIVE separately at the end of the
      * logic to ensure all cases are covered.
      */
+
+    /* The device status bits s0-s7 can be set and cleared by SW (or by
+     * the device); they are tested by the interrupt, branch and wait
+     * conditions of the channel program.
+     */
+    status = (status & ~(mask & DEVSTAT)) | (value & mask & DEVSTAT);
 
     /* Setting RUN will tentatively activate the channel
      */
