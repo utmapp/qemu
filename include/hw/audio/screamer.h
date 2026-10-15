@@ -48,12 +48,17 @@ struct ScreamerState {
 
     QEMUSoundCard card;
     SWVoiceOut *voice;
-    uint8_t *mixbuf;
-    int samples;
+    uint8_t *mixbuf;        /* ring of TX frames waiting for the host */
+    int samples;            /* ring size in frames */
     int shift;
 
-    uint32_t wpos;
-    uint32_t rpos;
+    uint32_t wpos;          /* ring write index (frames) */
+    uint32_t rpos;          /* ring read index (frames) */
+    uint32_t fill;          /* frames in the ring */
+
+    QEMUTimer *tx_timer;    /* paces TX DMA at the sample rate */
+    int64_t tx_last_ns;
+    uint32_t tx_credit;     /* frames TX DMA may consume now */
 
     uint32_t bpos;
     uint32_t ppos;

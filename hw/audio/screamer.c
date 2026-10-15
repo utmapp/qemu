@@ -64,26 +64,101 @@
 /* Audio */
 static const char *s_spk = "screamer";
 
+/*
+ * The real chip pulls TX samples from DBDMA at the codec sample rate through
+ * a small FIFO, so OUTPUT descriptors complete in real time. Emulate that:
+ * TX DMA may consume s->rate frames per second of virtual time, plus up to
+ * SCREAMER_FIFO_FRAMES of lead. Without this a guest ring that fits in our
+ * buffer completes (and raises its interrupts) almost instantly, which is
+ * what the Mac OS 9 driver does with VM off (>= 1 GB RAM): one 4 KiB page.
+ */
+#define SCREAMER_FIFO_FRAMES 128
+#define SCREAMER_TX_TICK_NS  (1 * SCALE_MS)
+
+static void screamer_tx_credit_update(ScreamerState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t frames;
+
+    if (now <= s->tx_last_ns) {
+        return;
+    }
+    frames = muldiv64(now - s->tx_last_ns, s->rate, NANOSECONDS_PER_SECOND);
+    s->tx_last_ns += muldiv64(frames, NANOSECONDS_PER_SECOND, s->rate);
+    s->tx_credit = MIN(s->tx_credit + frames, SCREAMER_FIFO_FRAMES);
+}
+
+/* Copy guest frames into the ring; drop the oldest if the host lags */
+static void screamer_ring_write(ScreamerState *s, hwaddr addr, uint32_t frames)
+{
+    while (frames) {
+        uint32_t n = MIN(frames, s->samples - s->wpos);
+        MemTxResult res;
+
+        res = dma_memory_read(&address_space_memory, addr,
+                              &s->mixbuf[s->wpos << s->shift], n << s->shift,
+                              MEMTXATTRS_UNSPECIFIED);
+        if (res != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "screamer: TX DMA read failed at 0x%" HWADDR_PRIx
+                          "\n", addr);
+        }
+        s->wpos = (s->wpos + n) % s->samples;
+        s->fill += n;
+        addr += n << s->shift;
+        frames -= n;
+    }
+
+    if (s->fill > s->samples) {
+        SCREAMER_DPRINTF("TX ring overrun, dropped %d frames\n",
+                         s->fill - s->samples);
+        s->rpos = s->wpos;
+        s->fill = s->samples;
+    }
+}
+
 static void pmac_screamer_tx_transfer(ScreamerState *s)
 {
     DBDMA_io *io = &s->io;
-    int samples;
+    uint32_t frames;
 
-    samples = MIN(io->len >> s->shift, s->samples - s->wpos);
-    dma_memory_read(&address_space_memory, io->addr,
-                    &s->mixbuf[s->wpos << s->shift], samples << s->shift,
-                    MEMTXATTRS_UNSPECIFIED);
+    screamer_tx_credit_update(s);
+    frames = MIN(io->len >> s->shift, s->tx_credit);
 
-    SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
+    if (frames) {
+        screamer_ring_write(s, io->addr, frames);
+        io->addr += frames << s->shift;
+        io->len -= frames << s->shift;
+        s->tx_credit -= frames;
 
-    io->addr += (samples << s->shift);
-    io->len -= (samples << s->shift);
-    s->wpos += samples;
+        /* The frame counter counts frames sent to the codec */
+        s->regs[FRAME_CNT_REG] += frames;
+        SCREAMER_DPRINTF("DMA actually transferred 0x%x\n",
+                         frames << s->shift);
+    }
+
+    /* A trailing partial frame can never be consumed; drop it */
+    if (io->len < (1 << s->shift)) {
+        io->len = 0;
+    }
 
     /* Continue DBDMA if we have completed the transfer, otherwise defer */
     if (io->len == 0) {
         SCREAMER_DPRINTF("-> End of transfer\n");
         io->dma_end(io);
+    } else if (!timer_pending(s->tx_timer)) {
+        timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                               SCREAMER_TX_TICK_NS);
+    }
+}
+
+static void screamer_tx_timer_cb(void *opaque)
+{
+    ScreamerState *s = opaque;
+
+    if (s->io.len) {
+        SCREAMER_DPRINTF("Continue deferred transfer\n");
+        pmac_screamer_tx_transfer(s);
     }
 }
 
@@ -95,15 +170,12 @@ static void pmac_screamer_tx(DBDMA_io *io)
                      " len: %x\n", io->addr, io->len);
 
     memcpy(&s->io, io, sizeof(DBDMA_io));
-    //if (s->wpos + (s->io.len >> s->shift) > s->samples) {
-    //    return;
-    //}
-
     pmac_screamer_tx_transfer(s);
 }
 
 static void pmac_screamer_tx_flush(DBDMA_io *io)
 {
+    ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
@@ -123,6 +195,13 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
 #endif
 
     ch->io.processing = false;
+
+    /* The guest is stopping the channel: abandon any deferred transfer */
+    if (((ch->regs[DBDMA_CONTROL] >> 16) & RUN) &&
+        !(ch->regs[DBDMA_CONTROL] & RUN)) {
+        s->io.len = 0;
+        timer_del(s->tx_timer);
+    }
 
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
     if (cmd == INPUT_MORE || cmd == INPUT_LAST) {
@@ -182,51 +261,22 @@ void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, i
 static void screamerspk_callback(void *opaque, int free_b)
 {
     ScreamerState *s = opaque;
-    DBDMA_io *io = &s->io;
-    int samples, generated;
 
-    if (free_b == 0) {
-        return;
-    }
+    while (s->fill && free_b >= (1 << s->shift)) {
+        uint32_t n = MIN(MIN(free_b >> s->shift, s->fill),
+                         s->samples - s->rpos);
+        size_t written;
 
-    if (s->wpos - s->rpos == 0) {
-        return;
-    }
-
-    samples = MIN(s->samples, free_b >> s->shift);
-    generated = MIN(samples, s->wpos - s->rpos);
-
-    AUD_write(s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
-              generated << s->shift);
-
-    SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
-    
-    s->regs[FRAME_CNT_REG] += generated;
-    s->rpos += generated;
-    if (s->rpos < s->wpos) {
-        return;
-    }
-
-    s->wpos = 0;
-    s->rpos = 0;
-
-    if (io->len) {
-        DBDMA_channel *ch = io->channel;
-        uint32_t status = ch->regs[DBDMA_STATUS];
-
-        SCREAMER_DPRINTF("Continue deferred transfer\n");
-
-        /* Disable channel so we only complete the current transfer */
-        ch->regs[DBDMA_STATUS] &= ~RUN;
-
-        /* Perform deferred transfer */
-        pmac_screamer_tx_transfer(s);
-
-        /* Re-enable channel */
-        ch->regs[DBDMA_STATUS] = status;
-
-        /* Kick channel to continue */
-        DBDMA_kick(container_of(ch, DBDMAState, channels[ch->channel]));
+        written = AUD_write(s->voice, &s->mixbuf[s->rpos << s->shift],
+                            n << s->shift) >> s->shift;
+        SCREAMER_DPRINTF("  - generated %zu, fill %d, rpos %d\n", written,
+                         s->fill, s->rpos);
+        if (!written) {
+            break;
+        }
+        s->rpos = (s->rpos + written) % s->samples;
+        s->fill -= written;
+        free_b -= written << s->shift;
     }
 }
 
@@ -240,10 +290,6 @@ static void screamer_update_settings(ScreamerState *s)
         AUD_log(s_spk, "Could not open voice\n");
         return;
     }
-
-    s->shift = 2;
-    s->samples = AUD_get_buffer_size_out(s->voice) >> s->shift;
-    s->mixbuf = g_malloc0(s->samples << s->shift);
 
     AUD_set_active_out(s->voice, true);
 }
@@ -275,6 +321,13 @@ static void screamer_reset(DeviceState *dev)
     s->bpos = 0;
     s->ppos = 0;
 
+    timer_del(s->tx_timer);
+    s->tx_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->tx_credit = 0;
+    s->wpos = 0;
+    s->rpos = 0;
+    s->fill = 0;
+
     return;
 }
 
@@ -285,6 +338,11 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     if (!AUD_register_card(s_spk, &s->card, errp)) {
         return;
     }
+
+    s->shift = 2;
+    s->samples = SCREAMER_BUFFER_SIZE >> s->shift;
+    s->mixbuf = g_malloc0(SCREAMER_BUFFER_SIZE);
+    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, screamer_tx_timer_cb, s);
 
     s->rate = 44100;
     screamer_update_settings(s);
