@@ -176,6 +176,14 @@ struct VirtIOGPUBase {
     int enable;
 
     MemoryRegion hostmem;
+    /*
+     * Lowest-priority RAM behind the blob subregions, enabled from a
+     * guest-initiated reset until the next machine reset (see
+     * virtio_gpu_hostmem_scratch_update()).
+     */
+    MemoryRegion hostmem_scratch;
+    bool hostmem_scratch_init;
+    bool hostmem_scratch_mapped;
 
     struct virtio_gpu_scanout scanout[VIRTIO_GPU_MAX_SCANOUTS];
 

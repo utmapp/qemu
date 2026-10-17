@@ -27,6 +27,7 @@ vmware_verify_rect_surface_bound_exceeded(const char *name, const char *componen
 vmware_update_rect_delayed_flush(void) "display update FIFO full - forcing flush"
 
 # virtio-gpu-base.c
+virtio_gpu_hostmem_scratch(bool mapped) "mapped=%d"
 virtio_gpu_features(bool virgl) "virgl %d"
 
 # virtio-gpu-3d.c
