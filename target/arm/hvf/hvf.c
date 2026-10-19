@@ -1498,6 +1498,54 @@ void hvf_arm_gic_save_cpu_state(GICv3State *s)
     }
 }
 
+/*
+ * hv_gic_reset() resets the distributor and the redistributors only; the
+ * CPU interfaces keep whatever the guest left in them.  A vCPU that was
+ * reset while it was handling an interrupt (for instance a CPU parked in
+ * an IPI handler while another one requests the system reset) comes back
+ * with that priority still active in ICC_AP1R0_EL1, and from then on
+ * takes no interrupt of equal or lower priority.  So record each CPU
+ * interface as Hypervisor.framework created it, when the vCPU is set up,
+ * and put that back on every reset.
+ */
+static void hvf_arm_gic_save_icc_reset(CPUState *cpu)
+{
+    GICv3CPUState tmp;
+    hv_gic_icc_reg_t reg;
+
+    if (__builtin_available(macOS 15.0, *)) {
+        for (unsigned i = 0; hvf_arm_gic_icc_field(&tmp, i, &reg); i++) {
+            assert(i < ARRAY_SIZE(cpu->accel->gic_icc_reset));
+            assert_hvf_ok(hv_gic_get_icc_reg(cpu->accel->fd, reg,
+                                             &cpu->accel->gic_icc_reset[i]));
+        }
+        cpu->accel->gic_icc_reset_saved = true;
+    }
+}
+
+static void hvf_arm_gic_reset_icc(CPUState *cpu, run_on_cpu_data arg)
+{
+    GICv3CPUState tmp;
+    hv_gic_icc_reg_t reg;
+
+    if (!cpu->accel->gic_icc_reset_saved) {
+        return;
+    }
+    if (__builtin_available(macOS 15.0, *)) {
+        for (unsigned i = 0; hvf_arm_gic_icc_field(&tmp, i, &reg); i++) {
+            assert_hvf_ok(hv_gic_set_icc_reg(cpu->accel->fd, reg,
+                                             cpu->accel->gic_icc_reset[i]));
+        }
+    }
+}
+
+void hvf_arm_gic_reset_cpu_state(GICv3State *s)
+{
+    for (unsigned i = 0; i < s->num_cpu; i++) {
+        run_on_cpu(s->cpu[i].cpu, hvf_arm_gic_reset_icc, RUN_ON_CPU_NULL);
+    }
+}
+
 int hvf_arm_gic_save_state(GICv3State *s, Error **errp)
 {
     if (__builtin_available(macOS 15.0, *)) {
@@ -1593,6 +1641,10 @@ void hvf_arm_gic_reset(void)
 }
 
 void hvf_arm_gic_save_cpu_state(GICv3State *s)
+{
+}
+
+void hvf_arm_gic_reset_cpu_state(GICv3State *s)
 {
 }
 
@@ -1701,6 +1753,12 @@ int hvf_arch_init_vcpu(CPUState *cpu)
         ret = hvf_vcpu_set_actlr(cpu->accel->fd, actlr);
         assert_hvf_ok(ret);
     }
+
+#if TARGET_OS_OSX
+    if (hvf_irqchip_in_kernel()) {
+        hvf_arm_gic_save_icc_reset(cpu);
+    }
+#endif
 
     return 0;
 }

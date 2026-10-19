@@ -88,6 +88,9 @@ struct AccelCPUState {
     /* PPIs to pend/unpend in this vCPU's in-kernel redistributor (owning thread only) */
     uint32_t gic_ppi_set;
     uint32_t gic_ppi_clear;
+    /* the in-kernel CPU interface as created, put back on a system reset */
+    bool gic_icc_reset_saved;
+    uint64_t gic_icc_reset[16];
 };
 
 void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,

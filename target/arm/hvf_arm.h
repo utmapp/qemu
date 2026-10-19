@@ -48,6 +48,7 @@ void hvf_arm_gic_reset(void);
  * All three require every vCPU to be stopped.
  */
 void hvf_arm_gic_save_cpu_state(GICv3State *s);
+void hvf_arm_gic_reset_cpu_state(GICv3State *s);
 int hvf_arm_gic_save_state(GICv3State *s, Error **errp);
 int hvf_arm_gic_load_state(GICv3State *s, Error **errp);
 
@@ -74,6 +75,10 @@ static inline void hvf_arm_gic_set_ppi(CPUState *cpu, uint32_t intid,
 }
 
 static inline void hvf_arm_gic_reset(void)
+{
+}
+
+static inline void hvf_arm_gic_reset_cpu_state(GICv3State *s)
 {
 }
 
