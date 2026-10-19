@@ -113,6 +113,7 @@ static void hvf_arm_gicv3_reset_hold(Object *obj, ResetType type)
         hgc->parent_phases.hold(obj, type);
     }
     hvf_arm_gic_reset();
+    hvf_arm_gic_reset_cpu_state(s);
 }
 
 static void hvf_arm_gicv3_class_init(ObjectClass *klass, void *data)
