@@ -1568,8 +1568,8 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
 
     if (ssd->guest_dmabuf_refresh) {
         QemuDmaBuf *dmabuf = ssd->guest_dmabuf;
-        width = qemu_dmabuf_get_width(dmabuf);
-        height = qemu_dmabuf_get_height(dmabuf);
+        int width = qemu_dmabuf_get_width(dmabuf);
+        int height = qemu_dmabuf_get_height(dmabuf);
 
         if (render_cursor) {
             egl_dmabuf_import_texture(dmabuf);
@@ -1620,7 +1620,7 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
         egl_texture_blit(ssd->gls, &ssd->blit_fb, &ssd->guest_fb,
                          !y_0_top);
         egl_texture_blend(ssd->gls, &ssd->blit_fb, &ssd->cursor_fb,
-                          !y_0_top, false, ptr_x, ptr_y, 1.0, 1.0);
+                          !y_0_top, ptr_x, ptr_y, 1.0, 1.0);
         glFlush();
     }
 #elif defined(CONFIG_IOSURFACE)
