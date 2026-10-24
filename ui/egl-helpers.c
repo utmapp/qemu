@@ -426,7 +426,8 @@ EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win)
                                       qemu_egl_config,
                                       win, NULL);
     if (esurface == EGL_NO_SURFACE) {
-        error_report("egl: eglCreateWindowSurface failed");
+        error_report("egl: eglCreateWindowSurface failed: %s",
+                     qemu_egl_get_error_string());
         return NULL;
     }
 
