@@ -18,6 +18,7 @@ struct QemuDmaBuf {
     uint32_t  fourcc;
     uint64_t  modifier;
     uint32_t  texture;
+    bool      external_texture;
     uint32_t  x;
     uint32_t  y;
     uint32_t  backing_width;
@@ -202,6 +203,16 @@ void qemu_dmabuf_set_texture(QemuDmaBuf *dmabuf, uint32_t texture)
 {
     assert(dmabuf != NULL);
     dmabuf->texture = texture;
+}
+
+bool qemu_dmabuf_get_external_texture(QemuDmaBuf *dmabuf)
+{
+    return dmabuf->external_texture;
+}
+
+void qemu_dmabuf_set_external_texture(QemuDmaBuf *dmabuf, bool external)
+{
+    dmabuf->external_texture = external;
 }
 
 void qemu_dmabuf_set_fence_fd(QemuDmaBuf *dmabuf, int32_t fence_fd)

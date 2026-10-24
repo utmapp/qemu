@@ -35,6 +35,7 @@ struct QemuGLShader {
     GLint texture_blit_prog;
     GLint texture_blit_flip_prog;
     GLint texture_blit_vao;
+    GLuint texture_external_prog[2];
 };
 
 /* ---------------------------------------------------------------------- */
@@ -175,6 +176,31 @@ QemuGLShader *qemu_gl_init_shader(void)
     return gls;
 }
 
+bool qemu_gl_run_texture_blit_external(QemuGLShader *gls, bool flip)
+{
+    if (!gls->texture_external_prog[flip]) {
+        static const char frag[] =
+            "#version 300 es\n"
+            "#extension GL_OES_EGL_image_external_essl3 : require\n"
+            "precision mediump float;\n"
+            "uniform samplerExternalOES image;\n"
+            "in mediump vec2 ex_tex_coord;\n"
+            "out mediump vec4 out_frag_color;\n"
+            "void main() { out_frag_color = texture(image, ex_tex_coord); }\n";
+        g_autofree char *vert = g_strconcat("#version 300 es\n",
+            flip ? texture_blit_flip_vert_src : texture_blit_vert_src, NULL);
+        gls->texture_external_prog[flip] =
+            qemu_gl_create_compile_link_program(vert, frag);
+        if (!gls->texture_external_prog[flip]) {
+            return false;
+        }
+    }
+    glUseProgram(gls->texture_external_prog[flip]);
+    glBindVertexArray(gls->texture_blit_vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    return true;
+}
+
 void qemu_gl_fini_shader(QemuGLShader *gls)
 {
     if (!gls) {
@@ -182,6 +208,8 @@ void qemu_gl_fini_shader(QemuGLShader *gls)
     }
     glDeleteProgram(gls->texture_blit_prog);
     glDeleteProgram(gls->texture_blit_flip_prog);
+    glDeleteProgram(gls->texture_external_prog[0]);
+    glDeleteProgram(gls->texture_external_prog[1]);
     glDeleteProgram(gls->texture_blit_vao);
     g_free(gls);
 }

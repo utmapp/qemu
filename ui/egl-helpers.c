@@ -23,6 +23,9 @@
 #include "system/system.h"
 #include "qapi/error.h"
 #include "trace.h"
+#ifdef CONFIG_GBM
+#include <drm_fourcc.h>
+#endif
 
 EGLDisplay *qemu_egl_display;
 EGLConfig qemu_egl_config;
@@ -83,7 +86,7 @@ static void egl_fb_delete_texture(egl_fb *fb)
 
 void egl_fb_destroy(egl_fb *fb)
 {
-    if (!fb->framebuffer) {
+    if (!fb->framebuffer && !fb->texture) {
         return;
     }
 
@@ -202,9 +205,12 @@ void egl_texture_blit(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip)
 {
     glBindFramebuffer(GL_FRAMEBUFFER_EXT, dst->framebuffer);
     glViewport(0, 0, dst->width, dst->height);
-    glEnable(GL_TEXTURE_2D);
     glBindTexture(src->texture_target, src->texture);
-    qemu_gl_run_texture_blit(gls, flip);
+    if (src->texture_target == GL_TEXTURE_EXTERNAL_OES) {
+        qemu_gl_run_texture_blit_external(gls, flip);
+    } else {
+        qemu_gl_run_texture_blit(gls, flip);
+    }
 }
 
 void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
@@ -218,11 +224,14 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
     } else {
         glViewport(x, dst->height - h - y, w, h);
     }
-    glEnable(GL_TEXTURE_2D);
     glBindTexture(src->texture_target, src->texture);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    qemu_gl_run_texture_blit(gls, flip);
+    if (src->texture_target == GL_TEXTURE_EXTERNAL_OES) {
+        qemu_gl_run_texture_blit_external(gls, flip);
+    } else {
+        qemu_gl_run_texture_blit(gls, flip);
+    }
     glDisable(GL_BLEND);
 }
 
@@ -315,16 +324,52 @@ int egl_get_fd_for_texture(uint32_t tex_id, EGLint *stride, EGLint *fourcc,
     return fd;
 }
 
-void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
+static void egl_dmabuf_import_texture_target(QemuDmaBuf *dmabuf,
+                                            bool allow_external)
 {
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
     EGLint attrs[64];
     int i = 0;
     uint64_t modifier;
     uint32_t texture = qemu_dmabuf_get_texture(dmabuf);
+    GLenum target = GL_TEXTURE_2D;
 
     if (texture != 0) {
         return;
+    }
+
+    /*
+     * A linear dma-buf may be sampleable only through samplerExternalOES.
+     * In particular, NVIDIA cannot bind its linear Vulkan exports as 2D
+     * textures or framebuffer attachments.
+     */
+    if (epoxy_has_egl_extension(qemu_egl_display,
+                                "EGL_EXT_image_dma_buf_import_modifiers")) {
+        EGLint count = 0;
+        if (eglQueryDmaBufModifiersEXT(qemu_egl_display,
+                                      qemu_dmabuf_get_fourcc(dmabuf),
+                                      0, NULL, NULL, &count) && count) {
+            g_autofree EGLuint64KHR *mods = g_new(EGLuint64KHR, count);
+            g_autofree EGLBoolean *external = g_new(EGLBoolean, count);
+            if (eglQueryDmaBufModifiersEXT(qemu_egl_display,
+                                          qemu_dmabuf_get_fourcc(dmabuf),
+                                          count, mods, external, &count)) {
+                for (int n = 0; n < count; n++) {
+                    if (mods[n] == qemu_dmabuf_get_modifier(dmabuf) &&
+                        external[n]) {
+                        if (!allow_external || epoxy_is_desktop_gl() ||
+                            !epoxy_has_gl_extension(
+                                "GL_OES_EGL_image_external_essl3")) {
+                            error_report("egl: dma-buf requires GLES "
+                                         "external-texture sampling");
+                            return;
+                        }
+                        target = GL_TEXTURE_EXTERNAL_OES;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     attrs[i++] = EGL_WIDTH;
@@ -342,7 +387,9 @@ void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
     attrs[i++] = 0;
 #ifdef EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT
     modifier = qemu_dmabuf_get_modifier(dmabuf);
-    if (modifier) {
+    if (modifier != DRM_FORMAT_MOD_INVALID &&
+        epoxy_has_egl_extension(qemu_egl_display,
+                                "EGL_EXT_image_dma_buf_import_modifiers")) {
         attrs[i++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
         attrs[i++] = (modifier >>  0) & 0xffffffff;
         attrs[i++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
@@ -361,13 +408,35 @@ void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
     }
 
     glGenTextures(1, &texture);
-    qemu_dmabuf_set_texture(dmabuf, texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    glBindTexture(target, texture);
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    while (glGetError() != GL_NO_ERROR) {
+        /* Discard earlier errors before checking this image binding. */
+    }
+    glEGLImageTargetTexture2DOES(target, (GLeglImageOES)image);
+    GLenum gl_error = glGetError();
+    if (gl_error != GL_NO_ERROR) {
+        error_report("egl: dma-buf texture binding failed: 0x%x", gl_error);
+        glDeleteTextures(1, &texture);
+    } else {
+        qemu_dmabuf_set_texture(dmabuf, texture);
+        qemu_dmabuf_set_external_texture(dmabuf,
+                                        target == GL_TEXTURE_EXTERNAL_OES);
+    }
     eglDestroyImageKHR(qemu_egl_display, image);
+}
+
+void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
+{
+    egl_dmabuf_import_texture_target(dmabuf, false);
+}
+
+void egl_dmabuf_import_texture_external(QemuDmaBuf *dmabuf)
+{
+    egl_dmabuf_import_texture_target(dmabuf, true);
 }
 
 void egl_dmabuf_release_texture(QemuDmaBuf *dmabuf)

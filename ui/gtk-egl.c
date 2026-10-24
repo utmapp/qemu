@@ -281,7 +281,7 @@ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
     eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
                    vc->gfx.esurface, vc->gfx.ectx);
 
-    egl_dmabuf_import_texture(dmabuf);
+    egl_dmabuf_import_texture_external(dmabuf);
     texture = qemu_dmabuf_get_texture(dmabuf);
     if (!texture) {
         return;
@@ -295,8 +295,23 @@ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
     backing_height = qemu_dmabuf_get_backing_height(dmabuf);
     y0_top = qemu_dmabuf_get_y0_top(dmabuf);
 
-    gd_egl_scanout_texture(dcl, texture, y0_top, backing_width, backing_height,
-                           x, y, width, height, NO_NATIVE_TEXTURE);
+    if (qemu_dmabuf_get_external_texture(dmabuf)) {
+        gtk_egl_set_scanout_mode(vc, true);
+        egl_fb_destroy(&vc->gfx.guest_fb);
+        vc->gfx.guest_fb.texture = texture;
+        vc->gfx.guest_fb.texture_target = GL_TEXTURE_EXTERNAL_OES;
+        vc->gfx.guest_fb.width = backing_width;
+        vc->gfx.guest_fb.height = backing_height;
+        vc->gfx.x = x;
+        vc->gfx.y = y;
+        vc->gfx.w = width;
+        vc->gfx.h = height;
+        vc->gfx.y0_top = y0_top;
+    } else {
+        gd_egl_scanout_texture(dcl, texture, y0_top,
+                              backing_width, backing_height,
+                              x, y, width, height, NO_NATIVE_TEXTURE);
+    }
 
     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
         vc->gfx.guest_fb.dmabuf = dmabuf;
@@ -313,7 +328,7 @@ void gd_egl_cursor_dmabuf(DisplayChangeListener *dcl,
     uint32_t backing_width, backing_height, texture;
 
     if (dmabuf) {
-        egl_dmabuf_import_texture(dmabuf);
+        egl_dmabuf_import_texture_external(dmabuf);
         texture = qemu_dmabuf_get_texture(dmabuf);
         if (!texture) {
             return;
@@ -321,8 +336,16 @@ void gd_egl_cursor_dmabuf(DisplayChangeListener *dcl,
 
         backing_width = qemu_dmabuf_get_backing_width(dmabuf);
         backing_height = qemu_dmabuf_get_backing_height(dmabuf);
-        egl_fb_setup_for_tex(&vc->gfx.cursor_fb, backing_width, backing_height,
-                             texture, false);
+        if (qemu_dmabuf_get_external_texture(dmabuf)) {
+            egl_fb_destroy(&vc->gfx.cursor_fb);
+            vc->gfx.cursor_fb.texture = texture;
+            vc->gfx.cursor_fb.texture_target = GL_TEXTURE_EXTERNAL_OES;
+            vc->gfx.cursor_fb.width = backing_width;
+            vc->gfx.cursor_fb.height = backing_height;
+        } else {
+            egl_fb_setup_for_tex(&vc->gfx.cursor_fb,
+                                 backing_width, backing_height, texture, false);
+        }
     } else {
         egl_fb_destroy(&vc->gfx.cursor_fb);
     }
@@ -348,7 +371,8 @@ void gd_egl_scanout_flush(DisplayChangeListener *dcl,
     if (!vc->gfx.scanout_mode) {
         return;
     }
-    if (!vc->gfx.guest_fb.framebuffer) {
+    if (!vc->gfx.guest_fb.framebuffer &&
+        vc->gfx.guest_fb.texture_target != GL_TEXTURE_EXTERNAL_OES) {
         return;
     }
 
@@ -360,13 +384,16 @@ void gd_egl_scanout_flush(DisplayChangeListener *dcl,
     ww = gdk_window_get_width(window) * ws;
     wh = gdk_window_get_height(window) * ws;
     egl_fb_setup_default(&vc->gfx.win_fb, ww, wh);
-    if (vc->gfx.cursor_fb.texture) {
+    if (vc->gfx.cursor_fb.texture ||
+        vc->gfx.guest_fb.texture_target == GL_TEXTURE_EXTERNAL_OES) {
         egl_texture_blit(vc->gfx.gls, &vc->gfx.win_fb, &vc->gfx.guest_fb,
                          vc->gfx.y0_top);
-        egl_texture_blend(vc->gfx.gls, &vc->gfx.win_fb, &vc->gfx.cursor_fb,
-                          vc->gfx.y0_top,
-                          vc->gfx.cursor_x, vc->gfx.cursor_y,
-                          vc->gfx.scale_x, vc->gfx.scale_y);
+        if (vc->gfx.cursor_fb.texture) {
+            egl_texture_blend(vc->gfx.gls, &vc->gfx.win_fb, &vc->gfx.cursor_fb,
+                              vc->gfx.y0_top,
+                              vc->gfx.cursor_x, vc->gfx.cursor_y,
+                              vc->gfx.scale_x, vc->gfx.scale_y);
+        }
     } else {
         egl_fb_blit(&vc->gfx.win_fb, &vc->gfx.guest_fb, !vc->gfx.y0_top);
     }

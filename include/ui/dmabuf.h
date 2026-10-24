@@ -31,6 +31,8 @@ uint32_t qemu_dmabuf_get_stride(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_fourcc(QemuDmaBuf *dmabuf);
 uint64_t qemu_dmabuf_get_modifier(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_texture(QemuDmaBuf *dmabuf);
+bool qemu_dmabuf_get_external_texture(QemuDmaBuf *dmabuf);
+void qemu_dmabuf_set_external_texture(QemuDmaBuf *dmabuf, bool external);
 uint32_t qemu_dmabuf_get_x(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_y(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_backing_width(QemuDmaBuf *dmabuf);
