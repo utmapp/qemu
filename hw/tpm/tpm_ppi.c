@@ -50,7 +50,14 @@ void tpm_ppi_init_memory(TPMPPI *tpmppi, Object *obj)
 
     tpmppi->buf = qemu_memalign(host_page_size,
                                 ROUND_UP(TPM_PPI_ADDR_SIZE, host_page_size));
+    /*
+     * Use the whole page: accelerators such as HVF can only map full pages,
+     * and a smaller region would leave firmware's accesses to the instruction
+     * emulator, which hangs OVMF under HVF on Intel Macs.
+     */
     memory_region_init_ram_device_ptr(&tpmppi->ram, obj, "tpm-ppi",
-                                      TPM_PPI_ADDR_SIZE, tpmppi->buf);
+                                      ROUND_UP(TPM_PPI_ADDR_SIZE,
+                                               host_page_size),
+                                      tpmppi->buf);
     vmstate_register_ram(&tpmppi->ram, DEVICE(obj));
 }
