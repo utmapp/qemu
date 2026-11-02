@@ -48,6 +48,10 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef HOST_X86_64
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "exec/address-spaces.h"
@@ -135,6 +139,40 @@ hvf_slot *hvf_find_overlap_slot(uint64_t start, uint64_t size)
     return NULL;
 }
 
+#ifdef HOST_X86_64
+/*
+ * Intel Hypervisor.framework refuses hv_vm_map() with HV_MEMORY_EXEC when the
+ * host mapping's maximum protection lacks execute.  virtio-gpu blobs shared
+ * from the render server are mapped read/write only, so check the host
+ * entries backing [mem, mem + size) and leave EXEC out for such memory.
+ */
+static bool hvf_host_mem_executable(void *mem, uint64_t size)
+{
+    mach_vm_address_t addr = (mach_vm_address_t)mem;
+    mach_vm_address_t end = addr + size;
+
+    while (addr < end) {
+        mach_vm_address_t start = addr;
+        mach_vm_size_t len = 0;
+        natural_t depth = 1;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+        if (mach_vm_region_recurse(mach_task_self(), &start, &len, &depth,
+                                   (vm_region_recurse_info_t)&info,
+                                   &count) != KERN_SUCCESS ||
+            start > addr) {
+            return true;
+        }
+        if (!(info.max_protection & VM_PROT_EXECUTE)) {
+            return false;
+        }
+        addr = start + len;
+    }
+    return true;
+}
+#endif
+
 static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
 {
     hvf_mac_slot *macslot;
@@ -157,6 +195,11 @@ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
     macslot->present = 1;
     macslot->gpa_start = slot->start;
     macslot->size = slot->size;
+#ifdef HOST_X86_64
+    if (!hvf_host_mem_executable(slot->mem, slot->size)) {
+        flags &= ~HV_MEMORY_EXEC;
+    }
+#endif
     ret = hv_vm_map(slot->mem, slot->start, slot->size, flags);
     assert_hvf_ok(ret);
     return 0;
