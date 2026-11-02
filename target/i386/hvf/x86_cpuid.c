@@ -78,6 +78,7 @@ uint32_t hvf_get_supported_cpuid(uint32_t func, uint32_t idx,
              CPUID_EXT_FMA | CPUID_EXT_CX16 | CPUID_EXT_PCID |
              CPUID_EXT_SSE41 | CPUID_EXT_SSE42 | CPUID_EXT_MOVBE |
              CPUID_EXT_POPCNT | CPUID_EXT_AES | CPUID_EXT_X2APIC |
+             CPUID_EXT_TSC_DEADLINE_TIMER |
              (supported_xcr0 ? CPUID_EXT_XSAVE : 0) |
              CPUID_EXT_AVX | CPUID_EXT_F16C | CPUID_EXT_RDRAND;
         ecx |= CPUID_EXT_HYPERVISOR;
@@ -117,6 +118,9 @@ uint32_t hvf_get_supported_cpuid(uint32_t func, uint32_t idx,
             edx = 0;
         }
         eax = 0;
+        break;
+    case 0xA:
+        /* Architectural PMU: reported as the host's, see hvf_pmu_reg(). */
         break;
     case 0xD:
         if (!supported_xcr0 || idx >= 63 ||

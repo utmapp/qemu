@@ -767,8 +767,22 @@ int apic_accept_pic_intr(DeviceState *dev)
     return 0;
 }
 
+static bool apic_timer_is_deadline(APICCommonState *s)
+{
+    return (s->lvt[APIC_LVT_TIMER] & (3 << APIC_LVT_TIMER_SHIFT)) ==
+           APIC_LVT_TIMER_TSCDEADLINE;
+}
+
 static void apic_timer_update(APICCommonState *s, int64_t current_time)
 {
+    if (apic_timer_is_deadline(s)) {
+        if (s->tsc_deadline) {
+            timer_mod(s->timer, s->tsc_deadline_ns);
+        } else {
+            timer_del(s->timer);
+        }
+        return;
+    }
     if (apic_next_timer(s, current_time)) {
         timer_mod(s->timer, s->next_time);
     } else {
@@ -781,7 +795,35 @@ static void apic_timer(void *opaque)
     APICCommonState *s = opaque;
 
     apic_local_deliver(s, APIC_LVT_TIMER);
+    if (apic_timer_is_deadline(s)) {
+        s->tsc_deadline = 0;
+        return;
+    }
     apic_timer_update(s, s->next_time);
+}
+
+/* The MSR is ignored unless the LVT timer is in TSC-deadline mode (SDM 10.5.4.1). */
+void apic_set_tsc_deadline(APICCommonState *s, uint64_t deadline, uint64_t tsc,
+                           int64_t tsc_khz)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!apic_timer_is_deadline(s)) {
+        return;
+    }
+    s->tsc_deadline = deadline;
+    if (deadline) {
+        s->tsc_deadline_ns = now;
+        if (deadline > tsc) {
+            s->tsc_deadline_ns += muldiv64(deadline - tsc, 1000000, tsc_khz);
+        }
+    }
+    apic_timer_update(s, now);
+}
+
+uint64_t apic_get_tsc_deadline(APICCommonState *s)
+{
+    return apic_timer_is_deadline(s) ? s->tsc_deadline : 0;
 }
 
 static int apic_register_read(int index, uint64_t *value)
@@ -1018,8 +1060,14 @@ static int apic_register_write(int index, uint64_t val)
     case 0x32 ... 0x37:
         {
             int n = index - 0x32;
+            uint32_t old = s->lvt[n];
             s->lvt[n] = val;
             if (n == APIC_LVT_TIMER) {
+                if ((old ^ val) & (3 << APIC_LVT_TIMER_SHIFT)) {
+                    /* Changing timer mode disarms the timer. */
+                    s->tsc_deadline = 0;
+                    s->initial_count = 0;
+                }
                 apic_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
             } else if (n == APIC_LVT_LINT0 && apic_check_pic(s)) {
                 apic_update_irq(s);
@@ -1027,6 +1075,9 @@ static int apic_register_write(int index, uint64_t val)
         }
         break;
     case 0x38:
+        if (apic_timer_is_deadline(s)) {
+            break;
+        }
         s->initial_count = val;
         s->initial_count_load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         apic_timer_update(s, s->initial_count_load_time);

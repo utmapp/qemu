@@ -73,6 +73,7 @@
 #include <sys/sysctl.h>
 
 #include "hw/i386/apic_internal.h"
+#include "host-cpu.h"
 #include "qemu/main-loop.h"
 #include "qemu/accel.h"
 #include "target/i386/cpu.h"
@@ -414,6 +415,29 @@ static void hvf_cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
      * leaving hypervisor signature empty
      */
 
+    /*
+     * Timing leaves. QEMU's APIC timer runs at 1 GHz, so report that as the
+     * crystal/bus clock and scale the TSC ratio from it.
+     */
+    if ((index == 0x15 || index == 0x16) && index <= env->cpuid_level) {
+        uint32_t a, b, c, d;
+
+        init_tsc_freq(env);
+        if (index == 0x15) {
+            *eax = 1000;
+            *ebx = env->tsc_khz / 1000;
+            *ecx = 1000000000;
+            *edx = 0;
+        } else {
+            host_cpuid(0x16, 0, &a, &b, &c, &d);
+            *eax = a;
+            *ebx = b;
+            *ecx = 1000;
+            *edx = 0;
+        }
+        return;
+    }
+
     if (index < 0x40000000 || index > 0x40000010 ||
         !tsc_is_known(env) || !apic_bus_freq_is_known(env)) {
 
@@ -489,19 +513,67 @@ void hvf_store_regs(CPUState *cs)
     macvm_set_rip(cs, env->eip);
 }
 
+/*
+ * HVF gives guests no hardware counters. With pmu=on, CPUID leaf 0xA reports
+ * the host's PMU and these MSRs behave as registers that never count or raise
+ * a PMI, which is enough for guests that key decisions off the PMU's presence.
+ */
+static uint64_t *hvf_pmu_reg(X86CPU *cpu, uint32_t msr)
+{
+    CPUX86State *env = &cpu->env;
+    static __thread uint64_t ignored;
+
+    if (!cpu->enable_pmu) {
+        return NULL;
+    }
+    if (msr >= MSR_P6_PERFCTR0 && msr < MSR_P6_PERFCTR0 + 8) {
+        return &env->msr_gp_counters[msr - MSR_P6_PERFCTR0];
+    }
+    if (msr >= 0x4c1 && msr < 0x4c1 + 8) { /* IA32_A_PMCx */
+        return &env->msr_gp_counters[msr - 0x4c1];
+    }
+    if (msr >= MSR_P6_EVNTSEL0 && msr < MSR_P6_EVNTSEL0 + 8) {
+        return &env->msr_gp_evtsel[msr - MSR_P6_EVNTSEL0];
+    }
+    if (msr >= MSR_CORE_PERF_FIXED_CTR0 && msr <= MSR_CORE_PERF_FIXED_CTR2) {
+        return &env->msr_fixed_counters[msr - MSR_CORE_PERF_FIXED_CTR0];
+    }
+    switch (msr) {
+    case MSR_CORE_PERF_FIXED_CTR_CTRL:
+        return &env->msr_fixed_ctr_ctrl;
+    case MSR_CORE_PERF_GLOBAL_CTRL:
+        return &env->msr_global_ctrl;
+    case MSR_CORE_PERF_GLOBAL_STATUS:
+    case MSR_CORE_PERF_GLOBAL_OVF_CTRL:
+    case 0x391: /* IA32_PERF_GLOBAL_STATUS_SET */
+    case 0x392: /* IA32_PERF_GLOBAL_INUSE */
+        ignored = 0;
+        return &ignored;
+    }
+    return NULL;
+}
+
+
 void hvf_simulate_rdmsr(CPUX86State *env)
 {
     X86CPU *cpu = env_archcpu(env);
     CPUState *cs = env_cpu(env);
     uint32_t msr = ECX(env);
     uint64_t val = 0;
+    uint64_t *pmu = hvf_pmu_reg(cpu, msr);
 
-    switch (msr) {
+    switch (pmu ? UINT32_MAX : msr) {
+    case UINT32_MAX:
+        val = *pmu;
+        break;
     case MSR_IA32_TSC:
         val = rdtscp() + rvmcs(cs->accel->fd, VMCS_TSC_OFFSET);
         break;
     case MSR_IA32_APICBASE:
         val = cpu_get_apic_base(cpu->apic_state);
+        break;
+    case MSR_IA32_TSCDEADLINE:
+        val = apic_get_tsc_deadline(APIC_COMMON(cpu->apic_state));
         break;
     case MSR_APIC_START ... MSR_APIC_END: {
         int ret;
@@ -601,8 +673,23 @@ void hvf_simulate_wrmsr(CPUX86State *env)
     uint32_t msr = ECX(env);
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
-    switch (msr) {
+    uint64_t *pmu = hvf_pmu_reg(cpu, msr);
+
+    switch (pmu ? UINT32_MAX : msr) {
+    case UINT32_MAX:
+        *pmu = data;
+        break;
     case MSR_IA32_TSC:
+        break;
+    case MSR_IA32_TSCDEADLINE:
+        init_tsc_freq(env);
+        if (!env->tsc_khz) {
+            x86_emul_raise_exception(env, EXCP0D_GPF, 0);
+            break;
+        }
+        apic_set_tsc_deadline(APIC_COMMON(cpu->apic_state), data,
+                              rdtscp() + rvmcs(cs->accel->fd, VMCS_TSC_OFFSET),
+                              env->tsc_khz);
         break;
     case MSR_IA32_APICBASE: {
         int r;

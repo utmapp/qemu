@@ -182,6 +182,8 @@ struct APICCommonState {
     int64_t next_time;
     QEMUTimer *timer;
     int64_t timer_expiry;
+    uint64_t tsc_deadline;
+    int64_t tsc_deadline_ns;
     int sipi_vector;
     int wait_for_sipi;
 
@@ -203,6 +205,9 @@ typedef struct VAPICState {
 extern bool apic_report_tpr_access;
 
 bool apic_next_timer(APICCommonState *s, int64_t current_time);
+void apic_set_tsc_deadline(APICCommonState *s, uint64_t deadline, uint64_t tsc,
+                           int64_t tsc_khz);
+uint64_t apic_get_tsc_deadline(APICCommonState *s);
 void apic_enable_tpr_access_reporting(DeviceState *d, bool enable);
 void apic_enable_vapic(DeviceState *d, hwaddr paddr);
 

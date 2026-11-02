@@ -329,7 +329,7 @@ void os_set_line_buffering(void)
 
 int os_mlock(bool on_fault)
 {
-#ifdef HAVE_MLOCKALL
+#if defined(HAVE_MLOCKALL) && !defined(__APPLE__)
     int ret = 0;
     int flags = MCL_CURRENT | MCL_FUTURE;
 
@@ -350,6 +350,11 @@ int os_mlock(bool on_fault)
     return ret;
 #else
     (void)on_fault;
+#ifdef __APPLE__
+    /* mlockall() returns ENOSYS on macOS; HVF locks each RAM mapping instead. */
+    return 0;
+#else
     return -ENOSYS;
+#endif
 #endif
 }
