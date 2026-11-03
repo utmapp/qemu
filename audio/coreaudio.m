@@ -42,6 +42,7 @@ typedef struct coreaudioVoiceOut {
     UInt32 audioDevicePropertyBufferFrameSize;
     AudioDeviceIOProcID ioprocid;
     bool enabled;
+    bool primed;
 } coreaudioVoiceOut;
 
 static const AudioObjectPropertyAddress voice_addr = {
@@ -325,8 +326,22 @@ static OSStatus audioDeviceIOProc(
     frameCount = core->audioDevicePropertyBufferFrameSize;
     pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
 
+    /*
+     * Jitter buffer: start playing only once half of the ring is queued, and
+     * prime again after an underrun. Without the cushion, playback runs with
+     * about one buffer queued, and every late audio timer (the main loop also
+     * runs the vCPUs' I/O and virgl) costs a whole buffer of silence.
+     */
+    if (!core->primed && pending_frames < hw->samples / 2) {
+        inInputTime = 0;
+        coreaudio_buf_unlock (core, "audioDeviceIOProc(priming)");
+        return 0;
+    }
+    core->primed = true;
+
     /* if there are not enough samples, set signal and return */
     if (pending_frames < frameCount) {
+        core->primed = false;
         inInputTime = 0;
         coreaudio_buf_unlock (core, "audioDeviceIOProc(empty)");
         return 0;
@@ -642,6 +657,9 @@ static void coreaudio_enable_out(HWVoiceOut *hw, bool enable)
     coreaudioVoiceOut *core = (coreaudioVoiceOut *) hw;
 
     core->enabled = enable;
+    if (enable) {
+        core->primed = false;
+    }
     update_device_playback_state(core);
 }
 
