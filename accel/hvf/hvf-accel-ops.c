@@ -48,6 +48,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <sys/mman.h>
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "exec/address-spaces.h"
@@ -61,6 +62,7 @@
 #include "system/hvf.h"
 #include "system/hvf_int.h"
 #include "system/runstate.h"
+#include "system/system.h"
 #include "qemu/guest-random.h"
 #include "hw/boards.h"
 
@@ -157,6 +159,15 @@ static int do_hvf_set_memory(hvf_slot *slot, hv_memory_flags_t flags)
     macslot->present = 1;
     macslot->gpa_start = slot->start;
     macslot->size = slot->size;
+    /*
+     * mlockall() returns ENOSYS on macOS, and left alone the host compresses
+     * guest RAM until every touch faults, so honour -overcommit mem-lock=on
+     * for each RAM mapping.
+     */
+    if (should_mlock(mlock_state) && memory_region_is_ram(slot->region) &&
+        mlock(slot->mem, slot->size) < 0) {
+        error_report("hvf: mlock of guest RAM failed: %s", strerror(errno));
+    }
     ret = hv_vm_map(slot->mem, slot->start, slot->size, flags);
     assert_hvf_ok(ret);
     return 0;
