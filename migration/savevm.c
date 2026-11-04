@@ -3547,6 +3547,7 @@ typedef struct SnapshotJob {
     Coroutine *co;
     Error **errp;
     bool ret;
+    QEMUBHFunc *work;
 } SnapshotJob;
 
 static void qmp_snapshot_job_free(SnapshotJob *s)
@@ -3605,13 +3606,30 @@ static void snapshot_delete_job_bh(void *opaque)
     aio_co_wake(s->co);
 }
 
+/*
+ * A snapshot job's work holds up the main loop, so QEMU answers nothing until
+ * it is done, and that includes the command that started the job, whose answer
+ * is still on its way out. A client that gives up on that answer takes a long
+ * save for a failed one, while the save goes on and stays in the image. So the
+ * work goes behind the answer: the monitor's wake-up is waiting in the monitor's
+ * context when this runs there, and the main context's turn comes after it.
+ */
+static void snapshot_job_after_answer_bh(void *opaque)
+{
+    Job *job = opaque;
+    SnapshotJob *s = container_of(job, SnapshotJob, common);
+
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), s->work, job);
+}
+
 static int coroutine_fn snapshot_save_job_run(Job *job, Error **errp)
 {
     SnapshotJob *s = container_of(job, SnapshotJob, common);
     s->errp = errp;
     s->co = qemu_coroutine_self();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            snapshot_save_job_bh, job);
+    s->work = snapshot_save_job_bh;
+    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+                            snapshot_job_after_answer_bh, job);
     qemu_coroutine_yield();
     return s->ret ? 0 : -1;
 }
@@ -3621,8 +3639,9 @@ static int coroutine_fn snapshot_load_job_run(Job *job, Error **errp)
     SnapshotJob *s = container_of(job, SnapshotJob, common);
     s->errp = errp;
     s->co = qemu_coroutine_self();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            snapshot_load_job_bh, job);
+    s->work = snapshot_load_job_bh;
+    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+                            snapshot_job_after_answer_bh, job);
     qemu_coroutine_yield();
     return s->ret ? 0 : -1;
 }
@@ -3632,8 +3651,9 @@ static int coroutine_fn snapshot_delete_job_run(Job *job, Error **errp)
     SnapshotJob *s = container_of(job, SnapshotJob, common);
     s->errp = errp;
     s->co = qemu_coroutine_self();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            snapshot_delete_job_bh, job);
+    s->work = snapshot_delete_job_bh;
+    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+                            snapshot_job_after_answer_bh, job);
     qemu_coroutine_yield();
     return s->ret ? 0 : -1;
 }
