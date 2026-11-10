@@ -618,7 +618,8 @@ static void dbdma_control_write(DBDMA_channel *ch)
      * logic to ensure all cases are covered.
      */
 
-    /* The device status bits s0-s7 can be set and cleared by SW (or by
+    /*
+     * The device status bits s0-s7 can be set and cleared by SW (or by
      * the device); they are tested by the interrupt, branch and wait
      * conditions of the channel program.
      */
@@ -885,6 +886,8 @@ static void mac_dbdma_reset(DeviceState *d)
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
         memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        /* No command is in progress after a reset */
+        s->channels[i].io.processing = false;
     }
 }
 
