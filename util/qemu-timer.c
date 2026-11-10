@@ -34,7 +34,7 @@
 #include <pthread.h>
 #endif
 
-#ifdef CONFIG_PPOLL
+#if defined(CONFIG_PPOLL) || defined(CONFIG_DARWIN)
 #include <poll.h>
 #endif
 
@@ -341,6 +341,28 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
 #else
+#ifdef CONFIG_DARWIN
+    /*
+     * GLib's g_poll() on macOS is a select() emulation, and select() cannot
+     * watch a descriptor >= FD_SETSIZE (1024): such a descriptor is left out
+     * of the set (the process gets an EXC_GUARD report) and its events are
+     * never seen.  A process can get there easily -- every blob resource of
+     * a virgl render-server context holds a shared-memory descriptor -- and
+     * then every socket, pipe or eventfd opened later is never serviced.
+     * Use poll(2) for such a set.  macOS poll(2) does not support devices,
+     * so g_poll() stays the default for the sets select() can handle.
+     */
+    QEMU_BUILD_BUG_ON(sizeof(GPollFD) != sizeof(struct pollfd));
+    QEMU_BUILD_BUG_ON(G_IO_IN != POLLIN || G_IO_OUT != POLLOUT ||
+                      G_IO_PRI != POLLPRI || G_IO_ERR != POLLERR ||
+                      G_IO_HUP != POLLHUP || G_IO_NVAL != POLLNVAL);
+    for (guint i = 0; i < nfds; i++) {
+        if (fds[i].fd >= FD_SETSIZE) {
+            return poll((struct pollfd *)fds, nfds,
+                        qemu_timeout_ns_to_ms(timeout));
+        }
+    }
+#endif
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
 }
