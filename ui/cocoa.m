@@ -97,6 +97,7 @@ static int left_command_key_enabled = 1;
 static bool swap_opt_cmd;
 
 static bool zoom_interpolation;
+static bool hidpi = true;
 static NSTextField *pauseLabel;
 
 static bool allow_events;
@@ -677,8 +678,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
 
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
-        CGFloat width = screen.width / [[self window] backingScaleFactor];
-        CGFloat height = screen.height / [[self window] backingScaleFactor];
+        CGFloat scale = hidpi ? [[self window] backingScaleFactor] : 1;
+        CGFloat width = screen.width / scale;
+        CGFloat height = screen.height / scale;
 
         [[self window] setContentSize:NSMakeSize(width, height)];
         [[self window] center];
@@ -754,8 +756,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     info.xoff = 0;
     info.yoff = 0;
-    info.width = frameSize.width * [[self window] backingScaleFactor];
-    info.height = frameSize.height * [[self window] backingScaleFactor];
+    if (hidpi) {
+        info.width = frameSize.width * [[self window] backingScaleFactor];
+        info.height = frameSize.height * [[self window] backingScaleFactor];
+    } else {
+        info.width = frameSize.width;
+        info.height = frameSize.height;
+    }
 
     dpy_set_ui_info(dcl.con, &info, TRUE);
 }
@@ -1351,7 +1358,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                 metalTexture, size.width, size.height);
     if (metalTexture) {
         CGFloat scale = self.window.backingScaleFactor;
-        CGRect frame = CGRectMake(0, 0, size.width / scale, size.height / scale);
+        /*
+         * With zoom-to-fit the layer fills the view and Core Animation scales
+         * the drawable, as the 2D path does; otherwise it is one texel per
+         * physical pixel.
+         */
+        CGRect frame = ([self window].styleMask & NSWindowStyleMaskResizable) ?
+            [self.layer bounds] :
+            CGRectMake(0, 0, size.width / scale, size.height / scale);
         CGSize drawableSize = CGSizeMake(size.width, size.height);
         /*
          * A guest may re-emit SET_SCANOUT_BLOB for every scanned-out frame, so
@@ -2711,6 +2725,10 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 
     zoom_interpolation = opts->u.cocoa.has_zoom_interpolation &&
                          opts->u.cocoa.zoom_interpolation;
+
+    if (opts->u.cocoa.has_hidpi) {
+        hidpi = opts->u.cocoa.hidpi;
+    }
 
     create_initial_menus();
     /*

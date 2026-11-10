@@ -1633,10 +1633,67 @@ static void virtio_gpu_reset_bh(void *opaque)
     qemu_cond_signal(&g->reset_cond);
 }
 
+/*
+ * A reset destroys every resource, so every blob mapped into the hostmem
+ * BAR goes away with it.  The guest driver cannot always revoke the CPU
+ * mappings it handed out first: a Windows display driver resets the device
+ * on its way to D3 while user-mode processes (DWM drawing the "Restarting"
+ * screen, or an application that is still exiting) keep writing through
+ * their mappings.  Those accesses then land in holes of the BAR.  A real
+ * GPU's BAR keeps decoding, but here a hole is unassigned memory: with hvf
+ * a store pair or SIMD store there exits without a valid ISS and QEMU
+ * aborts (assert(isv)), and under TCG the guest takes an external abort.
+ *
+ * So a guest-initiated reset that finds blobs mapped puts RAM behind the
+ * blob subregions (priority -1, shadowed by every blob mapped later) and
+ * keeps it there until the next machine reset, when no guest code can be
+ * holding a stale mapping.  Resets with nothing mapped (firmware, driver
+ * start) leave the BAR as it is.  The RAM is only reserved: host pages are
+ * committed only for what stale mappings actually touch.
+ */
+static void virtio_gpu_hostmem_scratch_update(VirtIOGPU *g, bool guest_reset)
+{
+    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
+    Error *local_err = NULL;
+
+    if (!virtio_gpu_hostmem_enabled(b->conf) ||
+        guest_reset == b->hostmem_scratch_mapped) {
+        return;
+    }
+
+    if (guest_reset && QTAILQ_EMPTY(&b->hostmem.subregions)) {
+        return;
+    }
+
+    if (!guest_reset) {
+        memory_region_del_subregion(&b->hostmem, &b->hostmem_scratch);
+        b->hostmem_scratch_mapped = false;
+        trace_virtio_gpu_hostmem_scratch(false);
+        return;
+    }
+
+    if (!b->hostmem_scratch_init) {
+        if (!memory_region_init_ram_nomigrate(&b->hostmem_scratch, OBJECT(g),
+                                              "virtio-gpu-hostmem-scratch",
+                                              b->conf.hostmem, &local_err)) {
+            warn_reportf_err(local_err, "virtio-gpu: hostmem scratch: ");
+            return;
+        }
+        b->hostmem_scratch_init = true;
+    }
+    memory_region_add_subregion_overlap(&b->hostmem, 0, &b->hostmem_scratch,
+                                        -1);
+    b->hostmem_scratch_mapped = true;
+    trace_virtio_gpu_hostmem_scratch(true);
+}
+
 void virtio_gpu_reset(VirtIODevice *vdev)
 {
     VirtIOGPU *g = VIRTIO_GPU(vdev);
     struct virtio_gpu_ctrl_command *cmd;
+
+    /* Before the resources (and their blob mappings) are destroyed. */
+    virtio_gpu_hostmem_scratch_update(g, qemu_in_vcpu_thread());
 
     if (qemu_in_vcpu_thread()) {
         g->reset_finished = false;

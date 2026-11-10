@@ -2298,6 +2298,20 @@ static GSList *gd_vc_gfx_init(GtkDisplayState *s, VirtualConsole *vc,
 #ifdef CONFIG_X11
             vc->gfx.drawing_area = gtk_drawing_area_new();
             /*
+             * The EGL config's X11 visual may differ from GTK's default,
+             * notably with PRIME offload. A mismatched native window makes
+             * eglCreateWindowSurface fail with EGL_BAD_MATCH on NVIDIA.
+             */
+            EGLint visual_id;
+            if (eglGetConfigAttrib(qemu_egl_display, qemu_egl_config,
+                                   EGL_NATIVE_VISUAL_ID, &visual_id)) {
+                GdkVisual *visual = gdk_x11_screen_lookup_visual(
+                    gdk_screen_get_default(), visual_id);
+                if (visual) {
+                    gtk_widget_set_visual(vc->gfx.drawing_area, visual);
+                }
+            }
+            /*
              * gtk_widget_set_double_buffered() was deprecated in 3.14.
              * It is required for opengl rendering on X11 though.  A
              * proper replacement (native opengl support) is only

@@ -1436,6 +1436,12 @@
 # @zoom-interpolation: Apply interpolation to smooth output when
 #     zoom-to-fit is enabled.  Defaults to "off".  (Since 9.0)
 #
+# @hidpi: Report the window size to the guest in physical pixels on
+#     Retina displays.  When "off" the guest gets the size in points
+#     and its output is scaled up to the display, which halves the
+#     guest resolution on a 2x screen.  Defaults to "on".
+#     (Since 10.1)
+#
 # Since: 7.0
 ##
 { 'struct': 'DisplayCocoa',
@@ -1444,7 +1450,8 @@
       '*full-grab': 'bool',
       '*swap-opt-cmd': 'bool',
       '*zoom-to-fit': 'bool',
-      '*zoom-interpolation': 'bool'
+      '*zoom-interpolation': 'bool',
+      '*hidpi': 'bool'
   } }
 
 ##

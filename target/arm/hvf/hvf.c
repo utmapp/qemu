@@ -2292,7 +2292,42 @@ run_again:
             break;
         }
 
-        assert(isv);
+        /*
+         * A memory topology update unmaps and maps again every hvf slot it
+         * touches.  A vCPU that faults on such a range in between only
+         * gets here once the update is done and the RAM is mapped again,
+         * so retry the access instead of emulating it: it may well have
+         * no valid syndrome (a store pair or SIMD access from memcpy).
+         * Writes to read-only and dirty-logged slots are still emulated.
+         */
+        {
+            hvf_slot *slot = hvf_find_overlap_slot(
+                hvf_exit->exception.physical_address, 1);
+
+            if (slot && memory_region_is_ram(slot->region) &&
+                !(iswrite && (slot->region->readonly ||
+                              (slot->flags & HVF_SLOT_LOG)))) {
+                break;
+            }
+        }
+
+        if (!isv) {
+            /*
+             * Nothing is mapped there to retry on, and without a syndrome
+             * (a store pair, SIMD or SVE access) the access cannot be
+             * emulated.  Report a synchronous external abort to the guest,
+             * as KVM does, instead of aborting QEMU.
+             */
+            int same_el;
+
+            cpu_synchronize_state(cpu);
+            same_el = arm_current_el(env) == 1;
+            env->exception.vaddress = hvf_exit->exception.virtual_address;
+            hvf_raise_exception(cpu, EXCP_DATA_ABORT,
+                                syn_data_abort_no_iss(same_el, 0, 1, 0, s1ptw,
+                                                      iswrite, 0x10));
+            break;
+        }
 
         if (iswrite) {
             val = hvf_get_reg(cpu, srt);

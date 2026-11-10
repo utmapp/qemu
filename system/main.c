@@ -39,11 +39,38 @@
 
 #ifdef CONFIG_DARWIN
 #include <CoreFoundation/CoreFoundation.h>
+#include <pthread/qos.h>
+#endif
+
+#ifdef CONFIG_DARWIN
+/*
+ * The main loop feeds the sound card (the HDA DMA timer and the audio timer)
+ * and runs virgl. At the default QoS it competes with the vCPU threads, so a
+ * busy guest on a busy Mac delays it by tens of ms and the sound breaks up.
+ * Ask for user-interactive QoS, as the window thread has.
+ * QEMU_MAIN_LOOP_QOS=default keeps the default.
+ * Based on OmacVM's qemu-darwin-main-loop-qos.patch (MIT).
+ */
+static void darwin_main_loop_qos(void)
+{
+    const char *v = getenv("QEMU_MAIN_LOOP_QOS");
+
+    if (v && strcmp(v, "default") == 0) {
+        return;
+    }
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0) {
+        fprintf(stderr, "main loop: user-interactive QoS refused\n");
+    }
+}
 #endif
 
 static void *qemu_default_main(void *opaque)
 {
     int status;
+
+#ifdef CONFIG_DARWIN
+    darwin_main_loop_qos();
+#endif
 
     replay_mutex_lock();
     bql_lock();
