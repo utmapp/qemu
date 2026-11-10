@@ -272,6 +272,8 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
+/* r[i] = idx[i] < 16 ? a[idx[i]] : idx[i] < 32 ? b[idx[i] - 16] : 0 */
+DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

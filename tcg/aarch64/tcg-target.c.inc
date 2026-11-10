@@ -628,6 +628,10 @@ typedef enum {
     I3616_UQSUB     = 0x2e202c00,
     I3616_USHL      = 0x2e204400,
 
+    /* AdvSIMD table lookup, one table register (len = 0).  */
+    I3616_TBL       = 0x0e000000,
+    I3616_TBX       = 0x0e001000,
+
     /* AdvSIMD two-reg misc.  */
     I3617_CMGT0     = 0x0e208800,
     I3617_CMEQ0     = 0x0e209800,
@@ -2831,6 +2835,28 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_tbl_vec:
+        /*
+         * Bytes 16-31 come from b by TBL on idx ^ 16 (indexes 0-15 map
+         * out of range there and give 0), then TBX fills in bytes 0-15
+         * from a on idx itself (16 and up leave the byte alone).  Built
+         * in TMP0 unless the output overlaps neither a nor idx.
+         */
+        {
+            TCGReg d = (a0 != a1 && a0 != args[3]) ? a0 : TCG_VEC_TMP0;
+
+            tcg_debug_assert(is_q);
+            tcg_out_dupi_vec(s, TCG_TYPE_V128, MO_8, TCG_VEC_TMP0, 16);
+            tcg_out_insn(s, 3616, EOR, 1, 0, TCG_VEC_TMP0,
+                         args[3], TCG_VEC_TMP0);
+            tcg_out_insn(s, 3616, TBL, 1, 0, d, a2, TCG_VEC_TMP0);
+            tcg_out_insn(s, 3616, TBX, 1, 0, d, a1, args[3]);
+            if (d != a0) {
+                tcg_out_mov(s, type, a0, d);
+            }
+        }
+        break;
+
     case INDEX_op_mov_vec:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_dup_vec:  /* Always emitted via tcg_out_dup_vec.  */
     default:
@@ -2874,6 +2900,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_umax_vec:
     case INDEX_op_umin_vec:
         return vece < MO_64;
+    case INDEX_op_tbl_vec:
+        return type == TCG_TYPE_V128 && vece == MO_8;
 
     default:
         return 0;
@@ -3137,6 +3165,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_cmp_vec:
         return C_O1_I2(w, w, wZ);
     case INDEX_op_bitsel_vec:
+    case INDEX_op_tbl_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);
