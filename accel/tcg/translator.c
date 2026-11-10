@@ -20,6 +20,8 @@
 #include "internal-target.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#include "tb-hash.h"
+#include "tb-jmp-cache.h"
 
 static void set_can_do_io(DisasContextBase *db, bool val)
 {
@@ -118,6 +120,93 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
     /* Check for the dest on the same page as the start of the TB.  */
     return translator_is_same_page(db, dest);
+}
+
+/*
+ * helper_lookup_tb_ptr's jump cache probe, inline: hash @pc, and if the
+ * entry holds a live TB for it with this TB's cs_base, flags and cflags,
+ * jump straight to it; otherwise call the helper as before.  Returns and
+ * other indirect branches take this path on every execution, and the
+ * helper call costs far more than the probe.
+ *
+ * Only for exits where cpu_get_tb_cpu_state() still returns this TB's
+ * cs_base and flags, and only for TBs with ordinary cflags, which is what
+ * curr_cflags() returns while such TBs run: anything unusual (icount,
+ * single-stepping, breakpoints on the page, plugins, exec logging) keeps
+ * the helper, which handles it.
+ */
+/* QEMU_TB_INLINE=0 always calls helper_lookup_tb_ptr (for A/B tests). */
+static bool tb_inline_lookup_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_TB_INLINE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
+{
+    TranslationBlock *tb = db->tb;
+    uint32_t cf = tb_cflags(tb);
+    const size_t esz = sizeof(((CPUJumpCache *)0)->array[0]);
+    TCGLabel *miss;
+    TCGv_i64 h, t;
+    TCGv_ptr jc, e, next;
+    TCGv_i32 a, b;
+
+    if ((cf & (CF_COUNT_MASK | CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP |
+               CF_MEMI_ONLY | CF_USE_ICOUNT | CF_NOIRQ | CF_PCREL |
+               CF_BP_PAGE)) ||
+        db->plugin_enabled || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) ||
+        !tb_inline_lookup_on()) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    miss = gen_new_label();
+    h = tcg_temp_new_i64();
+    t = tcg_temp_new_i64();
+    jc = tcg_temp_new_ptr();
+    e = tcg_temp_new_ptr();
+    next = tcg_temp_new_ptr();
+    a = tcg_temp_new_i32();
+    b = tcg_temp_new_i32();
+
+    /* tb_jmp_cache_hash_func(pc) * esz */
+    tcg_gen_shri_i64(t, pc, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_xor_i64(t, t, pc);
+    tcg_gen_shri_i64(h, t, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_andi_i64(h, h, TB_JMP_PAGE_MASK);
+    tcg_gen_andi_i64(t, t, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i64(h, h, t);
+    tcg_gen_muli_i64(h, h, esz);
+
+    tcg_gen_ld_ptr(jc, tcg_env, offsetof(ArchCPU, parent_obj.tb_jmp_cache) -
+                                offsetof(ArchCPU, env));
+    tcg_gen_trunc_i64_ptr(e, h);
+    tcg_gen_add_ptr(e, e, jc);
+
+    tcg_gen_ld_ptr(next, e, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, next, 0, miss);
+    tcg_gen_ld_i64(t, e, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, pc, miss);
+    tcg_gen_ld_i32(a, e, offsetof(CPUJumpCache, array[0].gen));
+    tcg_gen_ld_i32(b, jc, offsetof(CPUJumpCache, gen));
+    tcg_gen_brcond_i32(TCG_COND_NE, a, b, miss);
+    tcg_gen_ld_i64(t, next, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, tb->cs_base, miss);
+    tcg_gen_ld_i32(a, next, offsetof(TranslationBlock, flags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, a, tb->flags, miss);
+    tcg_gen_ld_i32(a, next, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, a, cf, miss);
+    tcg_gen_ld_ptr(next, next, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(next);
+
+    gen_set_label(miss);
+    tcg_gen_lookup_and_goto_ptr();
 }
 
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
