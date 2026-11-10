@@ -736,7 +736,13 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * If the length is larger than the jump cache size, then it will take
      * longer to clear each entry individually than it will to clear it all.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
+    /*
+     * A page's jump cache bucket is its page number bits [0, P) xor bits
+     * [P, 2P), P = TB_JMP_PAGE_BITS. Any run of 2 << P pages holds an
+     * aligned run of 1 << P pages, which covers every bucket: clearing it
+     * page by page would empty the whole cache, only more slowly.
+     */
+    if (d.len >= (TARGET_PAGE_SIZE * 2 * (TB_JMP_CACHE_SIZE / TB_JMP_PAGE_SIZE))) {
         tcg_flush_jmp_cache(cpu);
         return;
     }
