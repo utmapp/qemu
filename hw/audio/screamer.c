@@ -74,8 +74,14 @@ static const char *s_spk = "screamer";
  */
 #define SCREAMER_FIFO_FRAMES 128
 #define SCREAMER_TX_TICK_NS  (1 * SCALE_MS)
+/*
+ * Within a transfer, a late tick may catch up on frames that are already
+ * due, up to this bound so one long host stall cannot drain a guest ring.
+ */
+#define SCREAMER_TX_MAX_CREDIT (2 * SCREAMER_FIFO_FRAMES)
 
-static void screamer_tx_credit_update(ScreamerState *s)
+/* Accrue TX credit for the virtual time elapsed, up to @limit frames */
+static void screamer_tx_credit_update(ScreamerState *s, uint32_t limit)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t frames;
@@ -87,7 +93,9 @@ static void screamer_tx_credit_update(ScreamerState *s)
     }
     frames = muldiv64(now - s->tx_last_ns, s->rate, NANOSECONDS_PER_SECOND);
     s->tx_last_ns += muldiv64(frames, NANOSECONDS_PER_SECOND, s->rate);
-    s->tx_credit = MIN(s->tx_credit + frames, SCREAMER_FIFO_FRAMES);
+    if (s->tx_credit < limit) {
+        s->tx_credit = MIN(s->tx_credit + frames, limit);
+    }
 }
 
 /* Copy guest frames into the ring; drop the oldest if the host lags */
@@ -143,12 +151,12 @@ static bool screamer_dma_stopping(DBDMA_channel *ch)
            !(ch->regs[DBDMA_CONTROL] & RUN);
 }
 
-static void pmac_screamer_tx_transfer(ScreamerState *s)
+static void pmac_screamer_tx_transfer(ScreamerState *s, uint32_t limit)
 {
     DBDMA_io *io = &s->io;
     uint32_t frames;
 
-    screamer_tx_credit_update(s);
+    screamer_tx_credit_update(s, limit);
     frames = MIN(io->len >> s->shift, s->tx_credit);
 
     if (frames) {
@@ -184,7 +192,7 @@ static void screamer_tx_timer_cb(void *opaque)
 
     if (s->io.len) {
         SCREAMER_DPRINTF("Continue deferred transfer\n");
-        pmac_screamer_tx_transfer(s);
+        pmac_screamer_tx_transfer(s, SCREAMER_TX_MAX_CREDIT);
     }
 }
 
@@ -196,7 +204,8 @@ static void pmac_screamer_tx(DBDMA_io *io)
                      " len: %x\n", io->addr, io->len);
 
     memcpy(&s->io, io, sizeof(DBDMA_io));
-    pmac_screamer_tx_transfer(s);
+    /* Time the channel spent idle only fills the FIFO */
+    pmac_screamer_tx_transfer(s, SCREAMER_FIFO_FRAMES);
 }
 
 static void pmac_screamer_tx_flush(DBDMA_io *io)
@@ -223,6 +232,7 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
      */
     if (screamer_dma_stopping(ch)) {
         s->io.len = 0;
+        s->tx_credit = MIN(s->tx_credit, SCREAMER_FIFO_FRAMES);
         timer_del(s->tx_timer);
         ch->io.processing = false;
     }
