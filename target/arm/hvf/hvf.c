@@ -1755,7 +1755,8 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     }
 
 #if TARGET_OS_OSX
-    if (hvf_irqchip_in_kernel()) {
+    /* only a board that created the in-kernel GIC gives the vCPU one */
+    if (hvf_arm_gic_created()) {
         hvf_arm_gic_save_icc_reset(cpu);
     }
 #endif
