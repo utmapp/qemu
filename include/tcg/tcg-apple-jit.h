@@ -83,17 +83,31 @@ static __attribute__((__always_inline__)) void jit_write_protect(int enabled)
 
 #endif
 
+/*
+ * Switching the JIT mapping between writable and executable costs an
+ * "isb sy" -- a full pipeline resynchronisation.  qemu_thread_jit_execute()
+ * runs before every translated block is entered, while writes happen only
+ * when code is generated or patched, so remember which state this thread is
+ * already in and skip the switch (and the barrier) when nothing changes.
+ * The APRR state is per-thread, so the cache is too -- and it must be a
+ * single variable shared by every translation unit, or one file's idea of
+ * the state would let another skip a switch it actually needed.
+ */
+extern __thread int qemu_jit_wx_state;
+
 static inline void qemu_thread_jit_execute(void)
 {
-    if (jit_write_protect_supported()) {
+    if (qemu_jit_wx_state != 1 && jit_write_protect_supported()) {
         jit_write_protect(true);
+        qemu_jit_wx_state = 1;
     }
 }
 
 static inline void qemu_thread_jit_write(void)
 {
-    if (jit_write_protect_supported()) {
+    if (qemu_jit_wx_state != 0 && jit_write_protect_supported()) {
         jit_write_protect(false);
+        qemu_jit_wx_state = 0;
     }
 }
 
