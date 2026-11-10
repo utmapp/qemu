@@ -24,6 +24,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "qemu/lockable.h"
 #include "system/tcg.h"
 #include "system/replay.h"
@@ -184,6 +187,12 @@ static void *rr_cpu_thread_fn(void *arg)
 
     assert(tcg_enabled());
     rcu_register_thread();
+#ifdef __APPLE__
+    /* The vCPU thread is the emulator's critical path: keep it on the
+     * performance cores instead of letting macOS park it on efficiency
+     * cores whenever the host is busy or the window is in the background. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     force_rcu.notify = rr_force_rcu;
     rcu_add_force_rcu_notifier(&force_rcu);
     tcg_register_thread();
