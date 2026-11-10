@@ -146,28 +146,32 @@ static void booke206_flush_tlb(CPUPPCState *env, int flags,
 /*****************************************************************************/
 /* BATs management */
 #if !defined(FLUSH_ALL_TLBS)
-static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
-                                     target_ulong mask)
-{
-    CPUState *cs = env_cpu(env);
-    target_ulong base, end, page;
+/*
+ * MMU indexes that use address translation (see hreg_compute_hflags_value()):
+ * bit 1 of the index is set in real mode, where BATs never apply.
+ */
+#define PPC_BAT_MMUIDX_BITS ((1 << 0) | (1 << 1) | (1 << 4) | (1 << 5))
 
-    base = BATu & ~0x0001FFFF;
-    end = base + mask + 0x00020000;
-    if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
-        /* Flushing 1024 4K pages is slower than a complete flush */
-        qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
-        tlb_flush(cs);
-        qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+/*
+ * Drop the TLB entries a BAT can affect: the ones it translated, and the
+ * page table translations it hid. Use the block length of this BAT value,
+ * not of the value that replaces it, or entries beyond the new length
+ * would survive a BAT being shrunk or cleared.
+ */
+static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu)
+{
+    target_ulong base, len;
+
+    /* Neither Vs nor Vp: the BAT matches nothing, nothing to drop */
+    if (!(BATu & 0x3)) {
         return;
     }
+    base = BATu & ~0x0001FFFF;
+    len = ((BATu << 15) & 0x0FFE0000UL) + 0x00020000;
     qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
-                  " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
-                  base, end, mask);
-    for (page = base; page != end; page += TARGET_PAGE_SIZE) {
-        tlb_flush_page(cs, page);
-    }
-    qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+                  " length " TARGET_FMT_lx "\n", base, len);
+    tlb_flush_range_by_mmuidx(env_cpu(env), base, len,
+                              PPC_BAT_MMUIDX_BITS, TARGET_LONG_BITS);
 }
 #endif
 
@@ -187,7 +191,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
     if (env->IBAT[0][nr] != value) {
         mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr]);
 #endif
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
@@ -199,7 +203,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->IBAT[1][nr] = (env->IBAT[1][nr] & 0x0000007B) |
             (env->IBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr]);
 #else
         tlb_flush(env_cpu(env));
 #endif
@@ -224,7 +228,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
          */
         mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr]);
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         env->DBAT[0][nr] = (value & 0x00001FFFUL) |
@@ -232,7 +236,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->DBAT[1][nr] = (env->DBAT[1][nr] & 0x0000007B) |
             (env->DBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr]);
 #else
         tlb_flush(env_cpu(env));
 #endif
