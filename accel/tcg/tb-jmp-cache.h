@@ -12,7 +12,14 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
-#define TB_JMP_CACHE_BITS 12
+/*
+ * 4096 entries (the upstream default) thrash badly under a Mac OS X guest:
+ * a game's hot code covers 100k+ translation blocks, so most indirect
+ * branches -- and PowerPC returns through blr are indirect -- miss the
+ * cache and fall back to the (much slower) hash table.  64K entries cost
+ * 1 MB per vCPU and turn most of those misses into hits.
+ */
+#define TB_JMP_CACHE_BITS 16
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
@@ -24,9 +31,17 @@
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
+    /*
+     * Emptying the cache means bumping this counter: an entry counts only
+     * while its own gen matches.  Clearing 64K entries outright on every
+     * TLB flush would cost far more than the cache saves, and a 32-bit
+     * hash MMU guest flushes constantly.
+     */
+    uint32_t gen;
     struct {
         TranslationBlock *tb;
         vaddr pc;
+        uint32_t gen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
