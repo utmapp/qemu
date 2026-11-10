@@ -294,21 +294,29 @@ static void hda_audio_input_cb(void *opaque, int avail)
 }
 
 /*
- * No catch-up after a stalled main loop.
+ * Bounded catch-up after a stalled main loop.
  *
  * The output timer takes guest audio by the clock. When the main loop stalls
  * for S ms (virgl, or a Mac with every core busy), the backend keeps playing
- * from its own ring, and the next timer runs took the whole S of guest audio
- * at once, then the sync corrections pulled faster still. The guest saw its
- * DMA position jump by S and under-ran unless its own buffer was larger.
+ * from its own ring, and the next timer runs take the S of guest audio that
+ * is owed. That is right while the ring here can hold it. After a longer
+ * stall it cannot: the guest saw its DMA position jump and under-ran unless
+ * its own buffer was larger, and the sync corrections pulled faster still.
  *
  * Once the stream has run for HDA_PACE_PRIME, the guest's audio is taken at
- * most 1/32 faster than real time plus a burst of B_SIZE / 8; a debt beyond
- * that is forgiven (the guest's clock pauses during a stall) and the
- * backend's ring covers the stall. pace=off restores the old behaviour.
+ * most 1/32 faster than real time plus a burst of HDA_PACE_BURST, the whole
+ * ring. A debt beyond the burst is forgiven down to HDA_PACE_RESUME (the
+ * guest's clock pauses during the stall) and the backend's ring covers the
+ * stall. pace=off restores the old behaviour.
  * Based on OmacVM's qemu-hda-no-catch-up.patch (MIT).
+ *
+ * The burst must not be smaller than a stall that comes often. Forgiven time
+ * comes back only at 1/32, so a main loop that is late by more than the burst
+ * over and over (a frame of virgl work, coalesced timers) plays the guest's
+ * audio slow.
  */
-#define HDA_PACE_BURST (B_SIZE / 8)
+#define HDA_PACE_BURST B_SIZE
+#define HDA_PACE_RESUME (B_SIZE / 8)
 #define HDA_PACE_PRIME (250 * SCALE_MS)
 
 static int64_t hda_audio_output_pace(HDAAudioStream *st, int64_t now,
@@ -334,9 +342,10 @@ static int64_t hda_audio_output_pace(HDAAudioStream *st, int64_t now,
     st->pace_ns = now;
     st->budget = MIN(st->budget, (int64_t)HDA_PACE_BURST);
     if (wanted - st->wpos > (int64_t)HDA_PACE_BURST) {
-        int64_t excess = wanted - st->wpos - HDA_PACE_BURST;
+        int64_t excess = wanted - st->wpos - HDA_PACE_RESUME;
 
         st->buft_start += muldiv64(excess, NANOSECONDS_PER_SECOND, bps);
+        st->budget = MIN(st->budget, (int64_t)HDA_PACE_RESUME);
         trace_hda_audio_pace_forgive(st->node->name, excess);
     }
     return MIN(to_transfer, st->budget & -4);
