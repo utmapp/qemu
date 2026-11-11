@@ -7282,6 +7282,15 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
 #if !defined(CONFIG_USER_ONLY)
     env->nip = env->hreset_vector | env->excp_prefix;
 
+    /*
+     * The BATs live outside env->spr[], so the loop over the SPR defaults
+     * below does not touch them. Clear them here, otherwise the mappings
+     * of the previous boot are still valid when the firmware turns
+     * translation back on after a guest-initiated reset.
+     */
+    memset(env->IBAT, 0, sizeof(env->IBAT));
+    memset(env->DBAT, 0, sizeof(env->DBAT));
+
     if (tcg_enabled()) {
         cpu_breakpoint_remove_all(cs, BP_CPU);
         cpu_watchpoint_remove_all(cs, BP_CPU);
