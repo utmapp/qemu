@@ -1645,6 +1645,23 @@ static void usbredir_hello(void *priv, struct usb_redir_hello_header *h)
     }
 }
 
+static bool usbredir_has_superspeed_endpoints(USBRedirDevice *dev)
+{
+    int i;
+
+    if (!usbredirparser_peer_has_cap(dev->parser,
+                                     usb_redir_cap_ep_info_max_packet_size)) {
+        return false;
+    }
+    for (i = 0; i < MAX_ENDPOINTS; i++) {
+        if (dev->endpoint[i].type == usb_redir_type_bulk &&
+            dev->endpoint[i].max_packet_size == 1024) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void usbredir_device_connect(void *priv,
     struct usb_redir_device_connect_header *device_connect)
 {
@@ -1677,8 +1694,18 @@ static void usbredir_device_connect(void *priv,
         dev->dev.speed = USB_SPEED_SUPER;
         break;
     default:
-        speed = "unknown speed";
-        dev->dev.speed = USB_SPEED_FULL;
+        /*
+         * The protocol has no speed above super, and usbredirhost sends
+         * unknown for one (SuperSpeedPlus). Only a SuperSpeed link has
+         * bulk endpoints of 1024 bytes.
+         */
+        if (usbredir_has_superspeed_endpoints(dev)) {
+            speed = "unknown speed, taken for super speed";
+            dev->dev.speed = USB_SPEED_SUPER;
+        } else {
+            speed = "unknown speed";
+            dev->dev.speed = USB_SPEED_FULL;
+        }
     }
 
     if (usbredirparser_peer_has_cap(dev->parser,
