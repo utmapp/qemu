@@ -292,6 +292,8 @@ struct XHCIEPContext {
     /* iso xfer scheduling */
     unsigned int interval;
     int64_t mfindex_last;
+    /* iso: when the ring was found empty, negative while it has transfers */
+    int64_t mfindex_idle;
     QEMUTimer *kick_timer;
 };
 
@@ -1115,6 +1117,7 @@ static void xhci_init_epctx(XHCIEPContext *epctx,
     dequeue = xhci_addr64(ctx[2] & ~0xf, ctx[3]);
 
     epctx->type = (ctx[1] >> EP_TYPE_SHIFT) & EP_TYPE_MASK;
+    epctx->mfindex_idle = 0;
     epctx->pctx = pctx;
     epctx->max_psize = ctx[1]>>16;
     epctx->max_psize *= 1+((ctx[1]>>8)&0xff);
@@ -1244,6 +1247,10 @@ static int xhci_ep_nuke_xfers(XHCIState *xhci, unsigned int slotid,
     }
 
     epctx = slot->eps[epid-1];
+
+    /* no transfer is left to kick, and the next one does not follow these */
+    timer_del(epctx->kick_timer);
+    epctx->mfindex_idle = epctx->mfindex_last;
 
     for (;;) {
         xfer = QTAILQ_FIRST(&epctx->transfers);
@@ -1754,12 +1761,22 @@ static void xhci_calc_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
     if (xfer->trbs[0].control & TRB_TR_SIA) {
         uint64_t asap = ((mfindex + epctx->interval - 1) &
                          ~(epctx->interval-1));
+        /*
+         * The transfers of a busy endpoint are one interval apart, so this
+         * one follows the last however late we get to it: starting over
+         * from now would drop the time we are behind for good. Once the
+         * ring was empty, the guest has a few intervals from then to go on
+         * without a gap.
+         */
         if (asap >= epctx->mfindex_last &&
-            asap <= epctx->mfindex_last + epctx->interval * 4) {
+            (epctx->mfindex_idle < 0 ||
+             asap <= MAX(epctx->mfindex_last, epctx->mfindex_idle) +
+                     epctx->interval * 4)) {
             xfer->mfindex_kick = epctx->mfindex_last + epctx->interval;
         } else {
             xfer->mfindex_kick = asap;
         }
+        epctx->mfindex_idle = -1;
     } else {
         xfer->mfindex_kick = ((xfer->trbs[0].control >> TRB_TR_FRAMEID_SHIFT)
                               & TRB_TR_FRAMEID_MASK) << 3;
@@ -1971,6 +1988,9 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
             if (epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN) {
                 /* 4.10.3.1 */
                 XHCIEvent ev = { ER_TRANSFER };
+                if (epctx->mfindex_idle < 0) {
+                    epctx->mfindex_idle = xhci_mfindex_get(xhci);
+                }
                 ev.ccode  = epctx->type == ET_ISO_IN ?
                     CC_RING_OVERRUN : CC_RING_UNDERRUN;
                 ev.slotid = epctx->slotid;
@@ -2024,6 +2044,11 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
         }
         if (count++ > TRANSFER_LIMIT) {
             trace_usb_xhci_enforced_limit("transfers");
+            if (epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN) {
+                /* still behind: go on once the main loop had its turn */
+                timer_mod(epctx->kick_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            }
             break;
         }
     }
