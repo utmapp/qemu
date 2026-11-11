@@ -2002,10 +2002,12 @@ static void usbredir_control_packet(void *priv, uint64_t id,
     DPRINTF("ctrl-in status %d len %d id %"PRIu64"\n", control_packet->status,
             len, id);
 
-    /* Fix up USB-3 ep0 maxpacket size to allow superspeed connected devices
-     * to work redirected to a not superspeed capable hcd */
-    if (dev->dev.speed == USB_SPEED_SUPER &&
-            !((dev->dev.port->speedmask & USB_SPEED_MASK_SUPER)) &&
+    /*
+     * Fix up USB-3 ep0 maxpacket size to allow superspeed connected devices
+     * to work when they are not attached at superspeed: redirected to a not
+     * superspeed capable hcd, or announced at a speed we do not know.
+     */
+    if (dev->dev.speed != USB_SPEED_SUPER &&
             control_packet->requesttype == 0x80 &&
             control_packet->request == 6 &&
             control_packet->value == 0x100 && control_packet->index == 0 &&
