@@ -142,13 +142,17 @@ static void edid_fill_modes(uint8_t *edid, uint8_t *xtra3, uint8_t *dta,
 
         if (mode->byte) {
             edid[mode->byte] |= (1 << mode->bit);
-        } else if (std < 54) {
-            rc = edid_std_mode(edid + std, mode->xres, mode->yres);
-            if (rc == 0) {
-                std += 2;
+        } else {
+            if (std < 54) {
+                rc = edid_std_mode(edid + std, mode->xres, mode->yres);
+                if (rc == 0) {
+                    std += 2;
+                }
             }
-        } else if (mode->xtra3 && xtra3) {
-            xtra3[mode->xtra3] |= (1 << mode->bit);
+            /* a mode with a standard timing too: not every guest reads those */
+            if (mode->xtra3 && xtra3) {
+                xtra3[mode->xtra3] |= (1 << mode->bit);
+            }
         }
 
         if (dta && mode->dta) {
