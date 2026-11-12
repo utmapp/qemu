@@ -251,12 +251,62 @@ static void pmac_ide_flush(DBDMA_io *io)
     }
 }
 
+/*
+ * Whether the selected drive is busy only because a PIO request (a disk
+ * sector, a CD sector, a flush) is still out on the host, as opposed to
+ * a DMA transfer or a reset the guest itself is holding.
+ */
+static bool pmac_ide_pio_pending(MACIOIDEState *d)
+{
+    IDEState *s = ide_bus_active_if(&d->bus);
+    IDEBufferedRequest *req;
+
+    if (!s->blk || !(s->status & BUSY_STAT) || d->dma_active ||
+        s->bus->dma->aiocb) {
+        return false;
+    }
+    if (s->pio_aiocb) {
+        return true;
+    }
+    QLIST_FOREACH(req, &s->buffered_requests, list) {
+        if (!req->orphaned) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Answer a status read only once a PIO request in flight has finished.
+ *
+ * Firmware polls BSY with a deadline on the timebase, which follows the
+ * host's clock: OpenBIOS gives each sector 5 s (5000 x udelay(1000) in
+ * ob_ide_wait_stat), then carries on as if the drive had answered.  A host
+ * that stalls on one read for longer than that -- it happens under load,
+ * e.g. right after a guest wrote gigabytes and restarted -- left BootX with
+ * a failed read of a drive still busy, and it spun forever on the grey
+ * Apple (reproduced by throttling reads mid-boot).  A real drive answers
+ * a firmware read in milliseconds, so present the host's latency as that:
+ * wait for the request here instead of letting the guest's deadline run.
+ * DMA completes by interrupt and is left alone.
+ */
+static void pmac_ide_wait_pio(MACIOIDEState *d)
+{
+    if (pmac_ide_pio_pending(d)) {
+        AIO_WAIT_WHILE(qemu_get_aio_context(), pmac_ide_pio_pending(d));
+    }
+}
+
 /* PowerMac IDE memory IO */
 static uint64_t pmac_ide_read(void *opaque, hwaddr addr, unsigned size)
 {
     MACIOIDEState *d = opaque;
     uint64_t retval = 0xffffffff;
     int reg = addr >> 4;
+
+    if (reg == 0x7 || reg == 0x8 || reg == 0x16) {
+        pmac_ide_wait_pio(d);
+    }
 
     switch (reg) {
     case 0x0:
@@ -369,6 +419,7 @@ static void macio_ide_reset(DeviceState *dev)
     MACIOIDEState *d = MACIO_IDE(dev);
 
     ide_bus_reset(&d->bus);
+    d->dma_active = false;
 }
 
 static int ide_nop_int(const IDEDMA *dma, bool is_write)
