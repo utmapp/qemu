@@ -43,6 +43,7 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    uint32_t abs_scale;
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -720,6 +721,7 @@ static void usb_hid_initfn(USBDevice *dev, int kind,
     usb_desc_init(dev);
     us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
     hid_init(&us->hid, kind, usb_hid_changed);
+    us->hid.abs_scale = us->abs_scale;
     if (us->display && us->hid.s) {
         qemu_input_handler_bind(us->hid.s, us->display, us->head, NULL);
     }
@@ -797,6 +799,8 @@ static const Property usb_tablet_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
+        /* 1/10000 units, 0 = off; 11775 for Mac OS X 10.4 (see hid.h) */
+        DEFINE_PROP_UINT32("abs-scale", USBHIDState, abs_scale, 0),
 };
 
 static void usb_tablet_class_initfn(ObjectClass *klass, void *data)

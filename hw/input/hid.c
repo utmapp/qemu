@@ -135,14 +135,22 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
         }
         break;
 
-    case INPUT_EVENT_KIND_ABS:
+    case INPUT_EVENT_KIND_ABS: {
+        int32_t v;
+
         move = evt->u.abs.data;
+        v = move->value;
+        if (hs->abs_scale > 10000) {
+            const int32_t c = (INPUT_EVENT_ABS_MIN + INPUT_EVENT_ABS_MAX) / 2;
+            v = c + (int32_t)(((int64_t)(v - c) * 10000) / hs->abs_scale);
+        }
         if (move->axis == INPUT_AXIS_X) {
-            e->xdx = move->value;
+            e->xdx = v;
         } else if (move->axis == INPUT_AXIS_Y) {
-            e->ydy = move->value;
+            e->ydy = v;
         }
         break;
+    }
 
     case INPUT_EVENT_KIND_BTN:
         btn = evt->u.btn.data;
