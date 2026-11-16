@@ -144,6 +144,8 @@ static void mouse_motion(SpiceMouseInstance *sin, int dx, int dy, int dz,
                          uint32_t buttons_state)
 {
     QemuSpicePointer *pointer = container_of(sin, QemuSpicePointer, mouse);
+    /* buttons to the device that gets the motion (see input.c) */
+    qemu_input_handler_activate_kind(INPUT_EVENT_MASK_REL);
     spice_update_buttons(pointer, dz, buttons_state);
     qemu_input_queue_rel(NULL, INPUT_AXIS_X, dx);
     qemu_input_queue_rel(NULL, INPUT_AXIS_Y, dy);
@@ -185,6 +187,8 @@ static void tablet_position(SpiceTabletInstance* sin, int x, int y,
 {
     QemuSpicePointer *pointer = container_of(sin, QemuSpicePointer, tablet);
 
+    /* buttons to the device that gets the motion (see input.c) */
+    qemu_input_handler_activate_kind(INPUT_EVENT_MASK_ABS);
     spice_update_buttons(pointer, 0, buttons_state);
     qemu_input_queue_abs(NULL, INPUT_AXIS_X, x, 0, pointer->width);
     qemu_input_queue_abs(NULL, INPUT_AXIS_Y, y, 0, pointer->height);

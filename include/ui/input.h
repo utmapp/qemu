@@ -33,6 +33,7 @@ QemuInputHandlerState *qemu_input_handler_register(DeviceState *dev,
                                             const QemuInputHandler *handler);
 void qemu_input_handler_activate(QemuInputHandlerState *s);
 void qemu_input_handler_deactivate(QemuInputHandlerState *s);
+void qemu_input_handler_activate_kind(uint32_t mask);
 void qemu_input_handler_unregister(QemuInputHandlerState *s);
 void qemu_input_handler_bind(QemuInputHandlerState *s,
                              const char *device_id, int head,
