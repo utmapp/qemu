@@ -2188,7 +2188,10 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env, const void *v_tb_
           "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
 
         // We also use x26/x27 for temporary values, and x28 as our bytecode poitner.
-        "x25", "x26", "x27", "x28", "cc", "memory"
+        "x25", "x26", "x27", "x28", "cc", "memory",
+
+        // LR (x30) also used by blr instruction.
+        "x30"
     );
 
     return return_value;
