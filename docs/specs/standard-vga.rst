@@ -101,9 +101,10 @@ Likewise applies to the pci variant only for obvious reasons.
 ``0800``
   ID, reads ``0x50564d43`` (``'PVMC'``).
 ``0804``
-  version, reads 1.
+  version, reads 2 (1: cursor only; 2 adds the GL stream registers below).
 ``0808``
-  capabilities. Bit 0: hardware cursor.
+  capabilities. Bit 0: hardware cursor. Bit 1: GL stream available (the
+  PassthroughOpenGL in-process executor library was loaded).
 ``080c``
   status. Bit 1 is set when the last cursor definition was rejected;
   bits 8-15 hold the reason (1: size, 2: hotspot).
@@ -123,3 +124,36 @@ Likewise applies to the pci variant only for obvious reasons.
 ``0824``
   cursor slot offset in VRAM (read only). The slot is the last 16 KiB of
   VRAM; the guest must not use it for the framebuffer.
+``0828`` - ``084c``
+  GL stream (version 2, capabilities bit 1; all read 0 otherwise): ring
+  offset, ring size, ring head (rw), ring tail, reply offset, reply size,
+  reply length, doorbell (wo), GL status (write 1 to clear; bits: 0 bad
+  head, 1 bad reply expect, 2 write failed, 3 short reply, 4 executor open
+  failed, 5 no GL, 6 bad reply destination), reply expect (rw, exact reply bytes to read). The
+  1 MiB command ring and 4 MiB reply area sit in VRAM directly below the
+  cursor slot and must not be used for the framebuffer. A doorbell
+  forwards ring bytes tail..head to the executor, then reads reply expect
+  bytes into the reply area. A doorbell with reply expect 0 only queues
+  the ring bytes for a host worker thread and returns; one with reply
+  expect > 0 first waits for the queue to drain. The GL stream needs at
+  least 16 MiB of VRAM.
+``0850`` - ``085c``
+  Present destination (version 2). Reply destination offset (VRAM byte
+  offset; 0 is valid), destination pitch (bytes per row), source row
+  bytes (width * 4), flags (bit 0: byte-swap every 32bit pixel, BGRA8 to
+  big-endian xRGB; bit 1: source rows are bottom-up; bit 2: convert BGRA8
+  to big-endian RGB555, 0RRRRRGGGGGBBBBB, bit 0 then ignored, destination
+  rows are source row bytes / 2 and need only 2-byte alignment, and the
+  bounds checks use that size; bit 3: present, i.e. store the reply at the
+  destination instead of the reply area). With bit 3 set and reply expect > 0 the doorbell stores the reply row by row at
+  destination + row * pitch and marks it dirty; reply expect must be a
+  multiple of the row bytes, the rows 4-byte aligned and the rectangle
+  must end below the ring offset, else GL status bit 6 is set and the reply
+  is dropped. The 16 byte reply header read must use destination 0.
+``0860``
+  Stream reset (version 2, write only). Any value stops the host worker,
+  closes the executor stream (the host frees that client's contexts),
+  resets the ring head and tail, the reply registers and GL status. The
+  stream reopens on the next doorbell. A guest GL process writes it before
+  its first DG_HELLO, because the host rejects a second HELLO on one
+  stream; only one GL application can run at a time.

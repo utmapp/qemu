@@ -38,9 +38,21 @@
 #include "qom/object.h"
 #include "hw/acpi/acpi_aml_interface.h"
 #include "qemu/bswap.h"
+#include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "qemu/log.h"
 #include "system/reset.h"
 #include "trace.h"
+#ifdef __APPLE__
+#include "qemu/sockets.h"
+#include <netinet/tcp.h>
+/* The transport header is all static; only the in-process path is used here */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#include "vmware_passthrough_opengl_transport.h"
+#pragma GCC diagnostic pop
+#endif
 
 enum vga_pci_flags {
     PCI_VGA_FLAG_ENABLE_MMIO = 1,
@@ -54,13 +66,91 @@ enum vga_pci_flags {
  * built from QemuMacDrivers QemuVGADriver). Opt-in through the
  * "mac-accel" property; documented in docs/specs/standard-vga.rst.
  * Version 1 provides a hardware cursor only.
+ *
+ * Version 2 adds a byte-stream transport to VirtualIntelMac's in-process
+ * PassthroughOpenGL host executor (VIMGLInprocessAPI, library from env
+ * VIM_PASSTHROUGH_OPENGL_INPROCESS_LIBRARY), for a guest OpenGL/RAVE library.
+ * It is advertised with CAPS bit 1 only when the library loads; otherwise the
+ * bit stays clear (one warning at realize) and the GL registers read 0.
+ *
+ * VRAM layout, from the top (all reserved from the guest's framebuffer):
+ *   vram_size - 0x4000                cursor slot (v1)
+ *   ... - PVMAC_GL_REPLY_SIZE         reply area (4 MiB; device writes,
+ *                                     guest reads; was 1 MiB before E4)
+ *   ... - PVMAC_GL_RING_SIZE          command ring (guest writes, device reads)
+ * Everything from the ring offset up is reserved; the guest framebuffer and
+ * any REPLY_DEST rectangle must lie below RING_OFFSET. VRAM must be at least
+ * PVMAC_GL_MIN_VRAM (16 MiB) for the GL stream to be offered.
+ *
+ * Registers (32-bit LE at BAR2 + 0x800 + offset):
+ *   0x00 ID          'PVMC'                   0x04 VERSION   2
+ *   0x08 CAPS        bit0 cursor, bit1 GL     0x0c STATUS    (v1 cursor errors)
+ *   0x10-0x24        cursor, see v1
+ *   0x28 RING_OFFSET  ro  VRAM byte offset of the command ring
+ *   0x2c RING_SIZE    ro  ring bytes
+ *   0x30 RING_HEAD    rw  guest write index, < RING_SIZE
+ *   0x34 RING_TAIL    ro  device read index, == HEAD after a doorbell
+ *   0x38 REPLY_OFFSET ro  VRAM byte offset of the reply area
+ *   0x3c REPLY_SIZE   ro  reply area bytes
+ *   0x40 REPLY_LEN    ro  bytes the last doorbell stored at REPLY_OFFSET
+ *   0x44 DOORBELL     wo  any value: consume TAIL..HEAD, then fetch reply
+ *   0x48 GL_STATUS    rw1c error bits, PVMAC_GL_ERR_*
+ *   0x4c REPLY_EXPECT rw  exact reply bytes to read on the next doorbell
+ *                          (<= REPLY_SIZE); 0 = no reply. The executor read
+ *                          blocks, so the guest must name the exact span.
+ *   0x50 REPLY_DEST   rw  VRAM byte offset of a destination rectangle for
+ *                          the reply (used only with REPLY_FLAGS bit3;
+ *                          0 is a valid offset)
+ *   0x54 REPLY_PITCH  rw  bytes per destination row
+ *   0x58 REPLY_ROW_BYTES rw payload bytes per source row (width * 4)
+ *   0x5c REPLY_FLAGS  rw  bit0: byte-swap each 32-bit pixel (BGRA8 LE source
+ *                          -> big-endian xRGB, as in the r300 path);
+ *                          bit1: source rows are bottom-up (flip vertically);
+ *                          bit2: convert each BGRA8 LE pixel to big-endian
+ *                          RGB555 (0RRRRRGGGGGBBBBB); bit0 is then ignored,
+ *                          the destination row is ROW_BYTES / 2 bytes (dest
+ *                          and pitch need only 2-byte alignment) and the
+ *                          bounds checks use that size
+ *   0x60 STREAM_RESET wo  any value: stop the worker, close the executor
+ *                          stream (the host frees that client's contexts),
+ *                          reset ring head/tail, reply state and GL_STATUS.
+ *                          The stream reopens lazily on the next doorbell.
+ *                          A guest GL process writes it before its first
+ *                          DG_HELLO (the host rejects a second HELLO on one
+ *                          stream). One GL app at a time.
+ * RING_HEAD/TAIL are byte indexes; a doorbell handles the wrap.
+ *
+ * Present (E4): with REPLY_FLAGS bit3 (PRESENT) and REPLY_EXPECT > 0 the doorbell
+ * streams the reply row by row into VRAM + DEST + row * PITCH instead of the
+ * reply area (REPLY_LEN then counts payload bytes written). EXPECT must be a
+ * multiple of ROW_BYTES; ROW_BYTES must be a multiple of 4 and <= PITCH and
+ * <= 64 KiB; the rectangle must end at or below RING_OFFSET. Any violation
+ * sets GL_STATUS PVMAC_GL_ERR_DEST, the commands still run, and the reply is
+ * read and dropped. The 16-byte DGReply header read needs bit3 clear.
+ * The written span is marked dirty so the display refreshes.
+ *
+ * Threading (E5): a worker thread owns writes to the executor. A doorbell
+ * with REPLY_EXPECT == 0 copies TAIL..HEAD into a queue, advances TAIL and
+ * returns. A doorbell with REPLY_EXPECT > 0 first waits (BQL held, the
+ * worker never takes the BQL) until the queue is drained, then writes and
+ * reads synchronously. TODO: drop the BQL during that wait.
  */
 #define PVMAC_OFFSET            0x800
 #define PVMAC_SIZE              0x800
 #define PVMAC_ID_VALUE          0x50564d43  /* 'PVMC' */
-#define PVMAC_VERSION_VALUE     1
+#define PVMAC_VERSION_VALUE     2
 #define PVMAC_CAP_HWCURSOR      (1u << 0)
 #define PVMAC_CURSOR_SLOT_SIZE  0x4000      /* 64 * 64 * 4, top of VRAM */
+#define PVMAC_CAP_GL_STREAM     (1u << 1)
+#define PVMAC_GL_RING_SIZE      (1 * MiB)
+#define PVMAC_GL_REPLY_SIZE     (4 * MiB)
+#define PVMAC_GL_MIN_VRAM       (16 * MiB)  /* leave room for a framebuffer */
+#define PVMAC_GL_MAX_ROW_BYTES  (64 * KiB)
+#define PVMAC_GL_QUEUE_MAX      (32 * MiB)  /* backpressure on the vCPU */
+#define PVMAC_REPLY_FLAG_SWAP32 (1u << 0)
+#define PVMAC_REPLY_FLAG_FLIP   (1u << 1)
+#define PVMAC_REPLY_FLAG_RGB555 (1u << 2)
+#define PVMAC_REPLY_FLAG_PRESENT (1u << 3) /* write the reply rows at REPLY_DEST (0 is a valid offset) */
 
 enum {
     PVMAC_REG_ID         = 0x00,
@@ -73,7 +163,30 @@ enum {
     PVMAC_REG_CUR_SIZE   = 0x1c,
     PVMAC_REG_CUR_DEFINE = 0x20,
     PVMAC_REG_CUR_OFFSET = 0x24,
+    PVMAC_REG_RING_OFFSET   = 0x28,
+    PVMAC_REG_RING_SIZE     = 0x2c,
+    PVMAC_REG_RING_HEAD     = 0x30,
+    PVMAC_REG_RING_TAIL     = 0x34,
+    PVMAC_REG_REPLY_OFFSET  = 0x38,
+    PVMAC_REG_REPLY_SIZE    = 0x3c,
+    PVMAC_REG_REPLY_LEN     = 0x40,
+    PVMAC_REG_DOORBELL      = 0x44,
+    PVMAC_REG_GL_STATUS     = 0x48,
+    PVMAC_REG_REPLY_EXPECT  = 0x4c,
+    PVMAC_REG_REPLY_DEST    = 0x50,
+    PVMAC_REG_REPLY_PITCH   = 0x54,
+    PVMAC_REG_REPLY_ROW_BYTES = 0x58,
+    PVMAC_REG_REPLY_FLAGS   = 0x5c,
+    PVMAC_REG_STREAM_RESET  = 0x60,
 };
+
+#define PVMAC_GL_ERR_BAD_HEAD   (1u << 0)
+#define PVMAC_GL_ERR_BAD_EXPECT (1u << 1)
+#define PVMAC_GL_ERR_IO         (1u << 2)   /* write to the executor failed */
+#define PVMAC_GL_ERR_REPLY      (1u << 3)   /* reply short or read failed */
+#define PVMAC_GL_ERR_OPEN       (1u << 4)   /* executor endpoint won't open */
+#define PVMAC_GL_ERR_NO_GL      (1u << 5)   /* doorbell without CAPS bit 1 */
+#define PVMAC_GL_ERR_DEST       (1u << 6)   /* bad REPLY_DEST rectangle */
 
 #define PVMAC_CUR_CTRL_VISIBLE  (1u << 0)
 #define PVMAC_STATUS_ERROR      (1u << 1)
@@ -87,7 +200,37 @@ typedef struct PVMACState {
     uint32_t cur_hot;
     uint32_t cur_size;
     bool cur_defined;
+    /* v2 GL transport (migrated in the vga/mac-accel-gl subsection) */
+    uint32_t ring_head;
+    uint32_t ring_tail;
+    uint32_t reply_len;
+    uint32_t reply_expect;
+    uint32_t gl_status;
+    /* present destination: set before each present, not migrated */
+    uint32_t reply_dest;
+    uint32_t reply_pitch;
+    uint32_t reply_row_bytes;
+    uint32_t reply_flags;
 } PVMACState;
+
+#ifdef __APPLE__
+typedef struct PVMACGLChunk {
+    uint8_t *data;
+    uint32_t len;
+} PVMACGLChunk;
+
+typedef struct PVMACGLWorker {
+    QemuThread thread;
+    QemuMutex lock;
+    QemuCond work_cond;         /* worker waits for chunks */
+    QemuCond idle_cond;         /* vCPU waits for drain */
+    GQueue queue;               /* of PVMACGLChunk * */
+    uint64_t queued_bytes;      /* queued + in flight */
+    bool busy;
+    bool quit;
+    bool running;
+} PVMACGLWorker;
+#endif
 
 struct PCIVGAState {
     PCIDevice dev;
@@ -98,6 +241,11 @@ struct PCIVGAState {
     MemoryRegion mrs[5];
     uint8_t edid[384];
     PVMACState pvmac;
+    bool gl_available;          /* executor library loaded; not migrated */
+#ifdef __APPLE__
+    struct VIMPassthroughOpenGLStream gl_stream;  /* opened on first doorbell */
+    PVMACGLWorker gl_worker;                      /* started on first doorbell */
+#endif
 };
 
 #define TYPE_PCI_VGA "pci-vga"
@@ -139,6 +287,57 @@ static const VMStateDescription vmstate_vga_pci_mac_accel = {
     }
 };
 
+static bool vga_pci_mac_accel_gl_needed(void *opaque)
+{
+    PCIVGAState *d = opaque;
+
+    return vga_pci_mac_accel_needed(d) && d->gl_available;
+}
+
+static int vga_pci_mac_accel_gl_post_load(void *opaque, int version_id)
+{
+    PCIVGAState *d = opaque;
+
+    /* The executor endpoint is not migrated; never trust incoming indexes */
+    if (d->pvmac.ring_head >= PVMAC_GL_RING_SIZE ||
+        d->pvmac.ring_tail >= PVMAC_GL_RING_SIZE) {
+        d->pvmac.ring_head = d->pvmac.ring_tail = 0;
+    }
+    if (d->pvmac.reply_len > PVMAC_GL_REPLY_SIZE) {
+        d->pvmac.reply_len = 0;
+    }
+    if (d->pvmac.reply_expect > PVMAC_GL_REPLY_SIZE) {
+        d->pvmac.reply_expect = 0;
+    }
+    return 0;
+}
+
+static void pvmac_gl_flush(PCIVGAState *d);
+
+static int vga_pci_mac_accel_gl_pre_save(void *opaque)
+{
+    /* Queued spans are not migrated: drain them so TAIL is truthful */
+    pvmac_gl_flush(opaque);
+    return 0;
+}
+
+static const VMStateDescription vmstate_vga_pci_mac_accel_gl = {
+    .name = "vga/mac-accel-gl",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vga_pci_mac_accel_gl_needed,
+    .pre_save = vga_pci_mac_accel_gl_pre_save,
+    .post_load = vga_pci_mac_accel_gl_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(pvmac.ring_head, PCIVGAState),
+        VMSTATE_UINT32(pvmac.ring_tail, PCIVGAState),
+        VMSTATE_UINT32(pvmac.reply_len, PCIVGAState),
+        VMSTATE_UINT32(pvmac.reply_expect, PCIVGAState),
+        VMSTATE_UINT32(pvmac.gl_status, PCIVGAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_vga_pci = {
     .name = "vga",
     .version_id = 2,
@@ -150,6 +349,7 @@ static const VMStateDescription vmstate_vga_pci = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_vga_pci_mac_accel,
+        &vmstate_vga_pci_mac_accel_gl,
         NULL
     }
 };
@@ -294,6 +494,404 @@ static uint32_t pvmac_cursor_offset(PCIVGAState *d)
     return d->vga.vram_size - PVMAC_CURSOR_SLOT_SIZE;
 }
 
+static uint32_t pvmac_reply_offset(PCIVGAState *d)
+{
+    return pvmac_cursor_offset(d) - PVMAC_GL_REPLY_SIZE;
+}
+
+static uint32_t pvmac_ring_offset(PCIVGAState *d)
+{
+    return pvmac_reply_offset(d) - PVMAC_GL_RING_SIZE;
+}
+
+#ifdef __APPLE__
+/* Write all of buf to the executor; false on error (the data is dropped). */
+static bool pvmac_gl_write_all(PCIVGAState *d, const uint8_t *buf, size_t len)
+{
+    while (len) {
+        ssize_t n = vmsvga_gl_stream_write(d->gl_stream, buf, len);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        buf += n;
+        len -= n;
+    }
+    return true;
+}
+
+/*
+ * Worker thread: the only writer to the executor while chunks are queued.
+ * It never takes the BQL. gl_stream is only replaced by the vCPU thread
+ * while the queue is empty and the worker idle (open before the first
+ * enqueue, close after the worker has been joined).
+ */
+static void *pvmac_gl_worker_fn(void *opaque)
+{
+    PCIVGAState *d = opaque;
+    PVMACGLWorker *w = &d->gl_worker;
+
+    qemu_mutex_lock(&w->lock);
+    for (;;) {
+        PVMACGLChunk *c;
+        bool ok;
+
+        while (g_queue_is_empty(&w->queue) && !w->quit) {
+            qemu_cond_wait(&w->work_cond, &w->lock);
+        }
+        if (w->quit) {
+            break;
+        }
+        c = g_queue_pop_head(&w->queue);
+        w->busy = true;
+        qemu_mutex_unlock(&w->lock);
+
+        ok = pvmac_gl_write_all(d, c->data, c->len);
+        if (!ok) {
+            qatomic_or(&d->pvmac.gl_status, PVMAC_GL_ERR_IO);
+        }
+
+        qemu_mutex_lock(&w->lock);
+        w->busy = false;
+        w->queued_bytes -= c->len;
+        g_free(c->data);
+        g_free(c);
+        qemu_cond_broadcast(&w->idle_cond);
+    }
+    qemu_mutex_unlock(&w->lock);
+    return NULL;
+}
+
+static void pvmac_gl_worker_start(PCIVGAState *d)
+{
+    PVMACGLWorker *w = &d->gl_worker;
+
+    if (w->running) {
+        return;
+    }
+    qemu_mutex_init(&w->lock);
+    qemu_cond_init(&w->work_cond);
+    qemu_cond_init(&w->idle_cond);
+    g_queue_init(&w->queue);
+    w->queued_bytes = 0;
+    w->busy = false;
+    w->quit = false;
+    qemu_thread_create(&w->thread, "pvmac-gl", pvmac_gl_worker_fn, d,
+                       QEMU_THREAD_JOINABLE);
+    w->running = true;
+}
+
+/* Wait (BQL held; TODO: unlock it) until everything queued is written. */
+static void pvmac_gl_flush(PCIVGAState *d)
+{
+    PVMACGLWorker *w = &d->gl_worker;
+
+    if (!w->running) {
+        return;
+    }
+    qemu_mutex_lock(&w->lock);
+    trace_vga_pvmac_gl_flush(w->queued_bytes);
+    while (!g_queue_is_empty(&w->queue) || w->busy) {
+        qemu_cond_wait(&w->idle_cond, &w->lock);
+    }
+    qemu_mutex_unlock(&w->lock);
+}
+
+/* Stop and join the worker (dropping queued spans), close the stream. */
+static void pvmac_gl_close(PCIVGAState *d)
+{
+    PVMACGLWorker *w = &d->gl_worker;
+
+    if (w->running) {
+        PVMACGLChunk *c;
+
+        qemu_mutex_lock(&w->lock);
+        w->quit = true;
+        qemu_cond_broadcast(&w->work_cond);
+        qemu_mutex_unlock(&w->lock);
+        qemu_thread_join(&w->thread);
+        while ((c = g_queue_pop_head(&w->queue))) {
+            g_free(c->data);
+            g_free(c);
+        }
+        qemu_cond_destroy(&w->work_cond);
+        qemu_cond_destroy(&w->idle_cond);
+        qemu_mutex_destroy(&w->lock);
+        w->running = false;
+    }
+    if (vmsvga_gl_stream_valid(d->gl_stream)) {
+        vmsvga_gl_stream_shutdown(d->gl_stream);
+        vmsvga_gl_stream_close(d->gl_stream);
+    }
+    d->gl_stream = (struct VIMPassthroughOpenGLStream){ .fd = -1 };
+}
+
+/* Copy TAIL..HEAD out of the ring into the worker queue. */
+static void pvmac_gl_enqueue(PCIVGAState *d, uint32_t tail, uint32_t pending)
+{
+    PVMACGLWorker *w = &d->gl_worker;
+    const uint8_t *ring = d->vga.vram_ptr + pvmac_ring_offset(d);
+    uint32_t first = MIN(pending, PVMAC_GL_RING_SIZE - tail);
+    PVMACGLChunk *c = g_new(PVMACGLChunk, 1);
+
+    c->data = g_malloc(pending);
+    c->len = pending;
+    memcpy(c->data, ring + tail, first);
+    if (pending > first) {
+        memcpy(c->data + first, ring, pending - first);
+    }
+    qemu_mutex_lock(&w->lock);
+    while (w->queued_bytes > PVMAC_GL_QUEUE_MAX) {
+        qemu_cond_wait(&w->idle_cond, &w->lock);
+    }
+    g_queue_push_tail(&w->queue, c);
+    w->queued_bytes += pending;
+    trace_vga_pvmac_gl_enqueue(pending, w->queued_bytes);
+    qemu_cond_signal(&w->work_cond);
+    qemu_mutex_unlock(&w->lock);
+}
+
+/*
+ * Check the REPLY_DEST rectangle for a reply of "expect" bytes; on success
+ * return the row count in *rows. Every row must end at or below the ring
+ * offset (the reserved area starts there).
+ */
+static bool pvmac_present_valid(PCIVGAState *d, uint32_t expect,
+                                uint32_t *rows)
+{
+    PVMACState *p = &d->pvmac;
+    uint64_t limit = pvmac_ring_offset(d);
+    bool rgb555 = p->reply_flags & PVMAC_REPLY_FLAG_RGB555;
+    uint32_t align = rgb555 ? 1 : 3;
+    uint32_t dst_rb = rgb555 ? p->reply_row_bytes / 2 : p->reply_row_bytes;
+    uint64_t end;
+
+    if (!p->reply_row_bytes || p->reply_row_bytes > PVMAC_GL_MAX_ROW_BYTES ||
+        (p->reply_row_bytes & 3) || p->reply_pitch < dst_rb ||
+        (p->reply_dest & align) || (p->reply_pitch & align) ||
+        expect % p->reply_row_bytes) {
+        return false;
+    }
+    *rows = expect / p->reply_row_bytes;
+    end = (uint64_t)p->reply_dest +
+          (uint64_t)(*rows - 1) * p->reply_pitch + dst_rb;
+    return end <= limit;
+}
+
+/* Stream the reply row by row into the VRAM rectangle (E4). */
+static void pvmac_gl_present(PCIVGAState *d, uint32_t expect)
+{
+    PVMACState *p = &d->pvmac;
+    uint8_t *vram = d->vga.vram_ptr;
+    uint32_t rb = p->reply_row_bytes, rows = 0, row;
+    uint8_t *tmp;
+    bool valid = pvmac_present_valid(d, expect, &rows);
+    uint32_t done = 0;
+    bool rgb555 = p->reply_flags & PVMAC_REPLY_FLAG_RGB555;
+    uint32_t dst_rb = rgb555 ? rb / 2 : rb;
+
+    trace_vga_pvmac_gl_present(p->reply_dest, p->reply_pitch, rb, rows,
+                               p->reply_flags, valid);
+    if (!valid) {
+        /* consume and drop the reply so the stream stays in sync */
+        p->gl_status |= PVMAC_GL_ERR_DEST;
+        VIMGLInprocessReadExpected(vim_passthrough_opengl_inprocess,
+                                   d->gl_stream.memory,
+                                   vram + pvmac_reply_offset(d), expect);
+        return;
+    }
+    tmp = g_malloc(rb);
+    for (row = 0; row < rows; row++) {
+        uint32_t dst_row = (p->reply_flags & PVMAC_REPLY_FLAG_FLIP) ?
+                           rows - 1 - row : row;
+        uint8_t *dst = vram + p->reply_dest + (uint64_t)dst_row * p->reply_pitch;
+        ssize_t n = VIMGLInprocessReadExpected(vim_passthrough_opengl_inprocess,
+                                               d->gl_stream.memory, tmp, rb);
+
+        if (n != rb) {
+            p->gl_status |= PVMAC_GL_ERR_REPLY;
+            break;
+        }
+        if (rgb555) {
+            const uint32_t *s32 = (const uint32_t *)tmp;
+            uint32_t i;
+
+            for (i = 0; i < rb / 4; i++) {
+                uint32_t px = le32_to_cpu(s32[i]);   /* 0xAARRGGBB */
+                uint16_t v = ((px >> 9) & 0x7c00) | ((px >> 6) & 0x03e0) |
+                             ((px >> 3) & 0x001f);
+
+                stw_be_p(dst + i * 2, v);
+            }
+        } else if (p->reply_flags & PVMAC_REPLY_FLAG_SWAP32) {
+            uint32_t *s32 = (uint32_t *)tmp;   /* g_malloc: aligned */
+            uint32_t *d32 = (uint32_t *)dst;   /* dest and pitch are 4-aligned */
+            uint32_t i;
+
+            for (i = 0; i < rb / 4; i++) {
+                d32[i] = bswap32(s32[i]);
+            }
+        } else {
+            memcpy(dst, tmp, rb);
+        }
+        done += rb;
+    }
+    g_free(tmp);
+    p->reply_len = done;
+    memory_region_set_dirty(&d->vga.vram, p->reply_dest,
+                            (uint64_t)(rows - 1) * p->reply_pitch + dst_rb);
+}
+
+static void pvmac_gl_doorbell(PCIVGAState *d)
+{
+    PVMACState *p = &d->pvmac;
+    uint8_t *vram = d->vga.vram_ptr;
+    uint32_t head = p->ring_head, tail = p->ring_tail;
+    uint32_t expect = p->reply_expect;
+    uint32_t pending;
+    bool ok = true;
+
+    p->reply_len = 0;
+    if (!d->gl_available) {
+        p->gl_status |= PVMAC_GL_ERR_NO_GL;
+        return;
+    }
+    /* Indexes are only ever stored validated, but check again: cheap. */
+    if (head >= PVMAC_GL_RING_SIZE || tail >= PVMAC_GL_RING_SIZE) {
+        p->gl_status |= PVMAC_GL_ERR_BAD_HEAD;
+        p->ring_tail = p->ring_head = 0;
+        return;
+    }
+    if (expect > PVMAC_GL_REPLY_SIZE) {
+        p->gl_status |= PVMAC_GL_ERR_BAD_EXPECT;
+        return;
+    }
+    if (!vmsvga_gl_stream_valid(d->gl_stream)) {
+        d->gl_stream = vmsvga_gl_stream_open(0);
+        if (!vmsvga_gl_stream_valid(d->gl_stream)) {
+            d->gl_stream = (struct VIMPassthroughOpenGLStream){ .fd = -1 };
+            p->gl_status |= PVMAC_GL_ERR_OPEN;
+            p->ring_tail = head;      /* drop, never replay */
+            return;
+        }
+    }
+    pvmac_gl_worker_start(d);
+
+    pending = (head - tail) & (PVMAC_GL_RING_SIZE - 1);
+    trace_vga_pvmac_gl_doorbell(tail, head, pending, expect);
+
+    if (!expect) {
+        /* asynchronous: hand the span to the worker, free the ring now */
+        if (pending) {
+            pvmac_gl_enqueue(d, tail, pending);
+        }
+        p->ring_tail = head;
+        trace_vga_pvmac_gl_done(p->reply_len, p->gl_status);
+        return;
+    }
+
+    /* sync point: everything earlier must be in the executor first */
+    pvmac_gl_flush(d);
+    if (pending) {
+        const uint8_t *ring = vram + pvmac_ring_offset(d);
+        uint32_t first = MIN(pending, PVMAC_GL_RING_SIZE - tail);
+
+        ok = pvmac_gl_write_all(d, ring + tail, first);
+        if (ok && pending > first) {
+            ok = pvmac_gl_write_all(d, ring, pending - first);
+        }
+        if (!ok) {
+            p->gl_status |= PVMAC_GL_ERR_IO;
+        }
+    }
+    p->ring_tail = head;
+
+    if (ok) {
+        if (p->reply_flags & PVMAC_REPLY_FLAG_PRESENT) {
+            pvmac_gl_present(d, expect);
+        } else {
+            ssize_t n = VIMGLInprocessReadExpected(
+                            vim_passthrough_opengl_inprocess,
+                            d->gl_stream.memory,
+                            vram + pvmac_reply_offset(d), expect);
+
+            if (n < 0) {
+                n = 0;
+            }
+            p->reply_len = n;
+            if (n != expect) {
+                p->gl_status |= PVMAC_GL_ERR_REPLY;
+            }
+        }
+    }
+    trace_vga_pvmac_gl_done(p->reply_len, p->gl_status);
+}
+
+/* Load the executor library once at realize; never abort when absent. */
+static void pvmac_gl_probe(PCIVGAState *d)
+{
+    const char *path = getenv("VIM_PASSTHROUGH_OPENGL_INPROCESS_LIBRARY");
+
+    d->gl_stream = (struct VIMPassthroughOpenGLStream){ .fd = -1 };
+    if (d->vga.vram_size < PVMAC_GL_MIN_VRAM) {
+        warn_report("vga: mac-accel GL stream disabled: vgamem_mb too small");
+        return;
+    }
+    if (!path) {
+        warn_report("vga: mac-accel GL stream disabled: "
+                    "VIM_PASSTHROUGH_OPENGL_INPROCESS_LIBRARY not set");
+        return;
+    }
+    vmsvga_gl_load_inprocess(path);
+    if (!vim_passthrough_opengl_inprocess) {
+        warn_report("vga: mac-accel GL stream disabled: "
+                    "executor library failed to load");
+        return;
+    }
+    d->gl_available = true;
+}
+#else
+static void pvmac_gl_close(PCIVGAState *d)
+{
+}
+
+static void pvmac_gl_flush(PCIVGAState *d)
+{
+}
+
+static void pvmac_gl_doorbell(PCIVGAState *d)
+{
+    d->pvmac.reply_len = 0;
+    d->pvmac.gl_status |= PVMAC_GL_ERR_NO_GL;
+}
+
+static void pvmac_gl_probe(PCIVGAState *d)
+{
+    warn_report("vga: mac-accel GL stream needs macOS; disabled");
+}
+#endif
+
+/* STREAM_RESET: drop the executor stream and the ring/reply state. */
+static void pvmac_stream_reset(PCIVGAState *d)
+{
+    PVMACState *p = &d->pvmac;
+
+    trace_vga_pvmac_stream_reset();
+    pvmac_gl_flush(d);
+    pvmac_gl_close(d);
+    p->ring_head = p->ring_tail = 0;
+    p->reply_len = 0;
+    p->reply_expect = 0;
+    p->reply_dest = 0;
+    p->reply_pitch = 0;
+    p->reply_row_bytes = 0;
+    p->reply_flags = 0;
+    p->gl_status = 0;
+}
+
 static void pvmac_error(PCIVGAState *d, uint32_t code)
 {
     d->pvmac.status = PVMAC_STATUS_ERROR | (code << 8);
@@ -363,7 +961,8 @@ static uint64_t pvmac_read(void *opaque, hwaddr addr, unsigned size)
     case PVMAC_REG_VERSION:
         return PVMAC_VERSION_VALUE;
     case PVMAC_REG_CAPS:
-        return PVMAC_CAP_HWCURSOR;
+        return PVMAC_CAP_HWCURSOR |
+               (d->gl_available ? PVMAC_CAP_GL_STREAM : 0);
     case PVMAC_REG_STATUS:
         return d->pvmac.status;
     case PVMAC_REG_CUR_CTRL:
@@ -376,6 +975,32 @@ static uint64_t pvmac_read(void *opaque, hwaddr addr, unsigned size)
         return d->pvmac.cur_size;
     case PVMAC_REG_CUR_OFFSET:
         return pvmac_cursor_offset(d);
+    case PVMAC_REG_RING_OFFSET:
+        return d->gl_available ? pvmac_ring_offset(d) : 0;
+    case PVMAC_REG_RING_SIZE:
+        return d->gl_available ? PVMAC_GL_RING_SIZE : 0;
+    case PVMAC_REG_RING_HEAD:
+        return d->pvmac.ring_head;
+    case PVMAC_REG_RING_TAIL:
+        return d->pvmac.ring_tail;
+    case PVMAC_REG_REPLY_OFFSET:
+        return d->gl_available ? pvmac_reply_offset(d) : 0;
+    case PVMAC_REG_REPLY_SIZE:
+        return d->gl_available ? PVMAC_GL_REPLY_SIZE : 0;
+    case PVMAC_REG_REPLY_LEN:
+        return d->pvmac.reply_len;
+    case PVMAC_REG_GL_STATUS:
+        return d->pvmac.gl_status;
+    case PVMAC_REG_REPLY_EXPECT:
+        return d->pvmac.reply_expect;
+    case PVMAC_REG_REPLY_DEST:
+        return d->pvmac.reply_dest;
+    case PVMAC_REG_REPLY_PITCH:
+        return d->pvmac.reply_pitch;
+    case PVMAC_REG_REPLY_ROW_BYTES:
+        return d->pvmac.reply_row_bytes;
+    case PVMAC_REG_REPLY_FLAGS:
+        return d->pvmac.reply_flags;
     default:
         return 0;
     }
@@ -403,6 +1028,47 @@ static void pvmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case PVMAC_REG_CUR_DEFINE:
         pvmac_cursor_define(d);
         break;
+    case PVMAC_REG_RING_HEAD:
+        if (val >= PVMAC_GL_RING_SIZE) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "vga: mac-accel ring head 0x%" PRIx64 " out of range\n",
+                          (uint64_t)val);
+            d->pvmac.gl_status |= PVMAC_GL_ERR_BAD_HEAD;
+        } else {
+            d->pvmac.ring_head = val;
+        }
+        break;
+    case PVMAC_REG_REPLY_EXPECT:
+        if (val > PVMAC_GL_REPLY_SIZE) {
+            d->pvmac.gl_status |= PVMAC_GL_ERR_BAD_EXPECT;
+        } else {
+            d->pvmac.reply_expect = val;
+        }
+        break;
+    case PVMAC_REG_REPLY_DEST:
+        d->pvmac.reply_dest = val;
+        break;
+    case PVMAC_REG_REPLY_PITCH:
+        d->pvmac.reply_pitch = val;
+        break;
+    case PVMAC_REG_REPLY_ROW_BYTES:
+        d->pvmac.reply_row_bytes = val;
+        break;
+    case PVMAC_REG_REPLY_FLAGS:
+        d->pvmac.reply_flags = val & (PVMAC_REPLY_FLAG_SWAP32 |
+                                      PVMAC_REPLY_FLAG_FLIP |
+                                      PVMAC_REPLY_FLAG_RGB555 |
+                                      PVMAC_REPLY_FLAG_PRESENT);
+        break;
+    case PVMAC_REG_STREAM_RESET:
+        pvmac_stream_reset(d);
+        break;
+    case PVMAC_REG_DOORBELL:
+        pvmac_gl_doorbell(d);
+        break;
+    case PVMAC_REG_GL_STATUS:
+        d->pvmac.gl_status &= ~(uint32_t)val;
+        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "vga: mac-accel write to read-only/unknown register "
@@ -423,6 +1089,7 @@ static void pvmac_reset(void *opaque)
 {
     PCIVGAState *d = opaque;
 
+    pvmac_gl_close(d);
     memset(&d->pvmac, 0, sizeof(d->pvmac));
 }
 
@@ -497,6 +1164,7 @@ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
                 error_setg(errp, "mac-accel needs vgamem_mb >= 1");
                 return;
             }
+            pvmac_gl_probe(d);
             memory_region_init_io(&d->mrs[4], OBJECT(dev), &pvmac_ops, d,
                                   "mac-accel regs", PVMAC_SIZE);
             memory_region_add_subregion(&d->mmio, PVMAC_OFFSET, &d->mrs[4]);
@@ -506,6 +1174,16 @@ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
         pci_register_bar(&d->dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
     } else if (d->flags & (1 << PCI_VGA_FLAG_ENABLE_MAC_ACCEL)) {
         error_setg(errp, "mac-accel requires mmio=on");
+    }
+}
+
+static void pci_std_vga_exit(PCIDevice *dev)
+{
+    PCIVGAState *d = PCI_VGA(dev);
+
+    if (d->flags & (1 << PCI_VGA_FLAG_ENABLE_MAC_ACCEL)) {
+        qemu_unregister_reset(pvmac_reset, d);
+        pvmac_gl_close(d);
     }
 }
 
@@ -622,6 +1300,7 @@ static void vga_class_init(ObjectClass *klass, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->realize = pci_std_vga_realize;
+    k->exit = pci_std_vga_exit;
     k->romfile = "vgabios-stdvga.bin";
     k->class_id = PCI_CLASS_DISPLAY_VGA;
     device_class_set_props(dc, vga_pci_properties);
