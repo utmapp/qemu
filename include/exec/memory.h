@@ -808,6 +808,8 @@ struct MemoryRegion {
 
     /* For devices designed to perform re-entrant IO into their own IO MRs */
     bool disable_reentrancy_guard;
+    /* Accessors run without the BQL (memory_region_enable_lockless_io) */
+    bool lockless_io;
 };
 
 struct IOMMUMemoryRegion {
@@ -2035,6 +2037,17 @@ void memory_region_msync(MemoryRegion *mr, hwaddr addr, hwaddr size);
  * @size: the size of the range to be written back
  */
 void memory_region_writeback(MemoryRegion *mr, hwaddr addr, hwaddr size);
+
+/**
+ * memory_region_enable_lockless_io: Dispatch accesses without the BQL.
+ *
+ * CPU accesses to @mr call its accessors without taking the Big QEMU Lock;
+ * the device does its own synchronisation.  Also turns off the re-entrancy
+ * guard for @mr, whose bookkeeping assumes the BQL.
+ *
+ * @mr: the memory region being updated.
+ */
+void memory_region_enable_lockless_io(MemoryRegion *mr);
 
 /**
  * memory_region_set_log: Turn dirty logging on or off for a region.

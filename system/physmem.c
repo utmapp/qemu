@@ -2863,7 +2863,7 @@ bool prepare_mmio_access(MemoryRegion *mr)
 {
     bool release_lock = false;
 
-    if (!bql_locked()) {
+    if (!mr->lockless_io && !bql_locked()) {
         bql_lock();
         release_lock = true;
     }
