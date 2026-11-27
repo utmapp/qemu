@@ -92,6 +92,13 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu_renderer_sw.c',
 ), pixman] + r300_shader_deps)
 
+if host_os == 'darwin'
+  metal_fw = dependency('appleframeworks', modules: ['Foundation', 'Metal', 'QuartzCore'], required: false)
+  if metal_fw.found()
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m'), metal_fw])
+  endif
+endif
+
 system_ss.add(when: 'CONFIG_DPCD', if_true: files('dpcd.c'))
 system_ss.add(when: 'CONFIG_XLNX_DISPLAYPORT', if_true: files('xlnx_dp.c'))
 
