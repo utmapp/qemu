@@ -58,6 +58,7 @@ typedef struct ATITexUnit {
     uint64_t key;              /* identity of the uploaded texture */
     uint32_t gen;              /* content generation */
     bool chroma_key;
+    bool alpha_one;            /* PP_TXFORMAT ALPHA_IN_MAP clear: texel alpha = 1 */
 } ATITexUnit;
 
 typedef struct ATIStage {

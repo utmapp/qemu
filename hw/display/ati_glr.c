@@ -548,6 +548,9 @@ static const char *fs_src =
     "  T[0] = (tex_en & 1) != 0 ? sampleu(0, v_t0) : vec4(0.0);\n"
     "  T[1] = (tex_en & 2) != 0 ? sampleu(1, v_t1) : vec4(0.0);\n"
     "  T[2] = (tex_en & 4) != 0 ? sampleu(2, v_t2) : vec4(0.0);\n"
+    "  if ((tex_en & 17) == 17) T[0].a = 1.0;\n"   /* ALPHA_IN_MAP clear */
+    "  if ((tex_en & 34) == 34) T[1].a = 1.0;\n"
+    "  if ((tex_en & 68) == 68) T[2].a = 1.0;\n"
     "  T[3] = vec4(0.0);\n"
     "  cur = dif;\n"
     "  for (int s = 0; s < 3; s++) {\n"
@@ -1025,7 +1028,16 @@ static void glr_draw(ATIRenderer *r, GLRCmd *c)
     gl->Uniform4iv(r->u_stage_a, 3, sa);
     gl->Uniform4fv(r->u_tfactor, 3, tf);
     gl->Uniform1i(r->u_stage_en, st->stage_enable);
-    gl->Uniform1i(r->u_tex_en, st->tex_enable);
+    {
+        GLint te = st->tex_enable;   /* bits 4-6: unit alpha forced to 1 */
+
+        for (int u = 0; u < 3; u++) {
+            if (st->tex[u].alpha_one) {
+                te |= 16 << u;
+            }
+        }
+        gl->Uniform1i(r->u_tex_en, te);
+    }
     {
         GLint av[4] = { st->alpha_func, st->alpha_test, 0, 0 };
         GLint fg[4] = { st->fog, st->fog_src, 0, 0 };
