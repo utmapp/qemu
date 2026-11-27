@@ -146,28 +146,50 @@ static void booke206_flush_tlb(CPUPPCState *env, int flags,
 /*****************************************************************************/
 /* BATs management */
 #if !defined(FLUSH_ALL_TLBS)
-static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
-                                     target_ulong mask)
-{
-    CPUState *cs = env_cpu(env);
-    target_ulong base, end, page;
+/*
+ * MMU indexes that use address translation (see hreg_compute_hflags_value()):
+ * bit 1 of the index is set in real mode, where BATs never apply.
+ */
+#define PPC_BAT_MMUIDX_BITS 0x3333  /* also the SR-slot copies, bits 2-3 */
 
-    base = BATu & ~0x0001FFFF;
-    end = base + mask + 0x00020000;
-    if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
-        /* Flushing 1024 4K pages is slower than a complete flush */
-        qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
-        tlb_flush(cs);
-        qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+/*
+ * Drop the TLB entries a BAT can affect: the ones it translated, and the
+ * page table translations it hid. Use the block length of this BAT value,
+ * not of the value that replaces it, or entries beyond the new length
+ * would survive a BAT being shrunk or cleared.
+ */
+static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
+                                     bool data)
+{
+    target_ulong base, len;
+
+    /* Neither Vs nor Vp: the BAT matches nothing, nothing to drop */
+    if (!(BATu & 0x3)) {
         return;
     }
+    base = BATu & ~0x0001FFFF;
+    len = ((BATu << 15) & 0x0FFE0000UL) + 0x00020000;
     qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
-                  " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
-                  base, end, mask);
-    for (page = base; page != end; page += TARGET_PAGE_SIZE) {
-        tlb_flush_page(cs, page);
+                  " length " TARGET_FMT_lx "\n", base, len);
+    /*
+     * From ppc-osx-vgpu (poweremu-qemu 1b270be60f): a data BAT translates
+     * only data accesses made with translation on, so leave instruction
+     * fetches and the jump cache alone -- Tiger rewrites DBAT0/1 tens of
+     * thousands of times a second during file I/O.  PPC_DBAT_FAST=0
+     * flushes as for any BAT.
+     */
+    static int fast = -1;
+    if (fast < 0) {
+        const char *e = getenv("PPC_DBAT_FAST");
+        fast = !(e && e[0] == '0');
     }
-    qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+    if (data && fast && env->mmu_model == POWERPC_MMU_32B) {
+        tlb_flush_data_pages_by_mmuidx(env_cpu(env), base, len >> TARGET_PAGE_BITS,
+                                       PPC_BAT_MMUIDX_BITS);
+        return;
+    }
+    tlb_flush_range_by_mmuidx(env_cpu(env), base, len,
+                              PPC_BAT_MMUIDX_BITS, TARGET_LONG_BITS);
 }
 #endif
 
@@ -187,7 +209,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
     if (env->IBAT[0][nr] != value) {
         mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr], false);
 #endif
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
@@ -199,7 +221,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->IBAT[1][nr] = (env->IBAT[1][nr] & 0x0000007B) |
             (env->IBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr], false);
 #else
         tlb_flush(env_cpu(env));
 #endif
@@ -224,7 +246,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
          */
         mask = (value << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr], true);
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         env->DBAT[0][nr] = (value & 0x00001FFFUL) |
@@ -232,7 +254,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->DBAT[1][nr] = (env->DBAT[1][nr] & 0x0000007B) |
             (env->DBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr], true);
 #else
         tlb_flush(env_cpu(env));
 #endif
@@ -278,12 +300,76 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
+        ppc_mmu_slots_reset(env);
         break;
     default:
         /* XXX: TODO */
         cpu_abort(env_cpu(env), "Unknown MMU model %x\n", env->mmu_model);
         break;
     }
+}
+
+/*
+ * A 32-bit hash MMU's TLB is tagged with the VSID, so reloading the segment
+ * registers keeps it, and Mac OS X reloads them on every exception entry and
+ * exit to switch between the kernel's and the user's address space.  QEMU's
+ * TLB is indexed by effective address instead, and flushing it on each of
+ * those switches made the guest walk its page table millions of times a
+ * second.  So each recently used set of segment register values gets its
+ * own pair of MMU indexes (translated, user and supervisor; see
+ * ppc_env_mmu_index) and switching sets only evicts the least recently used
+ * one.  tlbie and tlbia still flush every set.
+ *
+ * Called at the context-synchronizing event after the segment registers
+ * changed.
+ */
+void ppc_mmu_slot_sync(CPUPPCState *env)
+{
+    int i, victim = 0;
+
+    for (i = 0; i < PPC_MMU_SLOTS; i++) {
+        if (env->mmu_slot_used[i] &&
+            !memcmp(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]))) {
+            break;
+        }
+        if (env->mmu_slot_used[i] < env->mmu_slot_used[victim]) {
+            victim = i;
+        }
+    }
+    if (i == PPC_MMU_SLOTS) {
+        i = victim;
+        memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
+        tlb_flush_by_mmuidx(env_cpu(env), 3 << (4 * i));
+    }
+    env->mmu_slot_used[i] = ++env->mmu_slot_clock;
+    env->mmu_slot = i;
+}
+
+/* After the whole QEMU TLB was flushed: only the current set is cached. */
+void ppc_mmu_slots_reset(CPUPPCState *env)
+{
+    env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
+    memset(env->mmu_slot_used, 0, sizeof(env->mmu_slot_used));
+    memcpy(env->mmu_slot_sr[env->mmu_slot], env->sr,
+           sizeof(env->mmu_slot_sr[0]));
+    env->mmu_slot_used[env->mmu_slot] = ++env->mmu_slot_clock;
+}
+
+/*
+ * Whether tlbie flushes the whole TLB, as the architecture allows and QEMU
+ * has always done, or only the page it names (PPC_TLBIE=page).  Flushing
+ * just the named pages sounds better and measures the same once emptying
+ * the TB jump cache is O(1), so the faithful behaviour stays the default.
+ */
+static bool ppc_tlbie_flushes_all(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *s = getenv("PPC_TLBIE");
+        mode = !(s && !strcmp(s, "page"));
+    }
+    return mode;
 }
 
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
@@ -310,10 +396,19 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         /*
          * Actual CPUs invalidate entire congruence classes based on
          * the geometry of their TLBs and some OSes take that into
-         * account, we just mark the TLB to be flushed later (context
-         * synchronizing event or sync instruction on 32-bit).
+         * account.  Remember the page this tlbie named instead, and flush
+         * just those at the next context-synchronizing event; an OS that
+         * leans on congruence-class behaviour (rather than naming every
+         * page it changes, as Darwin and Linux do) needs the default.
          */
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        if (ppc_tlbie_flushes_all()) {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        } else if (env->tlb_flush_npages < PPC_TLB_PENDING_PAGES) {
+            env->tlb_flush_pages[env->tlb_flush_npages++] = addr;
+            env->tlb_need_flush |= TLB_NEED_PAGE_FLUSH;
+        } else {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        }
         break;
     default:
         /* Should never reach here with other MMU models */
@@ -328,6 +423,24 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 /* Special registers manipulation */
 
 /* Segment registers load and store */
+
+/*
+ * The per-segment-register TLB slots are opt-in (PPC_SR_SLOTS=1); by default
+ * a segment register change flushes the whole TLB, as before.  On Mac OS X
+ * 10.4 guests the slots made the Quartz Extreme desktop much slower: opening
+ * a folder took up to 7 s and Dashboard managed under 1 fps instead of ~7
+ * (measured: 4-6 vs 29-41 distinct frames in 12 s with them off).
+ */
+static bool ppc_mmu_slots_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *s = getenv("PPC_SR_SLOTS");
+        on = s && !strcmp(s, "1");
+    }
+    return on;
+}
 target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
@@ -377,7 +490,9 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
             }
         }
 #else
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush |= env->mmu_model == POWERPC_MMU_32B &&
+                               ppc_mmu_slots_on() ?
+                               TLB_NEED_SR_SWITCH : TLB_NEED_LOCAL_FLUSH;
 #endif
     }
 }
@@ -1366,6 +1481,16 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     hwaddr raddr;
     int page_size, prot;
 
+    if (cpu->env.mmu_model == POWERPC_MMU_32B && !(mmu_idx & 2) &&
+        ((cpu->env.tlb_need_flush & TLB_NEED_SR_SWITCH) ||
+         mmu_idx >> 2 != cpu->env.mmu_slot)) {
+        /*
+         * Between a segment register write and the next context
+         * synchronization, entries made from the new values would land in
+         * the old set's TLB; never reuse that one for the old set.
+         */
+        cpu->env.mmu_slot_used[mmu_idx >> 2] = 0;
+    }
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,

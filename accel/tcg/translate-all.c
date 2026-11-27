@@ -673,7 +673,16 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
-    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+    /*
+     * Retire every entry at once.  Only on the (4-billionth) wrap does the
+     * cache have to be walked, so that generation 0 cannot match entries
+     * left behind by an earlier lap of the counter.
+     */
+    if (++jc->gen == 0) {
+        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+            qatomic_set(&jc->array[i].tb, NULL);
+            jc->array[i].gen = 0;
+        }
+        jc->gen = 1;
     }
 }

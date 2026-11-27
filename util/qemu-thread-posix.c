@@ -16,6 +16,12 @@
 #include "qemu/notify.h"
 #include "qemu-thread-common.h"
 #include "qemu/tsan.h"
+
+/*
+ * Which way the JIT mapping is currently switched on this thread, for
+ * tcg-apple-jit.h.  Defined once so every translation unit shares it.
+ */
+__thread int qemu_jit_wx_state = -1;
 #include "qemu/bitmap.h"
 
 #ifdef CONFIG_PTHREAD_SET_NAME_NP

@@ -193,6 +193,7 @@ int ppc_cpu_gdb_read_register_apple(CPUState *cs, GByteArray *buf, int n)
             gdb_get_reg32(buf, cpu_read_xer(env));
             break;
         case 70 + 32:
+            ppc_fprf_sync(env);
             gdb_get_reg64(buf, env->fpscr);
             break;
         }
@@ -449,6 +450,7 @@ static int gdb_get_float_reg(CPUState *cs, GByteArray *buf, int n)
         return 8;
     }
     if (n == 32) {
+        ppc_fprf_sync(env);
         gdb_get_reg32(buf, env->fpscr);
         mem_buf = gdb_get_reg_ptr(buf, 4);
         ppc_maybe_bswap_register(env, mem_buf, 4);

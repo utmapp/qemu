@@ -764,6 +764,73 @@ void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
     }
 }
 
+/*
+ * Two-register byte table lookup: r[i] = (a:b)[idx[i]] for idx[i] < 32,
+ * with a supplying bytes 0-15 and b bytes 16-31, and 0 for larger
+ * indexes.  V128 only, and only where the host has it; callers check
+ * tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8).
+ */
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *at = tcgv_vec_temp(a);
+    TCGTemp *bt = tcgv_vec_temp(b);
+    TCGTemp *it = tcgv_vec_temp(idx);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(at->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(bt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(it->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(TCG_TARGET_HAS_tbl_vec);
+    vec_gen_4(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8,
+              temp_arg(rt), temp_arg(at), temp_arg(bt), temp_arg(it));
+}
+
+/*
+ * Scalar floating point on V64 temps; see fop_vec/ffma_vec/fcvt_vec in
+ * tcg-opc.h.  Callers check
+ * tcg_can_emit_vec_op(INDEX_op_fop_vec, TCG_TYPE_V64, vece) (all three
+ * are provided together).
+ */
+void tcg_gen_fcvt_vec(bool to_double, TCGv_vec r, TCGv_vec a)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V64);
+    vec_gen_3(INDEX_op_fcvt_vec, TCG_TYPE_V64, MO_64,
+              temp_arg(rt), temp_arg(at), to_double);
+}
+
+void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
+                     TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *at = tcgv_vec_temp(a);
+    TCGTemp *bt = tcgv_vec_temp(b);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V64);
+    tcg_debug_assert(op < 4 && (vece == MO_32 || vece == MO_64));
+    vec_gen_4(INDEX_op_fop_vec, TCG_TYPE_V64, vece,
+              temp_arg(rt), temp_arg(at), temp_arg(bt), op);
+}
+
+void tcg_gen_ffma_vec(unsigned vece, unsigned kind, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec c, TCGv_vec b)
+{
+    TCGOp *op = tcg_emit_op(INDEX_op_ffma_vec, 5);
+
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V64);
+    tcg_debug_assert(kind < 4 && (vece == MO_32 || vece == MO_64));
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = vece;
+    op->args[0] = temp_arg(tcgv_vec_temp(r));
+    op->args[1] = temp_arg(tcgv_vec_temp(a));
+    op->args[2] = temp_arg(tcgv_vec_temp(c));
+    op->args[3] = temp_arg(tcgv_vec_temp(b));
+    op->args[4] = kind;
+}
+
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d)
 {

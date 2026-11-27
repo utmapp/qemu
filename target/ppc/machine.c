@@ -127,6 +127,7 @@ static int cpu_pre_save(void *opaque)
     env->spr[SPR_LR] = env->lr;
     env->spr[SPR_CTR] = env->ctr;
     env->spr[SPR_XER] = cpu_read_xer(env);
+    ppc_fprf_sync(env);
 #if defined(TARGET_PPC64)
     env->spr[SPR_CFAR] = env->cfar;
 #endif
@@ -258,7 +259,11 @@ static int cpu_post_load(void *opaque, int version_id)
         ppc_store_sdr1(env, env->spr[SPR_SDR1]);
     }
 
+    ppc_fprf_clear(env);
     post_load_update_msr(env);
+    if (tcg_enabled()) {
+        ppc_mmu_slots_reset(env); /* the QEMU TLB starts empty */
+    }
 
     if (tcg_enabled()) {
         /* Re-set breaks based on regs */

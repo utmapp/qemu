@@ -73,6 +73,8 @@ void tcg_gen_goto_tb(unsigned idx);
  * this op is equivalent to calling tcg_gen_exit_tb() with 0 as the argument.
  */
 void tcg_gen_lookup_and_goto_ptr(void);
+/* Jump to TB code at ptr, found by the caller; the TB must allow goto_ptr. */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
 
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
@@ -458,6 +460,12 @@ void tcg_gen_cmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 
 void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
+void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
+                     TCGv_vec a, TCGv_vec b);
+void tcg_gen_ffma_vec(unsigned vece, unsigned kind, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec c, TCGv_vec b);
+void tcg_gen_fcvt_vec(bool to_double, TCGv_vec r, TCGv_vec a);
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d);
 

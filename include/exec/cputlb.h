@@ -153,6 +153,20 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr,
                               uint16_t idxmap);
 
 /**
+ * tlb_flush_data_pages_by_mmuidx:
+ * @cpu: CPU whose TLB should be flushed
+ * @addr: virtual address of the first page
+ * @npages: number of consecutive pages
+ * @idxmap: bitmap of MMU indexes to flush
+ *
+ * Like tlb_flush_page_by_mmuidx on each page, for a mapping change that
+ * cannot affect instruction fetch (a data-only translation): the TB jump
+ * cache is left alone, and the TLB lock is taken once.
+ */
+void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
+                                    uint16_t idxmap);
+
+/**
  * tlb_flush_page_by_mmuidx_all_cpus_synced:
  * @cpu: Originating CPU of the flush
  * @addr: virtual address of page to be flushed
@@ -244,6 +258,10 @@ static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)
 }
 static inline void tlb_flush_page_by_mmuidx(CPUState *cpu,
                                             vaddr addr, uint16_t idxmap)
+{
+}
+static inline void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr,
+                                                  vaddr npages, uint16_t idxmap)
 {
 }
 

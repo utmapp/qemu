@@ -34,6 +34,84 @@ static inline void set_avr_full(int regno, TCGv_i128 src)
     tcg_gen_st_i128(src, tcg_env, avr_full_offset(regno));
 }
 
+/*
+ * Byte shuffles on the host's vector unit.
+ *
+ * AltiVec's permutes (vperm, vsldoi, merges, packs, unpacks) otherwise go
+ * through out-of-line helpers that loop over bytes.  Where the host can
+ * do a two-register table lookup (tbl_vec; TBL/TBX on AArch64 NEON) they
+ * become a few inline instructions instead.
+ *
+ * A vector register is held in host byte order: on a little-endian host,
+ * host byte j of the register is PPC (big-endian) byte 15 - j.  A PPC
+ * permute picking byte s (0-15 from vA, 16-31 from vB) for result byte i
+ * is therefore a lookup, for host byte j, of index 31 - s into the table
+ * (vB, vA), where s is the pick for PPC byte 15 - j.
+ */
+#if !HOST_BIG_ENDIAN
+static bool vmx_host_tbl(void)
+{
+    return tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8) > 0;
+}
+#else
+static bool vmx_host_tbl(void)
+{
+    return false;
+}
+#endif
+
+/* Turn a PPC byte pick list s0..s15 into a host-order tbl index vector. */
+#define VMX_PICK(s0, s1, s2, s3, s4, s5, s6, s7,                           \
+                 s8, s9, s10, s11, s12, s13, s14, s15)                      \
+    { 31 - (s15), 31 - (s14), 31 - (s13), 31 - (s12),                       \
+      31 - (s11), 31 - (s10), 31 - (s9), 31 - (s8),                         \
+      31 - (s7), 31 - (s6), 31 - (s5), 31 - (s4),                           \
+      31 - (s3), 31 - (s2), 31 - (s1), 31 - (s0) }
+#define VMX_PICK_LIST(...) VMX_PICK(__VA_ARGS__)
+
+static TCGv_vec vmx_ld(int reg)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(v, tcg_env, avr_full_offset(reg));
+    return v;
+}
+
+static void vmx_st(int reg, TCGv_vec v)
+{
+    tcg_gen_st_vec(v, tcg_env, avr_full_offset(reg));
+}
+
+/* A constant 16-byte vector from host memory (tables are static). */
+static TCGv_vec vmx_ld_const(const uint8_t *table)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(v, tcg_constant_ptr(table), 0);
+    return v;
+}
+
+/* PPC permute of (a, b) by the index vector idx (see above). */
+static TCGv_vec vmx_permute(TCGv_vec a, TCGv_vec b, TCGv_vec idx)
+{
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_tbl_vec(r, b, a, idx);
+    return r;
+}
+
+/* vD = the fixed permute table of vA and vB. */
+static void gen_vmx_shuffle(int rd, int ra, int rb, const uint8_t *table)
+{
+    vmx_st(rd, vmx_permute(vmx_ld(ra), vmx_ld(rb), vmx_ld_const(table)));
+}
+
+/* OR a nonzero-if-saturated vector into VSCR[SAT]. */
+static void vmx_accumulate_sat(TCGv_vec x)
+{
+    TCGv_vec sat = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(sat, tcg_env, offsetof(CPUPPCState, vscr_sat));
+    tcg_gen_or_vec(MO_8, sat, sat, x);
+    tcg_gen_st_vec(sat, tcg_env, offsetof(CPUPPCState, vscr_sat));
+}
+
 static bool trans_LVX(DisasContext *ctx, arg_X *a)
 {
     TCGv EA;
@@ -350,12 +428,40 @@ GEN_VXFORM_V(vsububm, MO_8, tcg_gen_gvec_sub, 0, 16);
 GEN_VXFORM_V(vsubuhm, MO_16, tcg_gen_gvec_sub, 0, 17);
 GEN_VXFORM_V(vsubuwm, MO_32, tcg_gen_gvec_sub, 0, 18);
 GEN_VXFORM_V(vsubudm, MO_64, tcg_gen_gvec_sub, 0, 19);
-GEN_VXFORM(vmrghb, 6, 0);
-GEN_VXFORM(vmrghh, 6, 1);
-GEN_VXFORM(vmrghw, 6, 2);
-GEN_VXFORM(vmrglb, 6, 4);
-GEN_VXFORM(vmrglh, 6, 5);
-GEN_VXFORM(vmrglw, 6, 6);
+/* A fixed byte shuffle inline when the host can, else the helper. */
+#define GEN_VXFORM_SHUFFLE(name, helper_args, ...)                     \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    static const uint8_t table[16] QEMU_ALIGNED(16) =                   \
+        VMX_PICK(__VA_ARGS__);                                          \
+    TCGv_ptr ra, rb, rd;                                                \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmx_host_tbl()) {                                               \
+        gen_vmx_shuffle(rD(ctx->opcode), rA(ctx->opcode),               \
+                        rB(ctx->opcode), table);                        \
+        return;                                                         \
+    }                                                                   \
+    ra = gen_avr_ptr(rA(ctx->opcode));                                  \
+    rb = gen_avr_ptr(rB(ctx->opcode));                                  \
+    rd = gen_avr_ptr(rD(ctx->opcode));                                  \
+    gen_helper_##name helper_args;                                      \
+}
+
+GEN_VXFORM_SHUFFLE(vmrghb, (rd, ra, rb),
+                   0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+GEN_VXFORM_SHUFFLE(vmrghh, (rd, ra, rb),
+                   0, 1, 16, 17, 2, 3, 18, 19, 4, 5, 20, 21, 6, 7, 22, 23);
+GEN_VXFORM_SHUFFLE(vmrghw, (rd, ra, rb),
+                   0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+GEN_VXFORM_SHUFFLE(vmrglb, (rd, ra, rb),
+                   8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+GEN_VXFORM_SHUFFLE(vmrglh, (rd, ra, rb),
+                   8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31);
+GEN_VXFORM_SHUFFLE(vmrglw, (rd, ra, rb),
+                   8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
 
 static void trans_vmrgew(DisasContext *ctx)
 {
@@ -1057,17 +1163,81 @@ TRANS(VRLQMI, do_vector_rotl_quad, false, true)
 
 GEN_VXFORM_TRANS(vsl, 2, 7);
 GEN_VXFORM_TRANS(vsr, 2, 11);
-GEN_VXFORM_ENV(vpkuhum, 7, 0);
-GEN_VXFORM_ENV(vpkuwum, 7, 1);
+#define VMX_PACK_H  1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
+#define VMX_PACK_W  2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31
+
+GEN_VXFORM_SHUFFLE(vpkuhum, (tcg_env, rd, ra, rb), VMX_PACK_H);
+GEN_VXFORM_SHUFFLE(vpkuwum, (tcg_env, rd, ra, rb), VMX_PACK_W);
 GEN_VXFORM_ENV(vpkudum, 7, 17);
-GEN_VXFORM_ENV(vpkuhus, 7, 2);
-GEN_VXFORM_ENV(vpkuwus, 7, 3);
+
+/*
+ * Saturating packs: clamp each element of vA and vB to the narrower
+ * range (noting in VSCR[SAT] any that changed), then pack as above.
+ */
+static void gen_vmx_pack_sat(DisasContext *ctx, unsigned vece, bool sign_in,
+                             int64_t lo, int64_t hi)
+{
+    static const uint8_t pack_h[16] QEMU_ALIGNED(16) = VMX_PICK_LIST(VMX_PACK_H);
+    static const uint8_t pack_w[16] QEMU_ALIGNED(16) = VMX_PICK_LIST(VMX_PACK_W);
+    static const TCGOpcode vecop_list[] = {
+        INDEX_op_smax_vec, INDEX_op_smin_vec, INDEX_op_umin_vec, 0
+    };
+    const TCGOpcode *hold_list = tcg_swap_vecop_list(vecop_list);
+    TCGv_vec in[2], sat, x;
+    int i;
+
+    in[0] = vmx_ld(rA(ctx->opcode));
+    in[1] = vmx_ld(rB(ctx->opcode));
+    sat = tcg_temp_new_vec(TCG_TYPE_V128);
+    x = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_dupi_vec(MO_8, sat, 0);
+    for (i = 0; i < 2; i++) {
+        if (sign_in) {
+            tcg_gen_smax_vec(vece, x, in[i],
+                             tcg_constant_vec(TCG_TYPE_V128, vece, lo));
+            tcg_gen_smin_vec(vece, x, x,
+                             tcg_constant_vec(TCG_TYPE_V128, vece, hi));
+        } else {
+            tcg_gen_umin_vec(vece, x, in[i],
+                             tcg_constant_vec(TCG_TYPE_V128, vece, hi));
+        }
+        tcg_gen_xor_vec(vece, in[i], in[i], x);
+        tcg_gen_or_vec(vece, sat, sat, in[i]);
+        tcg_gen_mov_vec(in[i], x);
+    }
+    vmx_accumulate_sat(sat);
+    vmx_st(rD(ctx->opcode),
+           vmx_permute(in[0], in[1],
+                       vmx_ld_const(vece == MO_16 ? pack_h : pack_w)));
+    tcg_swap_vecop_list(hold_list);
+}
+
+#define GEN_VXFORM_PACK_SAT(name, vece, sign_in, lo, hi)                \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    TCGv_ptr ra, rb, rd;                                                \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmx_host_tbl()) {                                               \
+        gen_vmx_pack_sat(ctx, vece, sign_in, lo, hi);                   \
+        return;                                                         \
+    }                                                                   \
+    ra = gen_avr_ptr(rA(ctx->opcode));                                  \
+    rb = gen_avr_ptr(rB(ctx->opcode));                                  \
+    rd = gen_avr_ptr(rD(ctx->opcode));                                  \
+    gen_helper_##name(tcg_env, rd, ra, rb);                             \
+}
+
+GEN_VXFORM_PACK_SAT(vpkuhus, MO_16, false, 0, 0xff);
+GEN_VXFORM_PACK_SAT(vpkuwus, MO_32, false, 0, 0xffff);
 GEN_VXFORM_ENV(vpkudus, 7, 19);
-GEN_VXFORM_ENV(vpkshus, 7, 4);
-GEN_VXFORM_ENV(vpkswus, 7, 5);
+GEN_VXFORM_PACK_SAT(vpkshus, MO_16, true, 0, 0xff);
+GEN_VXFORM_PACK_SAT(vpkswus, MO_32, true, 0, 0xffff);
 GEN_VXFORM_ENV(vpksdus, 7, 21);
-GEN_VXFORM_ENV(vpkshss, 7, 6);
-GEN_VXFORM_ENV(vpkswss, 7, 7);
+GEN_VXFORM_PACK_SAT(vpkshss, MO_16, true, -0x80, 0x7f);
+GEN_VXFORM_PACK_SAT(vpkswss, MO_32, true, -0x8000, 0x7fff);
 GEN_VXFORM_ENV(vpksdss, 7, 23);
 GEN_VXFORM(vpkpx, 7, 12);
 GEN_VXFORM_ENV(vsum4ubs, 4, 24);
@@ -1432,11 +1602,44 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
         rb = gen_avr_ptr(rB(ctx->opcode));                              \
         gen_helper_##name(cpu_gpr[rD(ctx->opcode)], rb);                \
     }
-GEN_VXFORM_NOA(vupkhsb, 7, 8);
-GEN_VXFORM_NOA(vupkhsh, 7, 9);
+/*
+ * Signed unpacks: move each source element into the top of its wider
+ * result element with a shuffle, then shift it down arithmetically.
+ */
+#define GEN_VXFORM_UNPACK(name, vece, ...)                               \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    static const uint8_t table[16] QEMU_ALIGNED(16) =                   \
+        VMX_PICK(__VA_ARGS__);                                          \
+    TCGv_ptr rb, rd;                                                    \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmx_host_tbl()) {                                               \
+        static const TCGOpcode vecop_list[] = { INDEX_op_sari_vec, 0 }; \
+        const TCGOpcode *hold_list = tcg_swap_vecop_list(vecop_list);   \
+        TCGv_vec b = vmx_ld(rB(ctx->opcode));                           \
+        TCGv_vec r = vmx_permute(b, b, vmx_ld_const(table));            \
+        tcg_gen_sari_vec(vece, r, r, 4 << vece);                        \
+        vmx_st(rD(ctx->opcode), r);                                     \
+        tcg_swap_vecop_list(hold_list);                                 \
+        return;                                                         \
+    }                                                                   \
+    rb = gen_avr_ptr(rB(ctx->opcode));                                  \
+    rd = gen_avr_ptr(rD(ctx->opcode));                                  \
+    gen_helper_##name(rd, rb);                                          \
+}
+
+GEN_VXFORM_UNPACK(vupkhsb, MO_16,
+                  0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+GEN_VXFORM_UNPACK(vupkhsh, MO_32,
+                  0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7);
 GEN_VXFORM_NOA(vupkhsw, 7, 25);
-GEN_VXFORM_NOA(vupklsb, 7, 10);
-GEN_VXFORM_NOA(vupklsh, 7, 11);
+GEN_VXFORM_UNPACK(vupklsb, MO_16,
+                  8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15);
+GEN_VXFORM_UNPACK(vupklsh, MO_32,
+                  8, 9, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15, 14, 15);
 GEN_VXFORM_NOA(vupklsw, 7, 27);
 GEN_VXFORM_NOA(vupkhpx, 7, 13);
 GEN_VXFORM_NOA(vupklpx, 7, 15);
@@ -1889,6 +2092,21 @@ static void gen_vsldoi(DisasContext *ctx)
     }
     ra = gen_avr_ptr(rA(ctx->opcode));
     rb = gen_avr_ptr(rB(ctx->opcode));
+    if (vmx_host_tbl()) {
+        /*
+         * PPC byte i of the result is byte i + sh of vA:vB, so host
+         * byte j indexes 31 - (15 - j + sh) = 16 - sh + j: a window of
+         * an ascending sequence.
+         */
+        static const uint8_t seq[32] QEMU_ALIGNED(16) = {
+             0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+        };
+        vmx_st(rD(ctx->opcode),
+               vmx_permute(vmx_ld(rA(ctx->opcode)), vmx_ld(rB(ctx->opcode)),
+                           vmx_ld_const(&seq[16 - VSH(ctx->opcode)])));
+        return;
+    }
     rd = gen_avr_ptr(rD(ctx->opcode));
     sh = tcg_constant_i32(VSH(ctx->opcode));
     gen_helper_vsldoi(rd, ra, rb, sh);
@@ -2304,7 +2522,23 @@ TRANS_FLAGS2(ALTIVEC_207, VADDEUQM, do_va_helper, gen_helper_VADDEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBEUQM, do_va_helper, gen_helper_VSUBEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBECUQ, do_va_helper, gen_helper_VSUBECUQ)
 
-TRANS_FLAGS(ALTIVEC, VPERM, do_va_helper, gen_helper_VPERM)
+static bool trans_VPERM(DisasContext *ctx, arg_VA *a)
+{
+    TCGv_vec idx;
+
+    REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
+    if (!vmx_host_tbl()) {
+        return do_va_helper(ctx, a, gen_helper_VPERM);
+    }
+    REQUIRE_VECTOR(ctx);
+
+    /* The pick for each byte is the low 5 bits of vC; index 31 - s. */
+    idx = vmx_ld(a->rc);
+    tcg_gen_andc_vec(MO_8, idx, tcg_constant_vec(TCG_TYPE_V128, MO_8, 0x1f),
+                     idx);
+    vmx_st(a->vrt, vmx_permute(vmx_ld(a->vra), vmx_ld(a->vrb), idx));
+    return true;
+}
 TRANS_FLAGS2(ISA300, VPERMR, do_va_helper, gen_helper_VPERMR)
 
 static void gen_vmladduhm_vec(unsigned vece, TCGv_vec t, TCGv_vec a, TCGv_vec b,
@@ -2349,10 +2583,117 @@ static bool trans_VSEL(DisasContext *ctx, arg_VA *a)
     return true;
 }
 
-TRANS_FLAGS(ALTIVEC, VMSUMUBM, do_va_helper, gen_helper_VMSUMUBM)
-TRANS_FLAGS(ALTIVEC, VMSUMMBM, do_va_helper, gen_helper_VMSUMMBM)
-TRANS_FLAGS(ALTIVEC, VMSUMSHM, do_va_helper, gen_helper_VMSUMSHM)
-TRANS_FLAGS(ALTIVEC, VMSUMUHM, do_va_helper, gen_helper_VMSUMUHM)
+/*
+ * Products of the even or odd elements of a and b, each in an element of
+ * twice the width (vece).  A PPC even element is the more significant
+ * half of the wider element, in either byte order.
+ */
+static TCGv_vec vmx_mul_eo(unsigned vece, TCGv_vec a, TCGv_vec b, bool even,
+                           bool sign_a, bool sign_b)
+{
+    unsigned half = 4 << vece;
+    TCGv_vec in[2] = { a, b };
+    bool sign[2] = { sign_a, sign_b };
+    TCGv_vec x[2];
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        x[i] = tcg_temp_new_vec(TCG_TYPE_V128);
+        if (even) {
+            if (sign[i]) {
+                tcg_gen_sari_vec(vece, x[i], in[i], half);
+            } else {
+                tcg_gen_shri_vec(vece, x[i], in[i], half);
+            }
+        } else if (sign[i]) {
+            tcg_gen_shli_vec(vece, x[i], in[i], half);
+            tcg_gen_sari_vec(vece, x[i], x[i], half);
+        } else {
+            tcg_gen_and_vec(vece, x[i], in[i],
+                            tcg_constant_vec(TCG_TYPE_V128, vece,
+                                             MAKE_64BIT_MASK(0, half)));
+        }
+    }
+    tcg_gen_mul_vec(vece, x[0], x[0], x[1]);
+    return x[0];
+}
+
+static const TCGOpcode vmx_mul_list[] = {
+    INDEX_op_shli_vec, INDEX_op_shri_vec, INDEX_op_sari_vec,
+    INDEX_op_add_vec, INDEX_op_mul_vec, 0
+};
+
+/* Inline even/odd multiplies need 16- and 32-bit vector multiplies. */
+static bool vmx_host_mul(void)
+{
+    return vmx_host_tbl()
+        && tcg_can_emit_vecop_list(vmx_mul_list, TCG_TYPE_V128, MO_16)
+        && tcg_can_emit_vecop_list(vmx_mul_list, TCG_TYPE_V128, MO_32);
+}
+
+/* Add both halves of each 32-bit element of x, as 16-bit values, to acc. */
+static void vmx_add_halves(TCGv_vec acc, TCGv_vec x, bool sign)
+{
+    TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    if (sign) {
+        tcg_gen_sari_vec(MO_32, t, x, 16);
+        tcg_gen_add_vec(MO_32, acc, acc, t);
+        tcg_gen_shli_vec(MO_32, t, x, 16);
+        tcg_gen_sari_vec(MO_32, t, t, 16);
+    } else {
+        tcg_gen_shri_vec(MO_32, t, x, 16);
+        tcg_gen_add_vec(MO_32, acc, acc, t);
+        tcg_gen_and_vec(MO_32, t, x,
+                        tcg_constant_vec(TCG_TYPE_V128, MO_32, 0xffff));
+    }
+    tcg_gen_add_vec(MO_32, acc, acc, t);
+}
+
+/*
+ * Modulo multiply-sums: vD.word = vC.word + the sum of the products of the
+ * byte (vece MO_16 products) or halfword (MO_32) elements in that word.
+ */
+static bool do_vmsum_mod(DisasContext *ctx, arg_VA *a, unsigned vece,
+                         bool sign_a, bool sign_b,
+                         void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr,
+                                        TCGv_ptr))
+{
+    const TCGOpcode *hold_list;
+    TCGv_vec va, vb, acc, pe, po;
+
+    if (!vmx_host_mul()) {
+        return do_va_helper(ctx, a, helper);
+    }
+    REQUIRE_VECTOR(ctx);
+
+    hold_list = tcg_swap_vecop_list(vmx_mul_list);
+    va = vmx_ld(a->vra);
+    vb = vmx_ld(a->vrb);
+    acc = vmx_ld(a->rc);
+    pe = vmx_mul_eo(vece, va, vb, true, sign_a, sign_b);
+    po = vmx_mul_eo(vece, va, vb, false, sign_a, sign_b);
+    if (vece == MO_32) {
+        tcg_gen_add_vec(MO_32, acc, acc, pe);
+        tcg_gen_add_vec(MO_32, acc, acc, po);
+    } else {
+        /* A byte pair's sum can overflow 16 bits, so widen each product. */
+        vmx_add_halves(acc, pe, sign_a || sign_b);
+        vmx_add_halves(acc, po, sign_a || sign_b);
+    }
+    vmx_st(a->vrt, acc);
+    tcg_swap_vecop_list(hold_list);
+    return true;
+}
+
+TRANS_FLAGS(ALTIVEC, VMSUMUBM, do_vmsum_mod, MO_16, false, false,
+            gen_helper_VMSUMUBM)
+TRANS_FLAGS(ALTIVEC, VMSUMMBM, do_vmsum_mod, MO_16, true, false,
+            gen_helper_VMSUMMBM)
+TRANS_FLAGS(ALTIVEC, VMSUMSHM, do_vmsum_mod, MO_32, true, true,
+            gen_helper_VMSUMSHM)
+TRANS_FLAGS(ALTIVEC, VMSUMUHM, do_vmsum_mod, MO_32, false, false,
+            gen_helper_VMSUMUHM)
 
 static bool do_va_env_helper(DisasContext *ctx, arg_VA *a,
     void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
@@ -3085,14 +3426,40 @@ static bool trans_VMULLD(DisasContext *ctx, arg_VX *a)
     return true;
 }
 
-TRANS_FLAGS(ALTIVEC, VMULESB, do_vx_helper, gen_helper_VMULESB)
-TRANS_FLAGS(ALTIVEC, VMULOSB, do_vx_helper, gen_helper_VMULOSB)
-TRANS_FLAGS(ALTIVEC, VMULEUB, do_vx_helper, gen_helper_VMULEUB)
-TRANS_FLAGS(ALTIVEC, VMULOUB, do_vx_helper, gen_helper_VMULOUB)
-TRANS_FLAGS(ALTIVEC, VMULESH, do_vx_helper, gen_helper_VMULESH)
-TRANS_FLAGS(ALTIVEC, VMULOSH, do_vx_helper, gen_helper_VMULOSH)
-TRANS_FLAGS(ALTIVEC, VMULEUH, do_vx_helper, gen_helper_VMULEUH)
-TRANS_FLAGS(ALTIVEC, VMULOUH, do_vx_helper, gen_helper_VMULOUH)
+static bool do_vx_vmul_eo(DisasContext *ctx, arg_VX *a, unsigned vece,
+                          bool even, bool sign,
+                          void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr))
+{
+    const TCGOpcode *hold_list;
+
+    if (!vmx_host_mul()) {
+        return do_vx_helper(ctx, a, helper);
+    }
+    REQUIRE_VECTOR(ctx);
+
+    hold_list = tcg_swap_vecop_list(vmx_mul_list);
+    vmx_st(a->vrt, vmx_mul_eo(vece, vmx_ld(a->vra), vmx_ld(a->vrb),
+                              even, sign, sign));
+    tcg_swap_vecop_list(hold_list);
+    return true;
+}
+
+TRANS_FLAGS(ALTIVEC, VMULESB, do_vx_vmul_eo, MO_16, true, true,
+            gen_helper_VMULESB)
+TRANS_FLAGS(ALTIVEC, VMULOSB, do_vx_vmul_eo, MO_16, false, true,
+            gen_helper_VMULOSB)
+TRANS_FLAGS(ALTIVEC, VMULEUB, do_vx_vmul_eo, MO_16, true, false,
+            gen_helper_VMULEUB)
+TRANS_FLAGS(ALTIVEC, VMULOUB, do_vx_vmul_eo, MO_16, false, false,
+            gen_helper_VMULOUB)
+TRANS_FLAGS(ALTIVEC, VMULESH, do_vx_vmul_eo, MO_32, true, true,
+            gen_helper_VMULESH)
+TRANS_FLAGS(ALTIVEC, VMULOSH, do_vx_vmul_eo, MO_32, false, true,
+            gen_helper_VMULOSH)
+TRANS_FLAGS(ALTIVEC, VMULEUH, do_vx_vmul_eo, MO_32, true, false,
+            gen_helper_VMULEUH)
+TRANS_FLAGS(ALTIVEC, VMULOUH, do_vx_vmul_eo, MO_32, false, false,
+            gen_helper_VMULOUH)
 TRANS_FLAGS2(ALTIVEC_207, VMULESW, do_vx_helper, gen_helper_VMULESW)
 TRANS_FLAGS2(ALTIVEC_207, VMULOSW, do_vx_helper, gen_helper_VMULOSW)
 TRANS_FLAGS2(ALTIVEC_207, VMULEUW, do_vx_helper, gen_helper_VMULEUW)

@@ -504,34 +504,200 @@ void helper_VPRTYBQ(ppc_avr_t *r, ppc_avr_t *b, uint32_t v)
     r->VsrD(0) = 0;
 }
 
-#define VARITHFP(suffix, func)                                          \
+/*
+ * Host-FPU fast paths for the AltiVec float ops.
+ *
+ * AltiVec float arithmetic always rounds to nearest and raises no
+ * exceptions the guest can see, so when every input and result lane is
+ * normal or zero the host's IEEE arithmetic gives the same bits as
+ * softfloat.  NaNs, infinities and denormals (whose handling depends on
+ * VSCR[NJ] and on PPC's NaN rules) fall back to softfloat.  This assumes
+ * the host FPU is in its default mode (round to nearest, no flush to
+ * zero, NaN propagation on), as softfloat's own hardfloat path does.
+ */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+/* Every lane normal or zero: no NaN, infinity or denormal. */
+static inline bool vfp_all_zon(float32x4_t v)
+{
+    uint32x4_t u = vreinterpretq_u32_f32(v);
+    uint32x4_t e = vandq_u32(u, vdupq_n_u32(0x7f800000));
+    uint32x4_t special = vceqq_u32(e, vdupq_n_u32(0x7f800000));
+    uint32x4_t denormal = vandq_u32(vceqzq_u32(e),
+                                    vtstq_u32(u, vdupq_n_u32(0x007fffff)));
+
+    return vmaxvq_u32(vorrq_u32(special, denormal)) == 0;
+}
+
+static inline float32x4_t vfp_ld(ppc_avr_t *v)
+{
+    return vreinterpretq_f32_u32(vld1q_u32(v->u32));
+}
+
+static inline bool vfp_st_checked(ppc_avr_t *r, float32x4_t x)
+{
+    if (!vfp_all_zon(x)) {
+        return false;
+    }
+    vst1q_u32(r->u32, vreinterpretq_u32_f32(x));
+    return true;
+}
+
+enum { VFP_ADD, VFP_SUB, VFP_MIN, VFP_MAX, VFP_MADD, VFP_NMSUB,
+       VFP_RE, VFP_RSQRTE };
+
+/* r = op(a, b[, c]); false (r untouched) when softfloat must decide. */
+static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
+                            ppc_avr_t *b, ppc_avr_t *c)
+{
+    float32x4_t fa = vfp_ld(a), fb, fc, x;
+
+    if (!vfp_all_zon(fa)) {
+        return false;
+    }
+    switch (op) {
+    case VFP_RE:
+        return vfp_st_checked(r, vdivq_f32(vdupq_n_f32(1.0f), fa));
+    case VFP_RSQRTE:
+        return vfp_st_checked(r, vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(fa)));
+    }
+    fb = vfp_ld(b);
+    if (!vfp_all_zon(fb)) {
+        return false;
+    }
+    switch (op) {
+    case VFP_ADD:
+        x = vaddq_f32(fa, fb);
+        break;
+    case VFP_SUB:
+        x = vsubq_f32(fa, fb);
+        break;
+    case VFP_MIN:
+        x = vminq_f32(fa, fb);
+        break;
+    case VFP_MAX:
+        x = vmaxq_f32(fa, fb);
+        break;
+    default:
+        fc = vfp_ld(c);
+        if (!vfp_all_zon(fc)) {
+            return false;
+        }
+        if (op == VFP_MADD) {
+            x = vfmaq_f32(fb, fa, fc);                   /* a * c + b */
+        } else {
+            x = vnegq_f32(vfmaq_f32(vnegq_f32(fb), fa, fc)); /* -(a*c - b) */
+        }
+        break;
+    }
+    return vfp_st_checked(r, x);
+}
+
+/* vcfux/vcfsx: r = (float)b / 2^uim. */
+static inline bool vfp_fast_cf(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign)
+{
+    float32x4_t x = sign ? vcvtq_f32_s32(vld1q_s32(b->s32))
+                         : vcvtq_f32_u32(vld1q_u32(b->u32));
+    float32x4_t scale = vreinterpretq_f32_u32(vdupq_n_u32((127 - uim) << 23));
+
+    return vfp_st_checked(r, vmulq_f32(x, scale));
+}
+
+/* vctuxs/vctsxs: r = saturate(trunc(b * 2^uim)), noting saturation. */
+static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign, int *sat)
+{
+    float32x4_t fb = vfp_ld(b);
+    float64x2_t scale = vreinterpretq_f64_u64(
+        vdupq_n_u64((uint64_t)(1023 + uim) << 52));
+    int64x2_t lo, hi;
+    uint32x4_t res;
+    uint64x2_t back_lo, back_hi;
+
+    if (!vfp_all_zon(fb)) {
+        return false;
+    }
+    /* Exact in double; the conversion truncates and saturates to 64 bits. */
+    lo = vcvtq_s64_f64(vmulq_f64(vcvt_f64_f32(vget_low_f32(fb)), scale));
+    hi = vcvtq_s64_f64(vmulq_f64(vcvt_high_f64_f32(fb), scale));
+    if (sign) {
+        int32x4_t n = vcombine_s32(vqmovn_s64(lo), vqmovn_s64(hi));
+        back_lo = vreinterpretq_u64_s64(vmovl_s32(vget_low_s32(n)));
+        back_hi = vreinterpretq_u64_s64(vmovl_high_s32(n));
+        res = vreinterpretq_u32_s32(n);
+    } else {
+        res = vcombine_u32(vqmovun_s64(lo), vqmovun_s64(hi));
+        back_lo = vmovl_u32(vget_low_u32(res));
+        back_hi = vmovl_high_u32(res);
+    }
+    if (vmaxvq_u32(vreinterpretq_u32_u64(
+            vorrq_u64(veorq_u64(back_lo, vreinterpretq_u64_s64(lo)),
+                      veorq_u64(back_hi, vreinterpretq_u64_s64(hi)))))) {
+        *sat = 1;
+    }
+    vst1q_u32(r->u32, res);
+    return true;
+}
+#else
+enum { VFP_ADD, VFP_SUB, VFP_MIN, VFP_MAX, VFP_MADD, VFP_NMSUB,
+       VFP_RE, VFP_RSQRTE };
+
+static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
+                            ppc_avr_t *b, ppc_avr_t *c)
+{
+    return false;
+}
+
+static inline bool vfp_fast_cf(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign)
+{
+    return false;
+}
+
+static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign, int *sat)
+{
+    return false;
+}
+#endif
+
+#define VARITHFP(suffix, func, fast_op)                                 \
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                           ppc_avr_t *b)                                 \
     {                                                                   \
         int i;                                                          \
                                                                         \
+        if (vfp_fast(fast_op, r, a, b, NULL)) {                         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = func(a->f32[i], b->f32[i], &env->vec_status);   \
         }                                                               \
     }
-VARITHFP(addfp, float32_add)
-VARITHFP(subfp, float32_sub)
-VARITHFP(minfp, float32_min)
-VARITHFP(maxfp, float32_max)
+VARITHFP(addfp, float32_add, VFP_ADD)
+VARITHFP(subfp, float32_sub, VFP_SUB)
+VARITHFP(minfp, float32_min, VFP_MIN)
+VARITHFP(maxfp, float32_max, VFP_MAX)
 #undef VARITHFP
 
-#define VARITHFPFMA(suffix, type)                                       \
+#define VARITHFPFMA(suffix, type, fast_op)                              \
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                            ppc_avr_t *b, ppc_avr_t *c)                  \
     {                                                                   \
         int i;                                                          \
+        if (vfp_fast(fast_op, r, a, b, c)) {                            \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = float32_muladd(a->f32[i], c->f32[i], b->f32[i], \
                                        type, &env->vec_status);         \
         }                                                               \
     }
-VARITHFPFMA(maddfp, 0);
-VARITHFPFMA(nmsubfp, float_muladd_negate_result | float_muladd_negate_c);
+VARITHFPFMA(maddfp, 0, VFP_MADD);
+VARITHFPFMA(nmsubfp, float_muladd_negate_result | float_muladd_negate_c,
+            VFP_NMSUB);
 #undef VARITHFPFMA
 
 #define VARITHSAT_CASE(type, op, cvt, element)                          \
@@ -612,19 +778,22 @@ VABSDU(VABSDUH, u16)
 VABSDU(VABSDUW, u32)
 #undef VABSDU
 
-#define VCF(suffix, cvt, element)                                       \
+#define VCF(suffix, cvt, element, sign)                                 \
     void helper_vcf##suffix(CPUPPCState *env, ppc_avr_t *r,             \
                             ppc_avr_t *b, uint32_t uim)                 \
     {                                                                   \
         int i;                                                          \
                                                                         \
+        if (vfp_fast_cf(r, b, uim, sign)) {                             \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             float32 t = cvt(b->element[i], &env->vec_status);           \
             r->f32[i] = float32_scalbn(t, -uim, &env->vec_status);      \
         }                                                               \
     }
-VCF(ux, uint32_to_float32, u32)
-VCF(sx, int32_to_float32, s32)
+VCF(ux, uint32_to_float32, u32, false)
+VCF(sx, int32_to_float32, s32, true)
 #undef VCF
 
 #define VCMPNEZ(NAME, ELEM) \
@@ -717,7 +886,7 @@ void helper_vcmpbfp_dot(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
     vcmpbfp_internal(env, r, a, b, 1);
 }
 
-#define VCT(suffix, satcvt, element)                                    \
+#define VCT(suffix, satcvt, element, sign)                              \
     void helper_vct##suffix(CPUPPCState *env, ppc_avr_t *r,             \
                             ppc_avr_t *b, uint32_t uim)                 \
     {                                                                   \
@@ -725,6 +894,12 @@ void helper_vcmpbfp_dot(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
         int sat = 0;                                                    \
         float_status s = env->vec_status;                               \
                                                                         \
+        if (vfp_fast_ct(r, b, uim, sign, &sat)) {                       \
+            if (sat) {                                                  \
+                set_vscr_sat(env);                                      \
+            }                                                           \
+            return;                                                     \
+        }                                                               \
         set_float_rounding_mode(float_round_to_zero, &s);               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             if (float32_is_any_nan(b->f32[i])) {                        \
@@ -742,8 +917,8 @@ void helper_vcmpbfp_dot(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
             set_vscr_sat(env);                                          \
         }                                                               \
     }
-VCT(uxs, cvtsduw, u32)
-VCT(sxs, cvtsdsw, s32)
+VCT(uxs, cvtsduw, u32, false)
+VCT(sxs, cvtsdsw, s32, true)
 #undef VCT
 
 typedef int64_t do_ger(uint32_t, uint32_t, uint32_t);
@@ -1527,6 +1702,9 @@ void helper_vrefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
     int i;
 
+    if (vfp_fast(VFP_RE, r, b, NULL, NULL)) {
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         r->f32[i] = float32_div(float32_one, b->f32[i], &env->vec_status);
     }
@@ -1554,6 +1732,9 @@ void helper_vrsqrtefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
     int i;
 
+    if (vfp_fast(VFP_RSQRTE, r, b, NULL, NULL)) {
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         float32 t = float32_sqrt(b->f32[i], &env->vec_status);
 

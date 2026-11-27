@@ -606,6 +606,24 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
     tlb_flush_page_by_mmuidx_async_0(cpu, addr, idxmap);
 }
 
+void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
+                                    uint16_t idxmap)
+{
+    assert_cpu_is_self(cpu);
+    addr &= TARGET_PAGE_MASK;
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    for (vaddr i = 0; i < npages; i++) {
+        for (int mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+            if ((idxmap >> mmu_idx) & 1) {
+                tlb_flush_page_locked(cpu, mmu_idx,
+                                      addr + i * TARGET_PAGE_SIZE);
+            }
+        }
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+}
+
 void tlb_flush_page(CPUState *cpu, vaddr addr)
 {
     tlb_flush_page_by_mmuidx(cpu, addr, ALL_MMUIDX_BITS);
@@ -736,7 +754,13 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * If the length is larger than the jump cache size, then it will take
      * longer to clear each entry individually than it will to clear it all.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
+    /*
+     * A page's jump cache bucket is its page number bits [0, P) xor bits
+     * [P, 2P), P = TB_JMP_PAGE_BITS. Any run of 2 << P pages holds an
+     * aligned run of 1 << P pages, which covers every bucket: clearing it
+     * page by page would empty the whole cache, only more slowly.
+     */
+    if (d.len >= (TARGET_PAGE_SIZE * 2 * (TB_JMP_CACHE_SIZE / TB_JMP_PAGE_SIZE))) {
         tcg_flush_jmp_cache(cpu);
         return;
     }

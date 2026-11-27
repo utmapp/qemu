@@ -2094,6 +2094,18 @@ static int ppc_next_unmasked_interrupt(CPUPPCState *env)
 void ppc_maybe_interrupt(CPUPPCState *env)
 {
     CPUState *cs = env_cpu(env);
+
+    /*
+     * The guest rewrites MSR constantly, and every write came here to take
+     * the BQL.  With nothing pending and CPU_INTERRUPT_HARD already clear
+     * there is nothing to change; a source raising an interrupt calls this
+     * itself, under the BQL, after setting pending_interrupts.
+     */
+    if (!bql_locked() && !qatomic_read(&env->pending_interrupts) &&
+        !(qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_HARD)) {
+        return;
+    }
+
     BQL_LOCK_GUARD();
 
     if (ppc_next_unmasked_interrupt(env)) {

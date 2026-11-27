@@ -149,6 +149,7 @@ static void ppc_write_elf_fpregset(NoteFuncArg *arg, PowerPCCPU *cpu, int id)
         uint64_t *fpr = cpu_fpr_ptr(&cpu->env, i);
         fpregset->fpr[i] = cpu_to_dump64(s, *fpr);
     }
+    ppc_fprf_sync(&cpu->env);
     fpregset->fpscr = cpu_to_dump_reg(s, cpu->env.fpscr);
 }
 

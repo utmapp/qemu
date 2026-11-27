@@ -811,6 +811,7 @@ enum {
     HFLAGS_PMC_OTHER = 18, /* PMC other than PMC5-6 is enabled */
     HFLAGS_INSN_CNT = 19, /* PMU instruction count enabled */
     HFLAGS_BHRB_ENABLE = 20, /* Summary flag for enabling BHRB */
+    HFLAGS_FP_FAST = 21, /* FPSCR: no FP exception enabled, NI=0, RN=0 */
     HFLAGS_VSX = 23, /* MSR_VSX if cpu has VSX */
     HFLAGS_VR = 25,  /* MSR_VR if cpu has VRE */
 
@@ -1232,6 +1233,12 @@ struct CPUArchState {
     target_ulong ca;
     target_ulong ov32;
     target_ulong ca32;
+    /*
+     * The result of the last inline FP op (fp-impl.c.inc), whose FPRF is
+     * not in fpscr yet, or PPC_FPRF_NONE; see ppc_fprf_sync().  Up here
+     * so translated code reaches it with a single store.
+     */
+    uint64_t fprf_res;
 
     target_ulong reserve_addr;   /* Reservation address */
     target_ulong reserve_length; /* Reservation larx op size (bytes) */
@@ -1281,6 +1288,27 @@ struct CPUArchState {
     uint32_t tlb_need_flush; /* Delayed flush needed */
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
+#define TLB_NEED_PAGE_FLUSH    0x4
+#define TLB_NEED_SR_SWITCH     0x8 /* segment registers changed */
+/*
+ * Pages named by tlbie since the last flush.  A 32-bit hash MMU guest
+ * (Mac OS X) invalidates single pages constantly; turning each of those
+ * into a whole-TLB flush, as the architecture's congruence-class wording
+ * would allow, costs far more than flushing the pages it actually named.
+ * Past this many pending pages a full flush is cheaper anyway.
+ */
+#define PPC_TLB_PENDING_PAGES 64
+    target_ulong tlb_flush_pages[PPC_TLB_PENDING_PAGES];
+    int tlb_flush_npages;
+/*
+ * The segment register sets that have their own QEMU TLB on a 32-bit hash
+ * MMU (see ppc_mmu_slot_sync), each with its last use; 0 means unused.
+ */
+#define PPC_MMU_SLOTS 4
+    target_ulong mmu_slot_sr[PPC_MMU_SLOTS][16];
+    uint64_t mmu_slot_used[PPC_MMU_SLOTS];
+    uint64_t mmu_slot_clock;
+    int mmu_slot; /* the current set's slot */
 #endif
 
     /* Other registers */
@@ -1645,12 +1673,33 @@ void store_40x_tsr(CPUPPCState *env, target_ulong val);
 void store_booke_tcr(CPUPPCState *env, target_ulong val);
 void store_booke_tsr(CPUPPCState *env, target_ulong val);
 void ppc_tlb_invalidate_all(CPUPPCState *env);
+void ppc_mmu_slot_sync(CPUPPCState *env);
+void ppc_mmu_slots_reset(CPUPPCState *env);
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr);
 void cpu_ppc_set_vhyp(PowerPCCPU *cpu, PPCVirtualHypervisor *vhyp);
 void cpu_ppc_set_1lpar(PowerPCCPU *cpu);
 #endif
 
 void ppc_store_fpscr(CPUPPCState *env, target_ulong val);
+
+/*
+ * The inline FP ops leave FPSCR[FPRF] to be computed from their result
+ * when it is needed: code that reads FPRF, or changes only part of it,
+ * calls ppc_fprf_sync() first; code that sets all of FPRF calls
+ * ppc_fprf_clear().  The sentinel is a NaN, which an inline op never keeps.
+ */
+#define PPC_FPRF_NONE UINT64_MAX
+void ppc_fprf_sync_slow(CPUPPCState *env);
+static inline void ppc_fprf_sync(CPUPPCState *env)
+{
+    if (unlikely(env->fprf_res != PPC_FPRF_NONE)) {
+        ppc_fprf_sync_slow(env);
+    }
+}
+static inline void ppc_fprf_clear(CPUPPCState *env)
+{
+    env->fprf_res = PPC_FPRF_NONE;
+}
 void helper_hfscr_facility_check(CPUPPCState *env, uint32_t bit,
                                  const char *caller, uint32_t cause);
 
@@ -1684,7 +1733,10 @@ static inline int ppc_env_mmu_index(CPUPPCState *env, bool ifetch)
 #ifdef CONFIG_USER_ONLY
     return MMU_USER_IDX;
 #else
-    return (env->hflags >> (ifetch ? HFLAGS_IMMU_IDX : HFLAGS_DMMU_IDX)) & 7;
+    int idx = (env->hflags >> (ifetch ? HFLAGS_IMMU_IDX : HFLAGS_DMMU_IDX)) & 7;
+
+    /* Translated accesses use the current segment register set's TLB. */
+    return idx & 2 ? idx : idx | env->mmu_slot << 2;
 #endif
 }
 
@@ -2759,6 +2811,16 @@ void cpu_write_xer(CPUPPCState *env, target_ulong xer);
  */
 #define is_book3s_arch2x(ctx) (!!((ctx)->insns_flags & PPC_SEGMENT_64B))
 
+/* The TB's memory accesses use its segment register set's TLB. */
+static inline uint64_t ppc_tb_cs_base(CPUPPCState *env)
+{
+#ifdef CONFIG_USER_ONLY
+    return 0;
+#else
+    return env->mmu_slot;
+#endif
+}
+
 #ifdef CONFIG_DEBUG_TCG
 void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
                           uint64_t *cs_base, uint32_t *flags);
@@ -2767,7 +2829,7 @@ static inline void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
                                         uint64_t *cs_base, uint32_t *flags)
 {
     *pc = env->nip;
-    *cs_base = 0;
+    *cs_base = ppc_tb_cs_base(env);
     *flags = env->hflags;
 }
 #endif

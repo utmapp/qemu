@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/exec-all.h"
@@ -161,6 +162,7 @@ void helper_compute_fprf_##tp(CPUPPCState *env, tp arg)           \
             fprf = 0x11 << FPSCR_FPRF;                            \
         }                                                         \
     }                                                             \
+    ppc_fprf_clear(env);                                          \
     env->fpscr = (env->fpscr & ~FP_FPRF) | fprf;                  \
 }
 
@@ -192,6 +194,7 @@ static void finish_invalid_op_arith(CPUPPCState *env, int op,
     env->fpscr &= ~(FP_FR | FP_FI);
     if (!(env->fpscr & FP_VE)) {
         if (set_fpcc) {
+            ppc_fprf_sync(env);
             env->fpscr &= ~FP_FPCC;
             env->fpscr |= (FP_C | FP_FU);
         }
@@ -252,6 +255,7 @@ static void float_invalid_op_vxvc(CPUPPCState *env, bool set_fpcc,
 {
     env->fpscr |= FP_VXVC;
     if (set_fpcc) {
+        ppc_fprf_sync(env);
         env->fpscr &= ~FP_FPCC;
         env->fpscr |= (FP_C | FP_FU);
     }
@@ -279,6 +283,7 @@ static void float_invalid_op_vxcvi(CPUPPCState *env, bool set_fpcc,
     env->fpscr &= ~(FP_FR | FP_FI);
     if (!(env->fpscr & FP_VE)) {
         if (set_fpcc) {
+            ppc_fprf_sync(env);
             env->fpscr &= ~FP_FPCC;
             env->fpscr |= (FP_C | FP_FU);
         }
@@ -355,9 +360,20 @@ static inline void float_inexact_excp(CPUPPCState *env)
     }
 }
 
+void ppc_fprf_sync_slow(CPUPPCState *env)
+{
+    helper_compute_fprf_float64(env, env->fprf_res);
+}
+
+void helper_fprf_sync(CPUPPCState *env)
+{
+    ppc_fprf_sync(env);
+}
+
 void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 {
     uint32_t mask = 1u << bit;
+    ppc_fprf_sync(env);
     if (env->fpscr & mask) {
         ppc_store_fpscr(env, env->fpscr & ~(target_ulong)mask);
     }
@@ -366,6 +382,7 @@ void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 void helper_fpscr_setbit(CPUPPCState *env, uint32_t bit)
 {
     uint32_t mask = 1u << bit;
+    ppc_fprf_sync(env);
     if (!(env->fpscr & mask)) {
         ppc_store_fpscr(env, env->fpscr | mask);
     }
@@ -376,6 +393,7 @@ void helper_store_fpscr(CPUPPCState *env, uint64_t val, uint32_t nibbles)
     target_ulong mask = 0;
     int i;
 
+    ppc_fprf_sync(env);
     /* TODO: push this extension back to translation time */
     for (i = 0; i < sizeof(target_ulong) * 2; i++) {
         if (nibbles & (1 << i)) {
@@ -892,6 +910,7 @@ void helper_fcmpu(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = ret;
@@ -923,6 +942,7 @@ void helper_fcmpo(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = (uint32_t) ret;
@@ -2189,6 +2209,7 @@ void helper_xscmpexpdp(CPUPPCState *env, uint32_t opcode,
         }
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[BF(opcode)] = cc;
@@ -2218,6 +2239,7 @@ void helper_xscmpexpqp(CPUPPCState *env, uint32_t opcode,
         }
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[BF(opcode)] = cc;
@@ -2264,6 +2286,7 @@ static inline void do_scalar_cmp(CPUPPCState *env, ppc_vsr_t *xa, ppc_vsr_t *xb,
         g_assert_not_reached();
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[crf_idx] = cc;
@@ -2329,6 +2352,7 @@ static inline void do_scalar_cmpq(CPUPPCState *env, ppc_vsr_t *xa,
         g_assert_not_reached();
     }
 
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[crf_idx] = cc;
@@ -3169,6 +3193,7 @@ static bool not_SP_value(float64 val)
         uint32_t cc, match, sign = TP##_is_neg(b->FLD);                     \
         match = TP##_tstdc(b->FLD, dcmx);                                   \
         cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT;                      \
+        ppc_fprf_sync(env);                                                 \
         env->fpscr &= ~FP_FPCC;                                             \
         env->fpscr |= cc << FPSCR_FPCC;                                     \
         env->crf[bf] = cc;                                                  \
@@ -3186,6 +3211,7 @@ void helper_XSTSTDCSP(CPUPPCState *env, uint32_t bf,
     int not_sp = (int)not_SP_value(b->VsrD(0));
     match = float64_tstdc(b->VsrD(0), dcmx) || (exp > 0 && exp < 0x381);
     cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT | not_sp << CRF_SO_BIT;
+    ppc_fprf_sync(env);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= cc << FPSCR_FPCC;
     env->crf[bf] = cc;
@@ -3657,4 +3683,176 @@ void helper_XVF64GERNN(CPUPPCState *env, ppc_vsr_t *a, ppc_vsr_t *b,
 {
     vsxger(env, a, b, at, mask, true, true, true, vsxger_mul64,
            vsxger_muladd64, vsxger_zero64);
+}
+
+
+/*
+ * Fast path for the A-form arithmetic ops (fadd/fsub/fmul/fdiv/f[n]m{add,sub}
+ * and their single-precision forms).  QEMU normally emits four helper calls
+ * per op (reset status, softfloat op, FPRF, check status); under emulated
+ * Mac OS X games that was a quarter of the vCPU's time.  In the state Mac OS
+ * X runs applications in - round to nearest, no FP exception enabled, NI off
+ * - the host FPU gives the IEEE result PowerPC defines, so compute there and
+ * only fall back to softfloat for NaNs or single-precision ops whose inputs
+ * are not exact singles.  Sticky exception bits (XX, OX, UX, ...) are not
+ * accumulated on the fast path.  PPC_STRICT_FP=1 disables it.
+ */
+enum {
+    FF_ADD, FF_ADDS, FF_SUB, FF_SUBS, FF_MUL, FF_MULS, FF_DIV, FF_DIVS,
+    FF_MADD = 16, FF_MADDS, FF_MSUB, FF_MSUBS, FF_NMADD, FF_NMADDS,
+    FF_NMSUB, FF_NMSUBS,
+};
+
+static inline bool fastfp_ok(CPUPPCState *env)
+{
+    static int strict = -1;
+    if (unlikely(strict < 0)) {
+        const char *e = getenv("PPC_STRICT_FP");
+        strict = e && e[0] == '1';
+    }
+    return !strict && !(env->fpscr & (FP_VE | FP_OE | FP_UE | FP_ZE | FP_XE |
+                                      FP_NI | FP_RN));
+}
+
+static inline double ff_d(uint64_t v)
+{
+    double d;
+    memcpy(&d, &v, 8);
+    return d;
+}
+
+static inline uint64_t ff_u(double d)
+{
+    uint64_t v;
+    memcpy(&v, &d, 8);
+    return v;
+}
+
+static inline bool ff_single(double d)
+{
+    return (double)(float)d == d;
+}
+
+/*
+ * Set FPRF for a result the fast path produced.
+ *
+ * helper_compute_fprf_float64() decides between five classes with a chain of
+ * softfloat predicates, and it ran on every arithmetic operation -- 2.25% of
+ * the vCPU thread in a Warcraft III profile, on top of the call itself.
+ *
+ * Nearly every result is an ordinary normal number, and that case is two bit
+ * tests on the exponent: not all-zero (zero or denormal) and not all-ones
+ * (infinity or NaN). Anything else goes to the full helper, which stays the
+ * single definition of what the other classes mean.
+ *
+ * The caller has already rejected NaN, so this does not have to distinguish
+ * signalling from quiet -- but it does not assume that either, since the
+ * all-ones exponent is handled by falling through.
+ */
+static inline void ff_fprf(CPUPPCState *env, uint64_t r)
+{
+    uint32_t exp = (r >> 52) & 0x7FF;
+
+    if (likely(exp != 0 && exp != 0x7FF)) {
+        target_ulong fprf = (r >> 63) ? (0x08 << FPSCR_FPRF)
+                                      : (0x04 << FPSCR_FPRF);
+        ppc_fprf_clear(env);
+        env->fpscr = (env->fpscr & ~FP_FPRF) | fprf;
+    } else {
+        helper_compute_fprf_float64(env, r);
+    }
+}
+
+uint64_t helper_fastfp_ab(CPUPPCState *env, uint64_t a, uint64_t b, uint32_t op)
+{
+    uintptr_t ra = GETPC();
+    if (likely(fastfp_ok(env))) {
+        double x = ff_d(a), y = ff_d(b), r;
+        bool ok = true;
+        switch (op) {
+        case FF_ADD: r = x + y; break;
+        case FF_SUB: r = x - y; break;
+        case FF_MUL: r = x * y; break;
+        case FF_DIV: r = x / y; break;
+        default:
+            ok = ff_single(x) && ff_single(y);
+            switch (op) {
+            case FF_ADDS: r = (float)x + (float)y; break;
+            case FF_SUBS: r = (float)x - (float)y; break;
+            case FF_MULS: r = (float)x * (float)y; break;
+            default:      r = (float)x / (float)y; break;
+            }
+            break;
+        }
+        if (likely(ok && !isnan(r))) {
+            uint64_t ret = ff_u(r);
+            ff_fprf(env, ret);
+            return ret;
+        }
+    }
+    /* exact softfloat path, as the four separate helpers would do it */
+    set_float_exception_flags(0, &env->fp_status);
+    float64 ret;
+    int flags;
+    switch (op) {
+    case FF_ADD:  ret = float64_add(a, b, &env->fp_status); break;
+    case FF_ADDS: ret = float64r32_add(a, b, &env->fp_status); break;
+    case FF_SUB:  ret = float64_sub(a, b, &env->fp_status); break;
+    case FF_SUBS: ret = float64r32_sub(a, b, &env->fp_status); break;
+    case FF_MUL:  ret = float64_mul(a, b, &env->fp_status); break;
+    case FF_MULS: ret = float64r32_mul(a, b, &env->fp_status); break;
+    case FF_DIV:  ret = float64_div(a, b, &env->fp_status); break;
+    default:      ret = float64r32_div(a, b, &env->fp_status); break;
+    }
+    flags = get_float_exception_flags(&env->fp_status);
+    switch (op) {
+    case FF_ADD: case FF_ADDS: case FF_SUB: case FF_SUBS:
+        addsub_flags_handler(env, flags, ra); break;
+    case FF_MUL: case FF_MULS:
+        mul_flags_handler(env, flags, ra); break;
+    default:
+        div_flags_handler(env, flags, ra); break;
+    }
+    helper_compute_fprf_float64(env, ret);
+    do_float_check_status(env, true, ra);
+    return ret;
+}
+
+uint64_t helper_fastfp_acb(CPUPPCState *env, uint64_t a, uint64_t c,
+                           uint64_t b, uint32_t op)
+{
+    uintptr_t ra = GETPC();
+    static const int mflags[4] = { MADD_FLGS, MSUB_FLGS, NMADD_FLGS, NMSUB_FLGS };
+    int kind = (op - FF_MADD) >> 1;
+    bool single = (op - FF_MADD) & 1;
+    if (likely(fastfp_ok(env))) {
+        double x = ff_d(a), y = ff_d(c), z = ff_d(b), r;
+        bool ok = true;
+        double zz = (kind & 1) ? -z : z;          /* msub / nmsub */
+        if (single) {
+            ok = ff_single(x) && ff_single(y) && ff_single(z);
+            r = fmaf((float)x, (float)y, (float)zz);
+        } else {
+            r = fma(x, y, zz);
+        }
+        if (likely(ok && !isnan(r))) {
+            uint64_t ret = ff_u(r);
+            /*
+             * nmadd / nmsub negate the rounded result, so an exact zero
+             * sum gives -0.  Flip the bit: the compiler would fold -fma()
+             * into AArch64 FNMADD, -(x*y)-z, which gives +0 there.
+             */
+            if (kind & 2) {
+                ret ^= INT64_MIN;
+            }
+            ff_fprf(env, ret);
+            return ret;
+        }
+    }
+    set_float_exception_flags(0, &env->fp_status);
+    uint64_t ret = single ? do_fmadds(env, a, c, b, mflags[kind], ra)
+                          : do_fmadd(env, a, c, b, mflags[kind], ra);
+    helper_compute_fprf_float64(env, ret);
+    do_float_check_status(env, true, ra);
+    return ret;
 }
