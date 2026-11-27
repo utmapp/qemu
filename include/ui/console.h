@@ -335,6 +335,13 @@ int dpy_set_ui_info(QemuConsole *con, QemuUIInfo *info, bool delay);
 
 void dpy_gfx_update(QemuConsole *con, int x, int y, int w, int h);
 void dpy_gfx_update_full(QemuConsole *con);
+/*
+ * Ask the UI to run its device refresh on the next main-loop iteration
+ * instead of waiting for the polling interval: for a device that knows a
+ * frame is ready now (a page flip, a render-queue completion).  Repeated
+ * calls coalesce into one refresh; safe to call from a worker thread.
+ */
+void dpy_refresh_soon(QemuConsole *con);
 void dpy_gfx_replace_surface(QemuConsole *con,
                              DisplaySurface *surface);
 void dpy_text_cursor(QemuConsole *con, int x, int y);
