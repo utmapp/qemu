@@ -56,6 +56,14 @@ struct UNINHostState {
     MemoryRegion pci_io;
 };
 
+/*
+ * Physical base of the AGP GART page table, as programmed by the guest's
+ * AGP driver through the AGP bridge's PCI config space.  Returns 0 if the
+ * guest has not programmed it yet.
+ */
+hwaddr uninorth_get_agp_gart_base(void);
+uint32_t uninorth_get_agp_gart_gen(void);
+
 struct UNINState {
     SysBusDevice parent_obj;
 

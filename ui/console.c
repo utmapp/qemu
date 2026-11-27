@@ -105,6 +105,25 @@ static void gui_update(void *opaque)
     timer_mod(ds->gui_timer, ds->last_update + interval);
 }
 
+/*
+ * Ask the UI to run its device refresh on the next main-loop iteration
+ * rather than waiting for the polling tick: a device that knows a frame is
+ * ready now (a page flip, a render-queue completion).  Calls coalesce into
+ * one refresh, so this only bounds the latency a poll would add.
+ */
+void dpy_refresh_soon(QemuConsole *con)
+{
+    DisplayState *ds;
+
+    if (!con || con->ds == NULL) {
+        return;
+    }
+    ds = con->ds;
+    if (ds->gui_timer) {
+        timer_mod(ds->gui_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+    }
+}
+
 static void gui_setup_refresh(DisplayState *ds)
 {
     DisplayChangeListener *dcl;

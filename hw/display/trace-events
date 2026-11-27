@@ -225,3 +225,15 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+# ppc_mac_gpu.c - ATI Radeon 9200 (RV280) compatible display device
+ppc_mac_gpu_mmio_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s -> 0x%"PRIx64
+ppc_mac_gpu_mmio_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s <- 0x%"PRIx64
+ppc_mac_gpu_mmio_read_unimpl(unsigned int size, uint64_t addr, const char *name) "%u 0x%"PRIx64" %s [UNIMPL READ]"
+ppc_mac_gpu_mmio_write_unimpl(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s <- 0x%"PRIx64" [UNIMPL WRITE]"
+ppc_mac_gpu_irq(uint32_t status, uint32_t cntl, bool level) "status=0x%x cntl=0x%x level=%d"
+ppc_mac_gpu_mode_change(uint32_t width, uint32_t height, uint32_t bpp, uint32_t stride) "%dx%d @ %dbpp stride=%d"
+ppc_mac_gpu_soft_reset(uint64_t val) "soft reset mask=0x%"PRIx64
+ppc_mac_gpu_realize(uint32_t vram_mb, uint64_t vram_bytes) "vram=%u MB (0x%"PRIx64" bytes)"
+ppc_mac_gpu_cp_ring_setup(uint64_t base, uint32_t cntl) "ring base=0x%"PRIx64" cntl=0x%x"
+ppc_mac_gpu_3d_reg_write(uint64_t addr, uint64_t val) "3D_REG 0x%04"PRIx64" <- 0x%08"PRIx64
+ppc_mac_gpu_3d_cmd(uint32_t opcode, uint32_t body_dw) "3D_CMD opcode=0x%02x body=%u dwords"

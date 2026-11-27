@@ -134,6 +134,7 @@ config MAC_NEWWORLD
     default y
     depends on PPC
     imply PCI_DEVICES
+    imply PPC_MAC_GPU
     imply SUNGEM
     imply TEST_DEVICES
     imply USB_OHCI_PCI
