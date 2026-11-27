@@ -130,6 +130,16 @@ vga_std_write_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"
 vga_vbe_read(uint32_t index, uint32_t val) "index 0x%x, val 0x%x"
 vga_vbe_write(uint32_t index, uint32_t val) "index 0x%x, val 0x%x"
 
+# vga-pci.c
+vga_pvmac_cursor_define(uint32_t size, int hot_x, int hot_y) "size %u hotspot %d,%d"
+vga_pvmac_cursor_pos(int x, int y, bool visible) "x %d y %d visible %d"
+vga_pvmac_gl_doorbell(uint32_t tail, uint32_t head, uint32_t pending, uint32_t expect) "tail %u head %u pending %u expect %u"
+vga_pvmac_gl_enqueue(uint32_t len, uint64_t queued) "enqueue %u bytes, queued %" PRIu64
+vga_pvmac_gl_flush(uint64_t queued) "flush, queued %" PRIu64
+vga_pvmac_gl_present(uint32_t dest, uint32_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t flags, bool valid) "present dest 0x%x pitch %u row_bytes %u rows %u flags 0x%x valid %d"
+vga_pvmac_stream_reset(void) "stream reset"
+vga_pvmac_gl_done(uint32_t reply_len, uint32_t gl_status) "reply_len %u gl_status 0x%x"
+
 # cirrus_vga.c
 vga_cirrus_read_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"
 vga_cirrus_write_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"
