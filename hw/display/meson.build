@@ -89,6 +89,7 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'r300/r300_us.c',
   'r300/r300_spirv.c',
   'r300/r300_draw.c',
+  'ppc_mac_gpu_renderer_sw.c',
 ), pixman] + r300_shader_deps)
 
 system_ss.add(when: 'CONFIG_DPCD', if_true: files('dpcd.c'))
