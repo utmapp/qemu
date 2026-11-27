@@ -106,6 +106,7 @@ struct Core99MachineState {
     MachineState parent;
 
     Core99ViaConfig via_config;
+    char *ndrv;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -508,7 +509,13 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
+    /*
+     * The ndrv= machine option picks another VGA NDRV from the BIOS path,
+     * e.g. qemu_vga_hwc.ndrv, whose hardware cursor the Radeon 9700 needs.
+     */
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS,
+                              core99_machine->ndrv ? core99_machine->ndrv :
+                              NDRV_VGA_FILENAME);
     if (filename) {
         gchar *ndrv_file;
         gsize ndrv_size;
@@ -619,6 +626,19 @@ static void core99_set_via_config(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *core99_get_ndrv(Object *obj, Error **errp)
+{
+    return g_strdup(CORE99_MACHINE(obj)->ndrv);
+}
+
+static void core99_set_ndrv(Object *obj, const char *value, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    g_free(cms->ndrv);
+    cms->ndrv = g_strdup(value);
+}
+
 static void core99_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -630,6 +650,11 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+
+    object_property_add_str(obj, "ndrv", core99_get_ndrv, core99_set_ndrv);
+    object_property_set_description(obj, "ndrv",
+                                    "VGA NDRV file to pass to the firmware "
+                                    "(default " NDRV_VGA_FILENAME ")");
 
     return;
 }
