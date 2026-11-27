@@ -69,8 +69,37 @@ static void ati_vga_set_offset(VGACommonState *vga, uint32_t offs)
     vga->vbe_start_addr = offs / 4;
 }
 
+#ifndef SURFACE_CNTL
+#define SURFACE_CNTL            0x0b00
+#endif
+/* SURFACE_CNTL non-surface aperture swap bits: aperture 0 and 1 */
+#define ATI_SURF_AP_SWAP_MASK   0x00f00000
+
+/*
+ * RetroBoot: everything the scanout format depends on.  The guest programs
+ * these registers in any order, and some (CNFG_CNTL, SURFACE_CNTL, the
+ * display size while the CRTC is off) used to be missed, leaving the old
+ * mode's format in use; the display update compares this and re-applies.
+ */
+static uint64_t ati_mode_signature(ATIVGAState *s)
+{
+    uint64_t sig;
+
+    sig = s->regs.crtc_gen_cntl & (CRTC2_EXT_DISP_EN | CRTC2_EN |
+                                   CRTC_PIX_WIDTH_MASK);
+    sig = sig * 0x100000001b3ULL + (s->regs.crtc_h_total_disp >> 16);
+    sig = sig * 0x100000001b3ULL + (s->regs.crtc_v_total_disp >> 16);
+    sig = sig * 0x100000001b3ULL + (s->regs.crtc_pitch & 0x7ff);
+    sig = sig * 0x100000001b3ULL + (s->regs.config_cntl &
+                                    (APER_0_ENDIAN | APER_1_ENDIAN));
+    sig = sig * 0x100000001b3ULL + (s->regfile[SURFACE_CNTL / 4] &
+                                    ATI_SURF_AP_SWAP_MASK);
+    return sig;
+}
+
 static void ati_vga_switch_mode(ATIVGAState *s)
 {
+    s->mode_sig = ati_mode_signature(s);
     s->flip_pending = false;     /* RetroBoot: a new mode shows its own start */
     DPRINTF("%d -> %d\n",
             s->mode, !!(s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN));
@@ -117,11 +146,30 @@ static void ati_vga_switch_mode(ATIVGAState *s)
                 return;
             }
             DPRINTF("Switching to %dx%d %d %d @ %x\n", h, v, stride, bpp, offs);
+            s->vga.big_endian_fb =
+                (s->regs.config_cntl & (APER_0_ENDIAN | APER_1_ENDIAN)) ||
+                (s->regfile[SURFACE_CNTL / 4] & ATI_SURF_AP_SWAP_MASK);
+            if (bpp <= 8) {
+                s->lut_loaded = false;
+            }
+            if (s->scan_bpp != bpp || s->scan_stride != stride ||
+                s->scan_w != h || s->scan_h != v) {
+                /* in-flight/tracked 3D targets belong to the old mode */
+                s->scan_bpp = bpp;
+                s->scan_stride = stride;
+                s->scan_w = h;
+                s->scan_h = v;
+                if (ati_is_radeon(s)) {
+                    ati_3d_mode_changed(s);
+                }
+            }
+            trace_ati_scanout_mode(h, v, bpp, stride, offs,
+                                   s->vga.big_endian_fb,
+                                   s->regs.crtc_gen_cntl, s->regs.crtc_pitch,
+                                   s->regs.config_cntl,
+                                   s->regfile[SURFACE_CNTL / 4]);
             vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_ENABLE);
             vbe_ioport_write_data(&s->vga, 0, VBE_DISPI_DISABLED);
-            s->vga.big_endian_fb = (s->regs.config_cntl & APER_0_ENDIAN ||
-                                    s->regs.config_cntl & APER_1_ENDIAN ?
-                                    true : false);
             /* reset VBE regs then set up mode */
             s->vga.vbe_regs[VBE_DISPI_INDEX_XRES] = h;
             s->vga.vbe_regs[VBE_DISPI_INDEX_YRES] = v;
@@ -143,6 +191,144 @@ static void ati_vga_switch_mode(ATIVGAState *s)
         s->mode = VGA_MODE;
         vbe_ioport_write_index(&s->vga, 0, VBE_DISPI_INDEX_ENABLE);
         vbe_ioport_write_data(&s->vga, 0, VBE_DISPI_DISABLED);
+    }
+}
+
+/*
+ * Display update: re-apply the mode when a register it depends on changed
+ * without ati_vga_switch_mode noticing (see ati_mode_signature).
+ */
+static const GraphicHwOps *ati_base_ops;
+static GraphicHwOps ati_vga_hw_ops;
+
+/* DAC palette entry as an 8-bit component (the VGA palette keeps raw bytes) */
+static inline uint8_t ati_lut_c(VGACommonState *vga, int i, int c)
+{
+    uint8_t v = vga->palette[i * 3 + c];
+
+    return vga->dac_8bit ? v : (v << 2) | (v >> 4);
+}
+
+/*
+ * Direct-colour scanout: the DAC palette is the gamma ramp (DrawSprocket
+ * gamma fades).  Plain VGA ignores it for >8 bpp, so apply it to the
+ * converted shadow surface.  15/16 bpp components index the LUT at spaced
+ * entries (5 bit: c<<3, 6 bit: c<<2).  Only after the guest loaded a LUT in
+ * a direct-colour mode, so the VGA default palette never darkens a desktop.
+ */
+static void ati_apply_gamma_lut(ATIVGAState *s)
+{
+    VGACommonState *vga = &s->vga;
+    DisplaySurface *ds = qemu_console_surface(vga->con);
+    uint8_t lut[3][256];
+    uint32_t sig_lo = 0, sig_hi = 0;
+    bool identity = true, applied = false;
+    int bpp = s->scan_bpp;
+
+    for (int i = 0; i < 256; i++) {
+        for (int c = 0; c < 3; c++) {
+            lut[c][i] = ati_lut_c(vga, i, c);
+            if (lut[c][i] != i) {
+                identity = false;
+            }
+        }
+    }
+    if (s->lut_loaded && !identity && surface_is_allocated(ds) &&
+        surface_bits_per_pixel(ds) == 32) {
+        PixelFormat pf = qemu_pixelformat_from_pixman(pixman_image_get_format(ds->image));
+        int w = surface_width(ds), h = surface_height(ds);
+        uint8_t *row = surface_data(ds);
+
+        for (int y = 0; y < h; y++, row += surface_stride(ds)) {
+            uint32_t *p = (uint32_t *)row;
+
+            for (int x = 0; x < w; x++) {
+                uint32_t px = p[x];
+                unsigned r = (px >> pf.rshift) & 0xff;
+                unsigned g = (px >> pf.gshift) & 0xff;
+                unsigned b = (px >> pf.bshift) & 0xff;
+
+                if (bpp == 15) {
+                    r &= 0xf8; g &= 0xf8; b &= 0xf8;
+                } else if (bpp == 16) {
+                    r &= 0xf8; g &= 0xfc; b &= 0xf8;
+                }
+                px &= ~((0xffu << pf.rshift) | (0xffu << pf.gshift) |
+                        (0xffu << pf.bshift));
+                p[x] = px | ((uint32_t)lut[0][r] << pf.rshift) |
+                       ((uint32_t)lut[1][g] << pf.gshift) |
+                       ((uint32_t)lut[2][b] << pf.bshift);
+            }
+        }
+        dpy_gfx_update_full(vga->con);
+        applied = true;
+    }
+    for (int i = 0; i < 256; i++) {
+        for (int c = 0; c < 3; c++) {
+            sig_lo = sig_lo * 31 + lut[c][i];
+        }
+    }
+    sig_lo ^= s->regs.dac_cntl;
+    sig_hi = (s->lut_loaded ? 1 : 0) | (applied ? 2 : 0) | (bpp << 4);
+    if (((uint64_t)sig_hi << 32 | sig_lo) != s->lut_sig) {
+        s->lut_sig = (uint64_t)sig_hi << 32 | sig_lo;
+        trace_ati_dac_lut(s->regs.dac_cntl, bpp, s->lut_loaded, applied,
+                          lut[0][0] << 16 | lut[1][0] << 8 | lut[2][0],
+                          lut[0][1] << 16 | lut[1][1] << 8 | lut[2][1],
+                          lut[0][128] << 16 | lut[1][128] << 8 | lut[2][128],
+                          lut[0][255] << 16 | lut[1][255] << 8 | lut[2][255]);
+    }
+}
+
+static void ati_vga_gfx_update(void *opaque)
+{
+    VGACommonState *vga = opaque;
+    ATIVGAState *s = container_of(vga, ATIVGAState, vga);
+
+    if (s->mode == EXT_MODE && s->mode_sig != ati_mode_signature(s)) {
+        ati_vga_switch_mode(s);
+    }
+    if (ati_is_radeon(s) && s->mode == EXT_MODE && s->scan_bpp &&
+        s->scan_bpp < 32) {
+        /*
+         * 8/15/16 bpp is converted into a shadow surface, which redraws only
+         * the pages the VGA dirty log reports.  Render-target readbacks and
+         * 2D/3D writes do not reach it reliably (the shared 32 bpp surface
+         * never needed it), and the display stayed frozen.  The frame is
+         * small at these depths: redraw all of it.
+         */
+        s->vga.last_width = -1;
+    }
+    ati_base_ops->gfx_update(opaque);
+    if (ati_is_radeon(s) && s->mode == EXT_MODE && s->scan_bpp > 8) {
+        ati_apply_gamma_lut(s);
+    }
+    if (trace_event_get_state_backends(TRACE_ATI_DISPLAY_SURFACE) &&
+        s->mode == EXT_MODE) {
+        /* what the display actually presented, once a second */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+        if (now - s->dbg_surface_ns >= NANOSECONDS_PER_SECOND) {
+            DisplaySurface *ds = qemu_console_surface(vga->con);
+            uint64_t base = (uint64_t)vga->params.start_addr * 4;
+            uint64_t l240 = base + (uint64_t)vga->params.line_offset * 240;
+            uint64_t v0 = 0, v1 = 0;
+
+            s->dbg_surface_ns = now;
+            if (l240 + 8 <= vga->vram_size) {
+                v0 = ldq_be_p(vga->vram_ptr + base);
+                v1 = ldq_be_p(vga->vram_ptr + l240);
+            }
+            trace_ati_display_surface(surface_width(ds), surface_height(ds),
+                                      surface_stride(ds),
+                                      pixman_image_get_format(ds->image),
+                                      surface_is_allocated(ds));
+            trace_ati_display_vga(vga->get_bpp(vga), vga->params.line_offset,
+                                  vga->params.start_addr, vga->big_endian_fb,
+                                  vga->last_depth,
+                                  vga->vbe_regs[VBE_DISPI_INDEX_ENABLE]);
+            trace_ati_display_vram(v0, v1);
+        }
     }
 }
 
@@ -353,6 +539,41 @@ void ati_flip_settle(ATIVGAState *s)
     }
 }
 
+void ati_front_touch(ATIVGAState *s, unsigned kind, uint64_t off, uint64_t len)
+{
+    uint64_t fs = (uint64_t)s->vga.vbe_start_addr * 4;
+    uint64_t fl = (uint64_t)s->vga.vbe_line_offset *
+                  s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
+
+    if (s->mode == EXT_MODE && off < fs + fl && fs < off + len) {
+        s->fw_mask |= kind;
+    }
+}
+
+/* front-buffer watch: every 4th vblank, log a change with who wrote it */
+static void ati_front_watch(ATIVGAState *s)
+{
+    uint64_t fs = (uint64_t)s->vga.vbe_start_addr * 4;
+    uint64_t fl = (uint64_t)s->vga.vbe_line_offset *
+                  s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
+    uint64_t h = 0xcbf29ce484222325ULL;
+
+    if (!trace_event_get_state_backends(TRACE_ATI_FRONT_CHANGE) ||
+        s->mode != EXT_MODE || fs + fl > s->vga.vram_size ||
+        ++s->fw_tick < 4) {
+        return;
+    }
+    for (uint64_t i = 0; i + 8 <= fl; i += 8) {
+        h = (h ^ ldq_le_p(s->vga.vram_ptr + fs + i)) * 0x100000001b3ULL;
+    }
+    if (h != s->fw_hash) {
+        trace_ati_front_change(fs, fl, h, s->fw_mask, s->fw_tick);
+        s->fw_hash = h;
+        s->fw_mask = 0;
+    }
+    s->fw_tick = 0;
+}
+
 static void ati_vga_vblank_irq(void *opaque)
 {
     ATIVGAState *s = opaque;
@@ -371,6 +592,7 @@ static void ati_vga_vblank_irq(void *opaque)
         ati_scanout_range(s, &mc, &len);
         ati_3d_sync_range(s, mc, len);  /* and start the next ones */
     }
+    ati_front_watch(s);
 
     /*
      * RetroBoot: a steady rate.  The next vblank is due a period after this
@@ -753,6 +975,23 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
     if (addr < CUR_OFFSET || addr > CUR_CLR1 || ATI_DEBUG_HW_CURSOR) {
         trace_ati_mm_write(size, addr, ati_reg_name(addr & ~3ULL), data);
     }
+    if (size == 4 && trace_event_get_state_backends(TRACE_ATI_TILE_REG) &&
+        ((addr >= 0xb00 && addr < 0xb80) || addr == CRTC_OFFSET ||
+         addr == CRTC_OFFSET_CNTL || addr == SRC_PITCH_OFFSET ||
+         addr == DST_PITCH_OFFSET || addr == DEFAULT_OFFSET ||
+         addr == DEFAULT_PITCH || addr == DST_TILE || addr == 0x1c24 ||
+         addr == 0x1c28 || addr == 0x1c48 || addr == DST_PITCH_OFFSET_C)) {
+        /* surface/tiling related registers, when the value changes */
+        static uint32_t last[0x1d00 / 4];
+        static bool seen[0x1d00 / 4];
+        unsigned i = addr / 4;
+
+        if (i < ARRAY_SIZE(last) && (!seen[i] || last[i] != (uint32_t)data)) {
+            seen[i] = true;
+            last[i] = data;
+            trace_ati_tile_reg((uint32_t)addr, (uint32_t)data);
+        }
+    }
     if (addr >= MM_DATA + 4 && addr < sizeof(s->regfile)) {
         ati_reg_write_offs(&s->regfile[addr / 4], addr & 3, data, size);
     }
@@ -920,6 +1159,7 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         }
         break;
     case PALETTE_DATA ... PALETTE_DATA + 3:
+        s->lut_loaded = s->mode == EXT_MODE && s->scan_bpp > 8;
         data <<= addr - PALETTE_DATA;
         data = bswap32(data) >> 8;
         vga_ioport_write(&s->vga, VGA_PEL_D, data & 0xff);
@@ -929,6 +1169,7 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         vga_ioport_write(&s->vga, VGA_PEL_D, data & 0xff);
         break;
     case PALETTE_30_DATA:
+        s->lut_loaded = s->mode == EXT_MODE && s->scan_bpp > 8;
         s->regs.palette[vga_ioport_read(&s->vga, VGA_PEL_IW)] = data;
         vga_ioport_write(&s->vga, VGA_PEL_D, (data >> 22) & 0xff);
         vga_ioport_write(&s->vga, VGA_PEL_D, (data >> 12) & 0xff);
@@ -973,13 +1214,23 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
             ati_scanout_range(s, &mc, &len);
             if (ati_3d_flip(s, mc, len)) {
                 s->flip_pending = true;
+                trace_ati_crtc_offset(s->regs.crtc_offset,
+                                      s->regs.crtc_offset_cntl,
+                                      s->vga.vbe_start_addr * 4, true,
+                                      s->mode);
                 break;
             }
         }
         s->flip_pending = false;
         ati_vga_set_offset(&s->vga, s->regs.crtc_offset & 0x07ffffff);
+        trace_ati_crtc_offset(s->regs.crtc_offset, s->regs.crtc_offset_cntl,
+                              s->vga.vbe_start_addr * 4, s->flip_pending,
+                              s->mode);
         break;
     case CRTC_OFFSET_CNTL:
+        trace_ati_crtc_offset(s->regs.crtc_offset, data,
+                              s->vga.vbe_start_addr * 4, s->flip_pending,
+                              s->mode);
         s->regs.crtc_offset_cntl = data; /* FIXME */
         break;
     case CRTC_PITCH:
@@ -1060,9 +1311,11 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         ati_cursor_define(s);
         break;
     case DST_OFFSET:
+        s->regs.dst_saved = false;
             s->regs.dst_offset = data & 0xfffffff0;
         break;
     case DST_PITCH:
+        s->regs.dst_saved = false;
             s->regs.dst_pitch = data & 0x3fff;
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
             s->regs.dst_tile = (data >> 16) & 1;
@@ -1093,6 +1346,7 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         s->regs.dst_y = data & 0x3fff;
         break;
     case SRC_PITCH_OFFSET:
+        s->regs.src_saved = false;
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
             s->regs.src_offset = (data & 0x1fffff) << 5;
             s->regs.src_pitch = (data & 0x7fe00000) >> 21;
@@ -1104,6 +1358,7 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         }
         break;
     case DST_PITCH_OFFSET:
+        s->regs.dst_saved = false;
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
             s->regs.dst_offset = (data & 0x1fffff) << 5;
             s->regs.dst_pitch = (data & 0x7fe00000) >> 21;
@@ -1133,13 +1388,43 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
                               (data & 0x4000) << 16;
         s->regs.dp_mix = (data & GMC_ROP3_MASK) | (data & 0x7000000) >> 16;
 
+        /*
+         * The engine picks the default or SRC/DST_PITCH_OFFSET by these bits.
+         * The registers are overwritten with the default here, but the
+         * guest's own values are kept and restored when a later operation
+         * selects them again without rewriting them: the Mac driver writes
+         * the blit source once, and a fill with the bit clear in between made
+         * the next blit read from the default (the front buffer itself).
+         */
         if (!(data & GMC_SRC_PITCH_OFFSET_CNTL)) {
+            if (ati_is_radeon(s) && !s->regs.src_saved) {
+                s->regs.saved_src_offset = s->regs.src_offset;
+                s->regs.saved_src_pitch = s->regs.src_pitch;
+                s->regs.saved_src_tile = s->regs.src_tile;
+                s->regs.src_saved = true;
+            }
             s->regs.src_offset = s->regs.default_offset;
             s->regs.src_pitch = s->regs.default_pitch;
+        } else if (s->regs.src_saved) {
+            s->regs.src_offset = s->regs.saved_src_offset;
+            s->regs.src_pitch = s->regs.saved_src_pitch;
+            s->regs.src_tile = s->regs.saved_src_tile;
+            s->regs.src_saved = false;
         }
         if (!(data & GMC_DST_PITCH_OFFSET_CNTL)) {
+            if (ati_is_radeon(s) && !s->regs.dst_saved) {
+                s->regs.saved_dst_offset = s->regs.dst_offset;
+                s->regs.saved_dst_pitch = s->regs.dst_pitch;
+                s->regs.saved_dst_tile = s->regs.dst_tile;
+                s->regs.dst_saved = true;
+            }
             s->regs.dst_offset = s->regs.default_offset;
             s->regs.dst_pitch = s->regs.default_pitch;
+        } else if (s->regs.dst_saved) {
+            s->regs.dst_offset = s->regs.saved_dst_offset;
+            s->regs.dst_pitch = s->regs.saved_dst_pitch;
+            s->regs.dst_tile = s->regs.saved_dst_tile;
+            s->regs.dst_saved = false;
         }
         if (!(data & GMC_SRC_CLIPPING)) {
             s->regs.src_sc_right = s->regs.default_sc_right;
@@ -1175,9 +1460,11 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         s->regs.dst_height = (data >> 16) & 0x3fff;
         break;
     case SRC_OFFSET:
+        s->regs.src_saved = false;
             s->regs.src_offset = data & 0xfffffff0;
         break;
     case SRC_PITCH:
+        s->regs.src_saved = false;
             s->regs.src_pitch = data & 0x3fff;
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
             s->regs.src_tile = (data >> 16) & 1;
@@ -1422,6 +1709,10 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     }
     vga_init(vga, OBJECT(s), pci_address_space(dev),
              pci_address_space_io(dev), true);
+    ati_base_ops = s->vga.hw_ops;
+    ati_vga_hw_ops = *ati_base_ops;
+    ati_vga_hw_ops.gfx_update = ati_vga_gfx_update;
+    s->vga.hw_ops = &ati_vga_hw_ops;
     vga->con = graphic_console_init(DEVICE(s), 0, s->vga.hw_ops, vga);
     if (s->cursor_guest_mode) {
         vga->cursor_invalidate = ati_cursor_invalidate;

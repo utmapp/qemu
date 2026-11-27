@@ -194,6 +194,20 @@ static void ati_set_dirty(VGACommonState *vga, const ATI2DCtx *ctx,
 
     if (r->width && r->height && end <= vga->vram_size) {
         memory_region_set_dirty(&vga->vram, start, end - start);
+        {
+            ATIVGAState *as = container_of(vga, ATIVGAState, vga);
+            uint32_t before = as->fw_mask;
+
+            ati_front_touch(as, 1, start, end - start);
+            if (!(before & 1) && (as->fw_mask & 1)) {
+                /* first 2D write to the front since the last change log */
+                trace_ati_front_2d(ctx->src_kind, ctx->rop3 >> 16,
+                                   as->regs.dp_gui_master_cntl,
+                                   ctx->src_offset, ctx->src_stride,
+                                   ctx->dst_offset, r->x, r->y, r->width,
+                                   r->height);
+            }
+        }
     }
 }
 
@@ -570,11 +584,61 @@ static bool ati_2d_run(ATIVGAState *s, ATI2DCtx *c, const uint8_t *buf,
             return false;
         }
     }
+    if (ati_is_radeon(s) && c->src_kind == SRC_MEM_COLOR &&
+        trace_event_get_state_backends(TRACE_ATI_2D_REGS)) {
+        /* the raw source registers, whenever they change */
+        static uint32_t last[6];
+        uint32_t cur[6] = { s->regs.dp_gui_master_cntl, s->regs.src_offset,
+                            s->regs.src_pitch, s->regs.default_offset,
+                            s->regs.dst_offset, s->regs.default_pitch };
+
+        if (memcmp(last, cur, sizeof(cur))) {
+            memcpy(last, cur, sizeof(cur));
+            trace_ati_2d_regs(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
+        }
+    }
+    if (ati_is_radeon(s) && c->src_kind == SRC_MEM_COLOR &&
+        trace_event_get_state_backends(TRACE_ATI_2D_SRC)) {
+        uint32_t tf = 0, tp = 0, tw = 0, th = 0;
+        bool go = false, tr;
+
+        tr = ati_3d_track_info(s, (uint64_t)c->src_offset +
+                               (uint64_t)sy * c->src_stride, &tf, &tp, &tw,
+                               &th, &go);
+        static uint32_t last[3];
+        uint32_t cur[3] = { c->src_offset, c->src_stride, c->dst_offset };
+
+        if (memcmp(last, cur, sizeof(cur))) {   /* on change only */
+            memcpy(last, cur, sizeof(cur));
+            trace_ati_2d_src(c->src_offset, c->src_stride, sx, sy,
+                             tr, tf, tp, tw, th, go);
+        }
+    }
+    if (ati_is_radeon(s) && c->src_kind == SRC_MEM_COLOR) {
+        ati_3d_watch_present(s, c->src_offset,
+                             (uint64_t)c->src_stride * (sy + vis.height));
+    }
     if (!ati_2d_fast(c, &vis, sx, sy, s->use_pixman)) {
         ati_2d_generic(c, &vis, sx, sy, buf, buf_stride);
     }
+    if (ati_is_radeon(s) && c->src_kind == SRC_MEM_COLOR &&
+        trace_event_get_state_backends(TRACE_ATI_2D_SRC_BYTES) &&
+        (uint64_t)c->src_offset + (uint64_t)(sy + 241) * c->src_stride + 8 <=
+        c->vram_size &&
+        (uint64_t)c->dst_offset + (uint64_t)241 * c->dst_stride + 8 <=
+        c->vram_size) {
+        trace_ati_2d_src_bytes(
+            ldq_be_p(c->vram + c->src_offset + (uint64_t)sy * c->src_stride),
+            ldq_be_p(c->vram + c->src_offset +
+                     (uint64_t)(sy + 240) * c->src_stride),
+            ldq_be_p(c->vram + c->dst_offset),
+            ldq_be_p(c->vram + c->dst_offset + (uint64_t)240 * c->dst_stride));
+    }
     ati_set_dirty(&s->vga, c, &vis);
     if (ati_is_radeon(s)) {
+        ati_3d_watch_2d(s, c->dst_offset + (uint64_t)vis.y * c->dst_stride,
+                        (uint64_t)vis.height * c->dst_stride, c->rop3 >> 16,
+                        c->src_kind);
         /* GL's copy of a 3D target here is stale now */
         ati_3d_vram_written(s, c->dst_offset + vis.x * c->bypp +
                                (uint64_t)vis.y * c->dst_stride,

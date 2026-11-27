@@ -80,6 +80,11 @@ typedef struct ATIVGARegs {
     uint32_t src_offset;
     uint32_t src_pitch;
     uint32_t src_tile;
+    /* Radeon: the guest's SRC/DST_PITCH_OFFSET while a GUI_MASTER_CNTL with
+     * the select bit clear has the default in them (restored when it is set) */
+    uint32_t saved_src_offset, saved_src_pitch, saved_src_tile;
+    uint32_t saved_dst_offset, saved_dst_pitch, saved_dst_tile;
+    bool src_saved, dst_saved;
     uint32_t src_x;
     uint32_t src_y;
     uint32_t dst_x;
@@ -161,8 +166,16 @@ struct ATIVGAState {
     char *model;
     uint16_t dev_id;
     uint8_t mode;
+    uint32_t scan_bpp, scan_stride, scan_h, scan_w;   /* applied scanout */
+    int64_t dbg_surface_ns;                           /* ati_display_surface */
+    bool lut_loaded;        /* guest wrote the DAC LUT in a direct-colour mode */
+    uint64_t lut_sig;                                 /* ati_dac_lut trace */
+    uint64_t mode_sig;           /* ati_mode_signature() of the applied mode */
     uint8_t use_pixman;
     bool cursor_guest_mode;
+    uint32_t fw_mask;           /* front-buffer watch: writers since last check */
+    uint64_t fw_hash;
+    unsigned fw_tick;
     bool flip_pending;          /* RetroBoot: display start waits for a readback */
     uint16_t cursor_size;
     uint8_t cursor_mode;
@@ -219,10 +232,17 @@ void ati_3d_sync_range(ATIVGAState *s, uint64_t mc, uint64_t len);
 bool ati_3d_flip(ATIVGAState *s, uint64_t mc, uint64_t len);
 bool ati_3d_range_ready(ATIVGAState *s, uint64_t mc, uint64_t len);
 void ati_3d_land(ATIVGAState *s);
+void ati_3d_mode_changed(ATIVGAState *s);
 /* the vCPU waits for the render thread with the BQL released */
 bool ati_3d_busy(ATIVGAState *s);
 /* the 2D engine wrote VRAM [off, off + len) (VRAM offsets) */
 void ati_3d_vram_written(ATIVGAState *s, uint64_t off, uint64_t len);
+void ati_3d_watch_2d(ATIVGAState *s, uint64_t off, uint64_t len, int rop,
+                     int src_kind);
+void ati_3d_watch_present(ATIVGAState *s, uint64_t off, uint64_t len);
+bool ati_3d_track_info(ATIVGAState *s, uint64_t off, uint32_t *fmt,
+                       uint32_t *pitch, uint32_t *w, uint32_t *h,
+                       bool *gl_owned);
 /*
  * A solid 2D fill of the rectangle r (dst offset, pitch and bytes per pixel
  * as the 2D engine has them; filler = the 32-bit VRAM word it would store,
@@ -235,6 +255,8 @@ void ati_scanout_range(ATIVGAState *s, uint64_t *mc, uint64_t *len);
 /* the CRTC runs an extended (non-VGA) mode */
 bool ati_ext_mode(ATIVGAState *s);
 void ati_flip_settle(ATIVGAState *s);
+/* front-buffer watch: kind 1 = 2D op, 2 = GL readback landing */
+void ati_front_touch(ATIVGAState *s, unsigned kind, uint64_t off, uint64_t len);
 const char *ati_3d_stats(ATIVGAState *s);
 const char *ati_3d_gl_info(ATIVGAState *s);
 bool ati_host_data_flush(ATIVGAState *s);

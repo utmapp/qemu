@@ -205,8 +205,17 @@ static unsigned ati_cp_packet(ATIVGAState *s, const uint32_t *pkt,
             ati_3d_packet(s, op, &pkt[1], count);
             break;
         default:
-            qemu_log_mask(LOG_UNIMP, "ati: CP packet3 op 0x%02x (%u dwords)\n",
-                          op, count);
+            {
+                static uint32_t seen[8];
+
+                if (!(seen[op >> 5] & (1u << (op & 31)))) {
+                    seen[op >> 5] |= 1u << (op & 31);
+                    trace_ati_cp_unhandled(op, count);
+                    qemu_log_mask(LOG_UNIMP,
+                                  "ati: CP packet3 op 0x%02x (%u dwords)\n",
+                                  op, count);
+                }
+            }
             break;
         }
         return count + 1;

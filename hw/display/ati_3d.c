@@ -121,6 +121,8 @@ typedef struct ATITrack {
     uint64_t gen, read_gen;
 } ATITrack;
 
+static void watch_land(ATIVGAState *s, uint64_t off, uint64_t len);
+
 #define MAX_TRACK 8
 
 typedef struct ATITexCache {
@@ -252,6 +254,8 @@ static void track_land(ATIVGAState *s, ATITrack *k)
     if (in_vram) {
         memcpy(s->vga.vram_ptr + off, j->buf, j->len);
         memory_region_set_dirty(&s->vga.vram, off, j->len);
+        watch_land(s, off, j->len);
+        ati_front_touch(s, 2, off, j->len);
     } else {
         ati_mc_rw(s, j->img.mc, j->buf, j->len, true);
     }
@@ -302,6 +306,8 @@ static void track_readback(ATIVGAState *s, ATITrack *k)
         return;
     }
     track_drop_pending(s, k);
+    trace_ati_3d_readback(0, k->img.mc, k->img.w, k->img.h, k->img.pitch,
+                          k->img.fmt, k->img.swap);
     if (ati_mc_translate(s, k->img.mc, &off, &contig) == ATI_MC_VRAM &&
         off + len <= s->vga.vram_size) {
         /*
@@ -315,6 +321,8 @@ static void track_readback(ATIVGAState *s, ATITrack *k)
         memcpy(s->vga.vram_ptr + off, buf, len);
         g_free(buf);
         memory_region_set_dirty(&s->vga.vram, off, len);
+        watch_land(s, off, len);
+        ati_front_touch(s, 2, off, len);
         k->gl_valid = true;
     } else {
         uint8_t *buf = g_malloc(len);
@@ -370,6 +378,8 @@ static void scanout_read_async(ATIVGAState *s, uint64_t mc, uint64_t len)
         track_land(s, k);
         if (k->gl_owned && mc < b && mc + len > a && !k->pending &&
             k->gen != k->read_gen) {
+            trace_ati_3d_readback(1, k->img.mc, k->img.w, k->img.h,
+                                  k->img.pitch, k->img.fmt, k->img.swap);
             k->pending = ati_glr_target_read_async(t->r, &k->img);
             k->read_gen = k->gen;
             t->rb_why[ATI_SYNC_VBLANK]++;
@@ -408,6 +418,33 @@ bool ati_3d_flip(ATIVGAState *s, uint64_t mc, uint64_t len)
     return !ati_3d_range_ready(s, mc, len);
 }
 
+/*
+ * The scanout's depth or geometry changed: the render targets tracked so far
+ * belong to the old mode's buffers.  They must not be read back over the new
+ * framebuffer (a stale 32 bpp desktop target landing in a 15 bpp one shows as
+ * squeezed, line-doubled garbage), so drop them, in-flight reads included.
+ */
+void ati_3d_mode_changed(ATIVGAState *s)
+{
+    ATI3DState *t = s->r3d;
+    int n = 0;
+
+    for (int i = 0; t && t->r && i < MAX_TRACK; i++) {
+        ATITrack *k = &t->track[i];
+
+        if (k->pending) {
+            ati_glr_read_wait(t->r, k->pending);
+            ati_glr_read_free(k->pending);
+            k->pending = NULL;
+        }
+        if (k->img.w) {
+            n++;
+        }
+        memset(k, 0, sizeof(*k));
+    }
+    trace_ati_3d_mode_drop(n);
+}
+
 /* finished asynchronous readbacks into VRAM */
 void ati_3d_land(ATIVGAState *s)
 {
@@ -430,6 +467,117 @@ bool ati_3d_busy(ATIVGAState *s)
  * the back buffer every frame: a 4 MB hash per frame at 1920x1080 on the
  * vCPU).  CPU writes are still caught by the hash.
  */
+/*
+ * Debug (ati_watch_*): did anything but the 3D readback write a render target
+ * in VRAM between its readback and the 2D blit that presents it?  A copy of
+ * each landed target is kept and compared at the blit.
+ */
+typedef struct ATIWatch {
+    uint64_t off, len;
+    uint8_t *data;
+    unsigned w2d;               /* 2D operations into it since */
+} ATIWatch;
+static ATIWatch watch[4];
+static unsigned watch_next;
+
+static bool watch_on(void)
+{
+    return trace_event_get_state_backends(TRACE_ATI_WATCH_LAND);
+}
+
+static void watch_land(ATIVGAState *s, uint64_t off, uint64_t len)
+{
+    ATIWatch *w = NULL;
+
+    if (!watch_on() || off + len > s->vga.vram_size) {
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (watch[i].data && watch[i].off == off) {
+            w = &watch[i];
+        }
+    }
+    if (!w) {
+        w = &watch[watch_next++ & 3];
+    }
+    g_free(w->data);
+    w->off = off;
+    w->len = len;
+    w->w2d = 0;
+    w->data = g_memdup2(s->vga.vram_ptr + off, len);
+    trace_ati_watch_land(off, len);
+}
+
+/* a 2D operation wrote [off, off+len) */
+void ati_3d_watch_2d(ATIVGAState *s, uint64_t off, uint64_t len, int rop,
+                     int src_kind)
+{
+    if (!watch_on()) {
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        ATIWatch *w = &watch[i];
+
+        if (w->data && off < w->off + w->len && w->off < off + len &&
+            ++w->w2d <= 4) {
+            trace_ati_watch_2d(w->off, off, len, rop, src_kind, w->w2d);
+        }
+    }
+}
+
+/* a 2D blit reads [off, off+len) as its source: compare with what landed */
+void ati_3d_watch_present(ATIVGAState *s, uint64_t off, uint64_t len)
+{
+    if (!watch_on() || off + len > s->vga.vram_size) {
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        ATIWatch *w = &watch[i];
+        uint64_t n, first = ~0ull, bad = 0;
+
+        if (!w->data || w->off != off) {
+            continue;
+        }
+        n = MIN(len, w->len);
+        for (uint64_t k = 0; k + 2 <= n; k += 2) {
+            if (memcmp(w->data + k, s->vga.vram_ptr + off + k, 2)) {
+                if (first == ~0ull) {
+                    first = k;
+                }
+                bad++;
+            }
+        }
+        trace_ati_watch_present(off, len, w->len, first, bad, w->w2d);
+        return;
+    }
+    trace_ati_watch_present(off, len, 0, ~0ull, 0, ~0u);   /* nothing landed */
+}
+
+/* debug: the tracked render target (if any) holding VRAM offset off */
+bool ati_3d_track_info(ATIVGAState *s, uint64_t off, uint32_t *fmt,
+                       uint32_t *pitch, uint32_t *w, uint32_t *h,
+                       bool *gl_owned)
+{
+    ATI3DState *t = s->r3d;
+
+    for (int i = 0; t && t->r && i < MAX_TRACK; i++) {
+        ATITrack *k = &t->track[i];
+        uint64_t o, contig;
+
+        if (k->img.w &&
+            ati_mc_translate(s, k->img.mc, &o, &contig) == ATI_MC_VRAM &&
+            off >= o && off < o + (uint64_t)k->img.pitch * k->img.h) {
+            *fmt = k->img.fmt;
+            *pitch = k->img.pitch;
+            *w = k->img.w;
+            *h = k->img.h;
+            *gl_owned = k->gl_owned;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ati_3d_vram_written(ATIVGAState *s, uint64_t off, uint64_t len)
 {
     ATI3DState *t = s->r3d;
@@ -556,6 +704,7 @@ bool ati_3d_range_ready(ATIVGAState *s, uint64_t mc, uint64_t len)
  * later).  2D operations and status reads still read back synchronously
  * (ati_3d_sync).
  */
+
 void ati_3d_sync_range(ATIVGAState *s, uint64_t mc, uint64_t len)
 {
     ATI3DState *t = s->r3d;
@@ -564,6 +713,13 @@ void ati_3d_sync_range(ATIVGAState *s, uint64_t mc, uint64_t len)
         return;
     }
     scanout_read_async(s, mc, len);
+    /*
+     * Mac OS's ATI RAVE presents by copying the GL back buffer to the front
+     * with the CPU through the aperture (no 2D blit, no CRTC flip), so every
+     * target drawn since its last landing is read back, not only the
+     * scanout: the CPU must see current pixels.
+     */
+    scanout_read_async(s, 0, 1ULL << 40);
 }
 
 static ATITrack *track_acquire(ATIVGAState *s, const ATIImage *img)
@@ -790,9 +946,22 @@ static void decode_texture(ATIVGAState *s, int u, ATITexUnit *tu)
         tu->enabled = false;
         return;
     }
-    trace_ati_3d_tex(u, offs, fmt, filt, w, h,
-                     R(s, PP_TXCBLEND_0 + u * PP_TEX_STRIDE),
-                     R(s, PP_TXABLEND_0 + u * PP_TEX_STRIDE));
+    if (trace_event_get_state_backends(TRACE_ATI_3D_TEX) ||
+        trace_event_get_state_backends(TRACE_ATI_3D_TEX_FLAGS)) {
+        /* only when a unit's texture state changes (it was one line per draw) */
+        static uint32_t last[8][7];
+        uint32_t cur[7] = { offs, fmt, filt, w, h,
+            R(s, PP_TXCBLEND_0 + u * PP_TEX_STRIDE),
+            R(s, PP_TXABLEND_0 + u * PP_TEX_STRIDE) };
+
+        if (u < 8 && memcmp(last[u], cur, sizeof(cur))) {
+            memcpy(last[u], cur, sizeof(cur));
+            trace_ati_3d_tex(u, offs, fmt, filt, w, h, cur[5], cur[6]);
+            /* PP_TXOFFSET low bits: endian swap, macro (bit 2) / micro (bit 3) tile */
+            trace_ati_3d_tex_flags(u, offs & ~31u, offs & 3, (offs >> 2) & 1,
+                                   (offs >> 3) & 1, fmt & 31, f);
+        }
+    }
     swp = swap_code((fmt >> 26) & 3) ^ swap_code(offs & 3) ^
           aperture_swap(s, bpp * 8);
     tu->img.mc = offs & ~31u;
@@ -1255,6 +1424,20 @@ static void draw(ATIVGAState *s, uint32_t vfmt, uint32_t vfcntl,
     }
     if (!decode_state(s, &st)) {
         return;
+    }
+    if (trace_event_get_state_backends(TRACE_ATI_3D_TARGET)) {
+        /* the colour target's raw state, whenever it changes */
+        static uint32_t last[9];
+        uint32_t cur[9] = { R(s, RB3D_COLORPITCH), R(s, RB3D_CNTL),
+                            R(s, RE_WIDTH_HEIGHT), R(s, RE_TOP_LEFT),
+                            R(s, SE_CNTL), R(s, SE_CNTL_STATUS),
+                            st.color.w, st.color.h, st.color.pitch };
+
+        if (memcmp(last, cur, sizeof(cur))) {
+            memcpy(last, cur, sizeof(cur));
+            trace_ati_3d_target(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5],
+                                cur[6], cur[7], cur[8], st.color.fmt);
+        }
     }
     en = expand_prim(vfcntl & 15, v, n, &ev, &glprim);
     trace_ati_3d_draw(st.color.mc, st.depth_mc, st.z_test, st.z_func, st.z_write,

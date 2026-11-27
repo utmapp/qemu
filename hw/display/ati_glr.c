@@ -27,6 +27,7 @@
 #include "hw/core/cpu.h"
 #include "ati_gl.h"
 #include "ati_3d.h"
+#include "trace.h"
 
 #define MAX_TARGETS 32
 #define MAX_TEXTURES 1024
@@ -773,6 +774,17 @@ static void glr_read(ATIRenderer *r, GLRCmd *c)
         rgba = glr_scratch(r, (size_t)w * 4 * h);
         glr_bind(r, t, t->depth_mc);
         gl->PixelStorei(GL_PACK_ALIGNMENT, 1);
+        if (trace_event_get_state_backends(TRACE_ATI_GLR_READ)) {
+            static uint32_t last[9];     /* on change only */
+            uint32_t cur[9] = { c->img.w, c->img.h, c->img.pitch, c->img.fmt,
+                                c->img.swap, t->w, t->h, w, h };
+
+            if (memcmp(last, cur, sizeof(cur))) {
+                memcpy(last, cur, sizeof(cur));
+                trace_ati_glr_read(cur[0], cur[1], cur[2], cur[3], cur[4],
+                                   cur[5], cur[6], cur[7], cur[8]);
+            }
+        }
         gl->ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
         for (unsigned y = 0; y < h; y++) {
             encode_row(rgba + (size_t)y * w * 4, c->data + y * c->img.pitch, w,
