@@ -92,6 +92,18 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu_renderer_sw.c',
 ), pixman] + r300_shader_deps)
 
+# Vulkan backend for the R300 (renderer=vulkan): MoltenVK through the
+# Vulkan loader on macOS, the loader alone elsewhere.  Optional: without
+# it the device refuses renderer=vulkan.
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
+  ppc_vulkan = dependency('vulkan', required: false, method: 'pkg-config')
+  if ppc_vulkan.found() and cc.has_header('vulkan/vulkan.h', dependencies: ppc_vulkan)
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [
+      files('ppc_mac_gpu_vulkan.c'), ppc_vulkan,
+      declare_dependency(compile_args: ['-DCONFIG_PPC_MAC_GPU_VULKAN'])])
+  endif
+endif
+
 if host_os == 'darwin'
   metal_fw = dependency('appleframeworks', modules: ['Foundation', 'Metal', 'QuartzCore'], required: false)
   if metal_fw.found()
