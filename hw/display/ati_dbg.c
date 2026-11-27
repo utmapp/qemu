@@ -1,3 +1,10 @@
+/*
+ * Emulated ATI Radeon R100 (ati-vga,model=r100): RetroBoot 2.0.1
+ * (432a43d4ba8502a7afeaa5dd25ecf959c23aed1c) as imported by amcchord/ClassicMac
+ * (bcee0a7d400312d3f37fb82d5abf19452416f3bb, ati/), rebased by hand from
+ * QEMU 11.0.2 onto QEMU 10.0 (UTM).  GPL-2.0-or-later.  See
+ * ATI-R100-PROVENANCE.md in this directory.
+ */
 #include "qemu/osdep.h"
 #include "ati_int.h"
 
@@ -252,6 +259,15 @@ static struct ati_regdesc ati_reg_names[] = {
     {"MC_SRC1_CNTL", 0x19D8},
     {"TEX_CNTL", 0x1800},
     {"RAGE128_MPP_TB_CONFIG", 0x01c0},
+    {"HOST_DATA0", 0x17c0},
+    {"HOST_DATA1", 0x17c4},
+    {"HOST_DATA2", 0x17c8},
+    {"HOST_DATA3", 0x17cc},
+    {"HOST_DATA4", 0x17d0},
+    {"HOST_DATA5", 0x17d4},
+    {"HOST_DATA6", 0x17d8},
+    {"HOST_DATA7", 0x17dc},
+    {"HOST_DATA_LAST", 0x17e0},
     {NULL, -1}
 };
 

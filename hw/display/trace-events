@@ -145,6 +145,21 @@ sii9022_switch_mode(const char *mode) "mode: %s"
 # ati.c
 ati_mm_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
 ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
+ati_pll_read(int idx, uint32_t val) "pll[0x%02x] -> 0x%08x"
+ati_cp_packet0(uint32_t reg, unsigned count, bool one) "reg 0x%04x count %u one %d"
+ati_cp_packet3(uint8_t op, unsigned count) "op 0x%02x count %u"
+ati_cp_ib(uint32_t base, uint32_t ndw) "base 0x%08x dwords %u"
+ati_cp_ring(uint32_t rptr, uint32_t wptr, unsigned n) "rptr %u wptr %u dwords %u"
+ati_2d_packet(uint8_t op, unsigned count) "op 0x%02x count %u"
+ati_2d_packet_data(uint8_t op, unsigned n, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3, uint32_t d4, uint32_t d5, uint32_t d6, uint32_t d7) "op 0x%02x n %u: %08x %08x %08x %08x %08x %08x %08x %08x"
+ati_2d_op(int bpp, uint32_t rop, int src, int x, int y, int w, int h, uint32_t dst_offset, int pitch) "bpp %d rop 0x%02x src %d (%d,%d) %dx%d dst 0x%x pitch %d"
+ati_3d_packet(uint8_t op, unsigned count, uint32_t d0, uint32_t d1) "op 0x%02x count %u 0x%08x 0x%08x"
+ati_3d_tex(int unit, uint32_t mc, uint32_t fmt, uint32_t filter, unsigned w, unsigned h, uint32_t cblend, uint32_t ablend) "unit %d mc 0x%08x txformat 0x%08x txfilter 0x%08x %ux%u cblend 0x%08x ablend 0x%08x"
+ati_3d_zclear(uint32_t color_mc, uint32_t depth_mc, unsigned w, unsigned h, uint32_t clearval, uint32_t zcntl) "color 0x%08x depth 0x%08x %ux%u clear 0x%08x zstencilcntl 0x%08x"
+ati_3d_draw(uint32_t color_mc, uint32_t depth_mc, int ztest, uint32_t zfunc, int zwrite, int blend, uint32_t src, uint32_t dst, unsigned prim, unsigned n) "color 0x%08x depth 0x%08x ztest %d func 0x%x zwrite %d blend %d 0x%x 0x%x prim %u n %u"
+ati_3d_rb(uint32_t rb3d_cntl, uint32_t planemask, uint32_t ropcntl, unsigned color_mask) "rb3d_cntl 0x%08x planemask 0x%08x ropcntl 0x%08x color_mask 0x%x"
+ati_3d_draw_vtx(int zmin_u, int rhwmin_u, int x0, int y0, uint32_t vfmt, uint32_t pp_cntl, int s0, int t0, int s1, int t1) "zmin %d rhwmin %d (1e-6) v0 %d,%d vfmt 0x%x pp_cntl 0x%x st0 %d,%d st1 %d,%d (1e-3)"
+ati_pll_write(int idx, uint32_t val) "pll[0x%02x] <- 0x%08x"
 
 # artist.c
 artist_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 "%s -> 0x%08"PRIx64
