@@ -54,6 +54,43 @@ if config_all_devices.has_key('CONFIG_QXL')
   hw_display_modules += {'qxl': qxl_ss}
 endif
 
+# The R300 fragment programs are generated as GLSL and compiled at run time
+# with shaderc (GLSL -> SPIR-V); SPIRV-Cross turns SPIR-V into MSL for the
+# Metal backend.  Homebrew ships SPIRV-Cross's C API only as static
+# libraries, which need its other parts and the C++ runtime.
+r300_shader_deps = []
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
+  # UTM's sysroot has only the static shaderc_combined (C++, so libc++)
+  shaderc = dependency('shaderc_combined', required: false, method: 'pkg-config')
+  if shaderc.found()
+    shaderc = declare_dependency(dependencies: shaderc, link_args:
+                                 host_os == 'darwin' ? ['-lc++'] : ['-lstdc++'])
+  else
+    shaderc = dependency('shaderc', required: true, method: 'pkg-config')
+  endif
+  spirv_cross = dependency('spirv-cross-c-shared', required: false, method: 'pkg-config')
+  if spirv_cross.found()
+    r300_shader_deps = [shaderc, spirv_cross]
+  else
+    spirv_cross = dependency('spirv-cross-c', required: true, method: 'pkg-config')
+    spvc_libdir = spirv_cross.get_variable(pkgconfig: 'libdir')
+    spvc_libs = [spirv_cross]
+    foreach l : ['msl', 'hlsl', 'cpp', 'reflect', 'glsl', 'util', 'core']
+      spvc_libs += cc.find_library('spirv-cross-' + l, dirs: [spvc_libdir], required: true)
+    endforeach
+    spvc_libs += declare_dependency(link_args: host_os == 'darwin' ? ['-lc++'] : ['-lstdc++'])
+    r300_shader_deps = [shaderc] + spvc_libs
+  endif
+endif
+
+system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
+  'r300/r300_state.c',
+  'r300/r300_pvs.c',
+  'r300/r300_us.c',
+  'r300/r300_spirv.c',
+  'r300/r300_draw.c',
+), pixman] + r300_shader_deps)
+
 system_ss.add(when: 'CONFIG_DPCD', if_true: files('dpcd.c'))
 system_ss.add(when: 'CONFIG_XLNX_DISPLAYPORT', if_true: files('xlnx_dp.c'))
 

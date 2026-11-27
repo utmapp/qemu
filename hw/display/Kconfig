@@ -149,3 +149,9 @@ config MAC_PVG_PCI
     bool
     depends on MAC_PVG && PCI
     default y if PCI_DEVICES
+
+config PPC_MAC_GPU
+    bool
+    # Needs shaderc and SPIRV-Cross at build time, so no default: it is
+    # only pulled in by the machines that use it (see hw/ppc/Kconfig).
+    depends on PCI
