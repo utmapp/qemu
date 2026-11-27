@@ -1,0 +1,38 @@
+diff --git a/drivers/pci.c b/drivers/pci.c
+index 6880edc..c354dc6 100644
+--- a/drivers/pci.c
++++ b/drivers/pci.c
+@@ -1077,6 +1077,15 @@ static void ati_radeon_setup(const pci_config_t *config, phandle_t ph)
+            (int)w, (int)h, (int)bpp, (unsigned long)mmio);
+ 
+     set_property(ph, "device_type", "display", 8);
++
++    /* retail Radeon Mac Edition ROM properties */
++    set_int_property(ph, "ATY,Flags", 0x1c4);
++    set_int_property(ph, "ATY,RefCLK", 27000);   /* kHz */
++    set_int_property(ph, "ATY,MCLK", 183000);
++    set_int_property(ph, "ATY,SCLK", 183000);
++    set_int_property(ph, "VRAM,totalsize", 0x04000000);
++    set_property(ph, "display-type", "CRT", 4);
++    set_property(ph, "character-set", "ISO8859-1", 10);
+ }
+ #endif
+ 
+diff --git a/drivers/pci_database.c b/drivers/pci_database.c
+index d8fe655..74d562f 100644
+--- a/drivers/pci_database.c
++++ b/drivers/pci_database.c
+@@ -246,10 +246,10 @@ static const pci_dev_t vga_devices[] = {
+         NULL, NULL,
+     },
+     {
+-        /* RetroBoot: R100 Radeon, as the PCI Radeon Mac Edition's FCode
+-         * names it; Mac OS 9.2.1's "ATI Driver Update" matches this name */
++        /* RetroBoot: R100 Radeon, as a retail Radeon Mac Edition
++         * names it, for ATI's retail OS 9 drivers (ATI Extension) */
+         PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_RADEON_QD,
+-        NULL, "ATY,Rage6p", "ATY,Rage6p", "ATY,Rage6p\0",
++        NULL, "ATY,RADEONp", "ATY,RADEON", "ATY,RADEONp\0",
+         0, 0, 0,
+         NULL, NULL,
+     },

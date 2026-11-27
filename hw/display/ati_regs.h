@@ -1,4 +1,11 @@
 /*
+ * Emulated ATI Radeon R100 (ati-vga,model=r100): RetroBoot 2.0.1
+ * (432a43d4ba8502a7afeaa5dd25ecf959c23aed1c) as imported by amcchord/ClassicMac
+ * (bcee0a7d400312d3f37fb82d5abf19452416f3bb, ati/), rebased by hand from
+ * QEMU 11.0.2 onto QEMU 10.0 (UTM).  GPL-2.0-or-later.  See
+ * ATI-R100-PROVENANCE.md in this directory.
+ */
+/*
  * ATI VGA register definitions
  *
  * based on:
@@ -168,6 +175,48 @@
 
 #define RBBM_STATUS                             0x0e40
 
+/* Radeon (R100) names used by the RetroBoot CP/3D emulation */
+#define CP_RB_BASE                              0x0700
+#define CP_RB_CNTL                              0x0704
+#define CP_RB_RPTR_ADDR                         0x070c
+#define CP_RB_RPTR                              0x0710
+#define CP_RB_WPTR                              0x0714
+#define CP_RB_WPTR_DELAY                        0x0718
+#define CP_RB_RPTR_WR                           0x071c
+#define CP_IB_BASE                              0x0738
+#define CP_IB_BUFSZ                             0x073c
+#define CP_CSQ_CNTL                             0x0740
+#define CP_CSQ_MODE                             0x0744
+#define SCRATCH_UMSK                            0x0770
+#define SCRATCH_ADDR                            0x0774
+#define CP_STAT                                 0x07c0
+#define CP_ME_CNTL                              0x07d0
+#define CP_ME_RAM_ADDR                          0x07d4
+#define CP_ME_RAM_RADDR                         0x07d8
+#define CP_ME_RAM_DATAH                         0x07dc
+#define CP_ME_RAM_DATAL                         0x07e0
+#define CP_CSQ_ADDR                             0x07f0
+#define CP_CSQ_DATA                             0x07f4
+#define CP_CSQ_STAT                             0x07f8
+#define CP_CSQ2_STAT                            0x07fc
+#define CP_CSQ_APER_PRIMARY                     0x1000
+#define CP_CSQ_APER_INDIRECT                    0x1300
+#define SCRATCH_REG0                            0x15e0
+#define SCRATCH_REG5                            0x15f4
+#define ATI_AIC_CNTL                            0x01d0
+#define ATI_AIC_PT_BASE                         0x01d8
+#define ATI_AIC_LO_ADDR                         0x01dc
+#define ATI_AIC_HI_ADDR                         0x01e0
+#define ISYNC_CNTL                              0x1724
+#define RB3D_DSTCACHE_CTLSTAT                   0x325c
+#define RB2D_DSTCACHE_CTLSTAT                   0x342c
+
+/* GEN_INT_CNTL / GEN_INT_STATUS (Radeon) */
+#define RADEON_GUI_IDLE_INT                     (1 << 19)
+#define RADEON_SW_INT_ENABLE                    (1 << 25)
+#define RADEON_SW_INT_TEST                      (1 << 25)
+#define RADEON_SW_INT_FIRE                      (1 << 26)
+
 /*
  * GUI Block Memory Mapped Registers
  * These registers are FIFOed.
@@ -252,6 +301,15 @@
 #define DP_T12_CNTL                             0x178c
 #define DST_BRES_T1_LNTH                        0x1790
 #define DST_BRES_T2_LNTH                        0x1794
+#define HOST_DATA0                              0x17c0
+#define HOST_DATA1                              0x17c4
+#define HOST_DATA2                              0x17c8
+#define HOST_DATA3                              0x17cc
+#define HOST_DATA4                              0x17d0
+#define HOST_DATA5                              0x17d4
+#define HOST_DATA6                              0x17d8
+#define HOST_DATA7                              0x17dc
+#define HOST_DATA_LAST                          0x17e0
 #define SCALE_SRC_HEIGHT_WIDTH                  0x1994
 #define SCALE_OFFSET_0                          0x1998
 #define SCALE_PITCH                             0x199c
@@ -386,6 +444,13 @@
 #define DST_16BPP                               0x00000004
 #define DST_24BPP                               0x00000005
 #define DST_32BPP                               0x00000006
+#define DP_DST_DATATYPE                         0x0000000f
+#define DP_BRUSH_DATATYPE                       0x00000f00
+#define SRC_MONO_FRGD_BKGD                      0x00000000
+#define SRC_MONO_FRGD                           0x00010000
+#define SRC_COLOR                               0x00030000
+#define DP_SRC_DATATYPE                         0x00030000
+#define DP_BYTE_PIX_ORDER                       0x40000000
 
 #define BRUSH_SOLIDCOLOR                        0x00000d00
 
@@ -394,6 +459,8 @@
 #define GMC_DST_PITCH_OFFSET_CNTL               0x00000002
 #define GMC_SRC_CLIP_DEFAULT                    0x00000000
 #define GMC_DST_CLIP_DEFAULT                    0x00000000
+#define GMC_SRC_CLIPPING                        0x00000004
+#define GMC_DST_CLIPPING                        0x00000008
 #define GMC_BRUSH_SOLIDCOLOR                    0x000000d0
 #define GMC_SRC_DSTCOLOR                        0x00003000
 #define GMC_BYTE_ORDER_MSB_TO_LSB               0x00000000
@@ -437,6 +504,8 @@
 #define DP_SRC_RECT                             0x00000200
 #define DP_SRC_HOST                             0x00000300
 #define DP_SRC_HOST_BYTEALIGN                   0x00000400
+#define DP_SRC_SOURCE                           0x00000700
+#define DP_ROP3                                 0x00ff0000
 
 /* LVDS_GEN_CNTL constants */
 #define LVDS_BL_MOD_LEVEL_MASK                  0x0000ff00
