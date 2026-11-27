@@ -61,8 +61,22 @@ void surface_gl_create_texture(QemuGLShader *gls,
         break;
     case PIXMAN_BE_x8r8g8b8:
     case PIXMAN_BE_a8r8g8b8:
-        surface->glformat = GL_RGBA;
-        surface->gltype = GL_UNSIGNED_BYTE;
+        /*
+         * Bytes A/X, R, G, B (big-endian guests' framebuffers).  Desktop GL
+         * reads them as a packed BGRA word; GLES uploads them as RGBA bytes
+         * and the swizzle below puts R, G, B back in place.
+         */
+        if (epoxy_is_desktop_gl()) {
+            surface->glformat = GL_BGRA_EXT;
+#if HOST_BIG_ENDIAN
+            surface->gltype = GL_UNSIGNED_INT_8_8_8_8_REV;
+#else
+            surface->gltype = GL_UNSIGNED_INT_8_8_8_8;
+#endif
+        } else {
+            surface->glformat = GL_RGBA;
+            surface->gltype = GL_UNSIGNED_BYTE;
+        }
         break;
     case PIXMAN_r5g6b5:
         surface->glformat = GL_RGB;
@@ -90,6 +104,12 @@ void surface_gl_create_texture(QemuGLShader *gls,
                      0, surface->glformat, surface->gltype,
                      surface_data(surface));
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
+        if (surface_format(surface) == PIXMAN_BE_x8r8g8b8 ||
+            surface_format(surface) == PIXMAN_BE_a8r8g8b8) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_GREEN);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_BLUE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ALPHA);
+        }
     }
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
