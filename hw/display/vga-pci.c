@@ -37,12 +37,57 @@
 #include "hw/display/edid.h"
 #include "qom/object.h"
 #include "hw/acpi/acpi_aml_interface.h"
+#include "qemu/bswap.h"
+#include "qemu/log.h"
+#include "system/reset.h"
+#include "trace.h"
 
 enum vga_pci_flags {
     PCI_VGA_FLAG_ENABLE_MMIO = 1,
     PCI_VGA_FLAG_ENABLE_QEXT = 2,
     PCI_VGA_FLAG_ENABLE_EDID = 3,
+    PCI_VGA_FLAG_ENABLE_MAC_ACCEL = 4,
 };
+
+/*
+ * PVMAC: paravirtual display extension for the Mac OS 9 NDRV (qemu_vga.ndrv
+ * built from QemuMacDrivers QemuVGADriver). Opt-in through the
+ * "mac-accel" property; documented in docs/specs/standard-vga.rst.
+ * Version 1 provides a hardware cursor only.
+ */
+#define PVMAC_OFFSET            0x800
+#define PVMAC_SIZE              0x800
+#define PVMAC_ID_VALUE          0x50564d43  /* 'PVMC' */
+#define PVMAC_VERSION_VALUE     1
+#define PVMAC_CAP_HWCURSOR      (1u << 0)
+#define PVMAC_CURSOR_SLOT_SIZE  0x4000      /* 64 * 64 * 4, top of VRAM */
+
+enum {
+    PVMAC_REG_ID         = 0x00,
+    PVMAC_REG_VERSION    = 0x04,
+    PVMAC_REG_CAPS       = 0x08,
+    PVMAC_REG_STATUS     = 0x0c,
+    PVMAC_REG_CUR_CTRL   = 0x10,
+    PVMAC_REG_CUR_POS    = 0x14,
+    PVMAC_REG_CUR_HOT    = 0x18,
+    PVMAC_REG_CUR_SIZE   = 0x1c,
+    PVMAC_REG_CUR_DEFINE = 0x20,
+    PVMAC_REG_CUR_OFFSET = 0x24,
+};
+
+#define PVMAC_CUR_CTRL_VISIBLE  (1u << 0)
+#define PVMAC_STATUS_ERROR      (1u << 1)
+#define PVMAC_ERR_BAD_SIZE      1
+#define PVMAC_ERR_BAD_HOTSPOT   2
+
+typedef struct PVMACState {
+    uint32_t status;
+    uint32_t cur_ctrl;
+    uint32_t cur_pos;
+    uint32_t cur_hot;
+    uint32_t cur_size;
+    bool cur_defined;
+} PVMACState;
 
 struct PCIVGAState {
     PCIDevice dev;
@@ -50,12 +95,49 @@ struct PCIVGAState {
     uint32_t flags;
     qemu_edid_info edid_info;
     MemoryRegion mmio;
-    MemoryRegion mrs[4];
+    MemoryRegion mrs[5];
     uint8_t edid[384];
+    PVMACState pvmac;
 };
 
 #define TYPE_PCI_VGA "pci-vga"
 OBJECT_DECLARE_SIMPLE_TYPE(PCIVGAState, PCI_VGA)
+
+static void pvmac_cursor_define(PCIVGAState *d);
+
+static bool vga_pci_mac_accel_needed(void *opaque)
+{
+    PCIVGAState *d = opaque;
+
+    return d->flags & (1 << PCI_VGA_FLAG_ENABLE_MAC_ACCEL);
+}
+
+static int vga_pci_mac_accel_post_load(void *opaque, int version_id)
+{
+    PCIVGAState *d = opaque;
+
+    if (d->pvmac.cur_defined) {
+        pvmac_cursor_define(d);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_vga_pci_mac_accel = {
+    .name = "vga/mac-accel",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vga_pci_mac_accel_needed,
+    .post_load = vga_pci_mac_accel_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(pvmac.status, PCIVGAState),
+        VMSTATE_UINT32(pvmac.cur_ctrl, PCIVGAState),
+        VMSTATE_UINT32(pvmac.cur_pos, PCIVGAState),
+        VMSTATE_UINT32(pvmac.cur_hot, PCIVGAState),
+        VMSTATE_UINT32(pvmac.cur_size, PCIVGAState),
+        VMSTATE_BOOL(pvmac.cur_defined, PCIVGAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_vga_pci = {
     .name = "vga",
@@ -65,6 +147,10 @@ static const VMStateDescription vmstate_vga_pci = {
         VMSTATE_PCI_DEVICE(dev, PCIVGAState),
         VMSTATE_STRUCT(vga, PCIVGAState, 0, vmstate_vga_common, VGACommonState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_vga_pci_mac_accel,
+        NULL
     }
 };
 
@@ -201,6 +287,145 @@ static const MemoryRegionOps pci_vga_qext_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* ------------------------------------------------------------------ PVMAC */
+
+static uint32_t pvmac_cursor_offset(PCIVGAState *d)
+{
+    return d->vga.vram_size - PVMAC_CURSOR_SLOT_SIZE;
+}
+
+static void pvmac_error(PCIVGAState *d, uint32_t code)
+{
+    d->pvmac.status = PVMAC_STATUS_ERROR | (code << 8);
+}
+
+static void pvmac_mouse_set(PCIVGAState *d)
+{
+    int x = (int16_t)(d->pvmac.cur_pos & 0xffff);
+    int y = (int16_t)(d->pvmac.cur_pos >> 16);
+    bool visible = d->pvmac.cur_defined &&
+                   (d->pvmac.cur_ctrl & PVMAC_CUR_CTRL_VISIBLE);
+
+    trace_vga_pvmac_cursor_pos(x, y, visible);
+    dpy_mouse_set(d->vga.con, x, y, visible);
+}
+
+/*
+ * Build a host cursor from the image the guest left in the cursor slot at the
+ * top of VRAM: size x size pixels, 32-bit ARGB, stored big-endian (A, R, G, B
+ * byte order), which is the natural layout for a PowerPC guest.
+ */
+static void pvmac_cursor_define(PCIVGAState *d)
+{
+    uint32_t size = d->pvmac.cur_size;
+    int hot_x = d->pvmac.cur_hot & 0xffff;
+    int hot_y = d->pvmac.cur_hot >> 16;
+    const uint8_t *src;
+    QEMUCursor *c;
+    uint32_t i;
+
+    if (size != 32 && size != 64) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "vga: mac-accel cursor size %u not supported\n", size);
+        pvmac_error(d, PVMAC_ERR_BAD_SIZE);
+        return;
+    }
+    if (hot_x >= size || hot_y >= size) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "vga: mac-accel cursor hotspot %d,%d outside %ux%u\n",
+                      hot_x, hot_y, size, size);
+        pvmac_error(d, PVMAC_ERR_BAD_HOTSPOT);
+        return;
+    }
+
+    src = d->vga.vram_ptr + pvmac_cursor_offset(d);
+    c = cursor_alloc(size, size);
+    c->hot_x = hot_x;
+    c->hot_y = hot_y;
+    for (i = 0; i < size * size; i++) {
+        c->data[i] = ldl_be_p(src + i * 4);   /* 0xAARRGGBB */
+    }
+    d->pvmac.cur_defined = true;
+    d->pvmac.status = 0;
+    trace_vga_pvmac_cursor_define(size, hot_x, hot_y);
+    dpy_cursor_define(d->vga.con, c);
+    cursor_unref(c);
+    pvmac_mouse_set(d);
+}
+
+static uint64_t pvmac_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PCIVGAState *d = opaque;
+
+    switch (addr) {
+    case PVMAC_REG_ID:
+        return PVMAC_ID_VALUE;
+    case PVMAC_REG_VERSION:
+        return PVMAC_VERSION_VALUE;
+    case PVMAC_REG_CAPS:
+        return PVMAC_CAP_HWCURSOR;
+    case PVMAC_REG_STATUS:
+        return d->pvmac.status;
+    case PVMAC_REG_CUR_CTRL:
+        return d->pvmac.cur_ctrl;
+    case PVMAC_REG_CUR_POS:
+        return d->pvmac.cur_pos;
+    case PVMAC_REG_CUR_HOT:
+        return d->pvmac.cur_hot;
+    case PVMAC_REG_CUR_SIZE:
+        return d->pvmac.cur_size;
+    case PVMAC_REG_CUR_OFFSET:
+        return pvmac_cursor_offset(d);
+    default:
+        return 0;
+    }
+}
+
+static void pvmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    PCIVGAState *d = opaque;
+
+    switch (addr) {
+    case PVMAC_REG_CUR_CTRL:
+        d->pvmac.cur_ctrl = val & PVMAC_CUR_CTRL_VISIBLE;
+        pvmac_mouse_set(d);
+        break;
+    case PVMAC_REG_CUR_POS:
+        d->pvmac.cur_pos = val;
+        pvmac_mouse_set(d);
+        break;
+    case PVMAC_REG_CUR_HOT:
+        d->pvmac.cur_hot = val;
+        break;
+    case PVMAC_REG_CUR_SIZE:
+        d->pvmac.cur_size = val;
+        break;
+    case PVMAC_REG_CUR_DEFINE:
+        pvmac_cursor_define(d);
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "vga: mac-accel write to read-only/unknown register "
+                      "0x%" HWADDR_PRIx "\n", addr);
+        break;
+    }
+}
+
+static const MemoryRegionOps pvmac_ops = {
+    .read = pvmac_read,
+    .write = pvmac_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void pvmac_reset(void *opaque)
+{
+    PCIVGAState *d = opaque;
+
+    memset(&d->pvmac, 0, sizeof(d->pvmac));
+}
+
 void pci_std_vga_mmio_region_init(VGACommonState *s,
                                   Object *owner,
                                   MemoryRegion *parent,
@@ -267,7 +492,20 @@ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
         pci_std_vga_mmio_region_init(s, OBJECT(dev), &d->mmio, d->mrs,
                                      qext, edid);
 
+        if (d->flags & (1 << PCI_VGA_FLAG_ENABLE_MAC_ACCEL)) {
+            if (s->vram_size < 2 * PVMAC_CURSOR_SLOT_SIZE) {
+                error_setg(errp, "mac-accel needs vgamem_mb >= 1");
+                return;
+            }
+            memory_region_init_io(&d->mrs[4], OBJECT(dev), &pvmac_ops, d,
+                                  "mac-accel regs", PVMAC_SIZE);
+            memory_region_add_subregion(&d->mmio, PVMAC_OFFSET, &d->mrs[4]);
+            qemu_register_reset(pvmac_reset, d);
+        }
+
         pci_register_bar(&d->dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
+    } else if (d->flags & (1 << PCI_VGA_FLAG_ENABLE_MAC_ACCEL)) {
+        error_setg(errp, "mac-accel requires mmio=on");
     }
 }
 
@@ -337,6 +575,8 @@ static const Property vga_pci_properties[] = {
                     PCIVGAState, flags, PCI_VGA_FLAG_ENABLE_QEXT, true),
     DEFINE_PROP_BIT("edid",
                     PCIVGAState, flags, PCI_VGA_FLAG_ENABLE_EDID, true),
+    DEFINE_PROP_BIT("mac-accel",
+                    PCIVGAState, flags, PCI_VGA_FLAG_ENABLE_MAC_ACCEL, false),
     DEFINE_EDID_PROPERTIES(PCIVGAState, edid_info),
     DEFINE_PROP_BOOL("global-vmstate", PCIVGAState, vga.global_vmstate, false),
 };

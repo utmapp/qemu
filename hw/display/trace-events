@@ -130,6 +130,10 @@ vga_std_write_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"
 vga_vbe_read(uint32_t index, uint32_t val) "index 0x%x, val 0x%x"
 vga_vbe_write(uint32_t index, uint32_t val) "index 0x%x, val 0x%x"
 
+# vga-pci.c
+vga_pvmac_cursor_define(uint32_t size, int hot_x, int hot_y) "size %u hotspot %d,%d"
+vga_pvmac_cursor_pos(int x, int y, bool visible) "x %d y %d visible %d"
+
 # cirrus_vga.c
 vga_cirrus_read_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"
 vga_cirrus_write_io(uint32_t addr, uint32_t val) "addr 0x%x, val 0x%x"

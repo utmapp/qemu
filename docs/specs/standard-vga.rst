@@ -92,3 +92,34 @@ Likewise applies to the pci variant only for obvious reasons.
   framebuffer endianness register.
   - ``0xbebebebe`` indicates big endian.
   - ``0x1e1e1e1e`` indicates little endian.
+``0800 - 0fff``
+  Mac OS paravirtual extension ("PVMAC"), ``VGA`` device with
+  ``mac-accel=on`` only (off by default). Used by the Mac OS 9 driver
+  ``qemu_vga.ndrv``; a driver must check the ID register and treat the
+  region as absent when it does not read ``0x50564d43``. The registers
+  are 32bit, little endian.
+``0800``
+  ID, reads ``0x50564d43`` (``'PVMC'``).
+``0804``
+  version, reads 1.
+``0808``
+  capabilities. Bit 0: hardware cursor.
+``080c``
+  status. Bit 1 is set when the last cursor definition was rejected;
+  bits 8-15 hold the reason (1: size, 2: hotspot).
+``0810``
+  cursor control. Bit 0: cursor visible.
+``0814``
+  cursor position: x in bits 0-15, y in bits 16-31 (signed, pixels,
+  hotspot position).
+``0818``
+  cursor hotspot: x in bits 0-15, y in bits 16-31.
+``081c``
+  cursor size: 32 or 64 (square).
+``0820``
+  cursor define doorbell. Writing any value makes the host read the
+  cursor image (size x size pixels, 32bit ARGB stored in A, R, G, B
+  byte order) from the cursor slot in VRAM.
+``0824``
+  cursor slot offset in VRAM (read only). The slot is the last 16 KiB of
+  VRAM; the guest must not use it for the framebuffer.
