@@ -1,0 +1,144 @@
+diff --git a/drivers/pci.c b/drivers/pci.c
+index c9c5608..cfae0c0 100644
+--- a/drivers/pci.c
++++ b/drivers/pci.c
+@@ -1002,6 +1002,84 @@ int macio_keylargo_config_cb (const pci_config_t *config)
+         return 0;
+ }
+ 
++#ifdef CONFIG_PPC
++/*
++ * RetroBoot: an emulated R100 Radeon (QEMU ati-vga,model=r100) has no FCode
++ * ROM.  Program a boot mode through the ATI CRTC registers (the Bochs VBE
++ * registers the QEMU VGA FCode uses do not exist on it) and publish the
++ * properties a Radeon Mac Edition ROM would.  Runs only for that device.
++ */
++#define ATI_CRTC_GEN_CNTL       0x0050
++#define ATI_CRTC_EXT_CNTL       0x0054
++#define ATI_DAC_CNTL            0x0058
++#define ATI_CNFG_CNTL           0x00e0
++#define ATI_CRTC_H_TOTAL_DISP   0x0200
++#define ATI_CRTC_H_SYNC         0x0204
++#define ATI_CRTC_V_TOTAL_DISP   0x0208
++#define ATI_CRTC_V_SYNC         0x020c
++#define ATI_CRTC_OFFSET         0x0224
++#define ATI_CRTC_OFFSET_CNTL    0x0228
++#define ATI_CRTC_PITCH          0x022c
++
++static int is_ati_radeon(const pci_config_t *config)
++{
++    /* from the node's properties: config cycles here may go to another
++     * host bridge than the one this device sits behind */
++    phandle_t ph = get_cur_dev();
++    int len;
++
++    (void)config;
++    return get_int_property(ph, "vendor-id", &len) == PCI_VENDOR_ID_ATI &&
++           get_int_property(ph, "device-id", &len) == PCI_DEVICE_ID_ATI_RADEON_QD;
++}
++
++static void ati_radeon_setup(const pci_config_t *config, phandle_t ph)
++{
++    volatile uint8_t *mmio;
++    uint32_t w, h, depth, pixw, bpp, swap;
++
++    mmio = (volatile uint8_t *)pci_bus_addr_to_host_addr(MEMORY_SPACE_32,
++                                                         config->assigned[2] & ~0x0000000F);
++    /* the card's command processor and GART fetch from system memory */
++    ob_pci_enable_bus_master(config);
++    feval("openbios-video-width");
++    w = POP();
++    feval("openbios-video-height");
++    h = POP();
++    feval("depth-bits");
++    depth = POP();
++    switch (depth) {
++    case 8:  pixw = 2; bpp = 8;  swap = 0; break;
++    case 15: pixw = 3; bpp = 16; swap = 1; break;
++    case 16: pixw = 4; bpp = 16; swap = 1; break;
++    default: pixw = 6; bpp = 32; swap = 2; break;
++    }
++    /* aperture 0 byte swap for the big-endian CPU */
++    out_le32((volatile uint32_t *)(mmio + ATI_CNFG_CNTL), swap);
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_H_TOTAL_DISP),
++             ((w / 8 - 1) << 16) | (w / 8 + 39));
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_H_SYNC),
++             (w + 16) | (12 << 16));
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_V_TOTAL_DISP),
++             ((h - 1) << 16) | (h + 44));
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_V_SYNC),
++             (h + 10) | (2 << 16));
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_OFFSET), 0);
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_OFFSET_CNTL), 0);
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_PITCH),
++             ((w + 7) / 8) | (((w + 7) / 8) << 16));
++    out_le32((volatile uint32_t *)(mmio + ATI_DAC_CNTL),
++             in_le32((volatile uint32_t *)(mmio + ATI_DAC_CNTL)) | 0x100);
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_GEN_CNTL),
++             0x03000000 | (pixw << 8));
++    out_le32((volatile uint32_t *)(mmio + ATI_CRTC_EXT_CNTL), 0x00008000);
++    printk("ATI Radeon: boot mode %dx%dx%d, registers at %lx\n",
++           (int)w, (int)h, (int)bpp, (unsigned long)mmio);
++
++    set_property(ph, "device_type", "display", 8);
++}
++#endif
++
+ int vga_config_cb (const pci_config_t *config)
+ {
+ #ifdef CONFIG_PPC
+@@ -1040,9 +1118,23 @@ int vga_config_cb (const pci_config_t *config)
+             }
+ #endif
+ 
++#ifdef CONFIG_PPC
++            if (is_ati_radeon(config)) {
++                ati_radeon_setup(config, get_cur_dev());
++            }
++#endif
+             /* Currently we don't read FCode from the hardware but execute
+              * it directly */
+             feval("['] vga-driver-fcode 2 cells + 1 byte-load");
++#ifdef CONFIG_PPC
++            if (is_ati_radeon(config)) {
++                /* the QEMU VGA NDRV drives Bochs VBE registers; the Radeon
++                 * gets its driver from Mac OS ("ATI Driver Update") */
++                push_str("driver,AAPL,MacOS,PowerPC");
++                PUSH(get_cur_dev());
++                fword("(delete-property)");
++            }
++#endif
+ 
+ #ifdef CONFIG_MOL
+             /* Install special words for Mac On Linux */
+diff --git a/drivers/pci_database.c b/drivers/pci_database.c
+index 14ebd29..d8fe655 100644
+--- a/drivers/pci_database.c
++++ b/drivers/pci_database.c
+@@ -245,6 +245,14 @@ static const pci_dev_t vga_devices[] = {
+         0, 0, 0,
+         NULL, NULL,
+     },
++    {
++        /* RetroBoot: R100 Radeon, as the PCI Radeon Mac Edition's FCode
++         * names it; Mac OS 9.2.1's "ATI Driver Update" matches this name */
++        PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_RADEON_QD,
++        NULL, "ATY,Rage6p", "ATY,Rage6p", "ATY,Rage6p\0",
++        0, 0, 0,
++        NULL, NULL,
++    },
+     {
+         PCI_VENDOR_ID_QEMU, PCI_DEVICE_ID_QEMU_VGA,
+         NULL, "QEMU,VGA", "Qemu VGA",    "VGA\0",
+diff --git a/include/drivers/pci.h b/include/drivers/pci.h
+index 990d071..bfc41c8 100644
+--- a/include/drivers/pci.h
++++ b/include/drivers/pci.h
+@@ -193,6 +193,7 @@ extern const pci_arch_t *arch;
+ 
+ #define PCI_VENDOR_ID_ATI                0x1002
+ #define PCI_DEVICE_ID_ATI_RAGE128_PF     0x5046
++#define PCI_DEVICE_ID_ATI_RADEON_QD      0x5144
+ 
+ #define PCI_VENDOR_ID_DEC                0x1011
+ #define PCI_DEVICE_ID_DEC_21154          0x0026

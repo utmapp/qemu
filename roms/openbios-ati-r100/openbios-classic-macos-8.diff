@@ -1,0 +1,296 @@
+diff --git a/arch/ppc/qemu/init.c b/arch/ppc/qemu/init.c
+index 45cd77e..cce3bcf 100644
+--- a/arch/ppc/qemu/init.c
++++ b/arch/ppc/qemu/init.c
+@@ -954,12 +954,12 @@ arch_of_init(void)
+ 
+         /* model */
+ 
+-        push_str("PowerMac3,1");
++        push_str("iMac,1");
+         fword("model");
+ 
+         /* compatible */
+ 
+-        push_str("PowerMac3,1");
++        push_str("iMac,1");
+         fword("encode-string");
+         push_str("MacRISC");
+         fword("encode-string");
+@@ -1030,6 +1030,14 @@ arch_of_init(void)
+                 size *= 2;
+             set_property(ph, "rtas-size", (char*)&size, sizeof(size));
+             set_int_property(ph, "rtas-version", is_apple() ? 0x41 : 1);
++            set_int_property(ph, "nvram-fetch", 1);
++            set_int_property(ph, "nvram-store", 2);
++            set_int_property(ph, "get-time-of-day", 3);
++            set_int_property(ph, "set-time-of-day", 4);
++            set_int_property(ph, "read-pci-config", 8);
++            set_int_property(ph, "write-pci-config", 9);
++            set_int_property(ph, "power-off", 17);
++            set_int_property(ph, "system-reboot", 20);
+         }
+         break;
+     }
+diff --git a/arch/ppc/qemu/methods.c b/arch/ppc/qemu/methods.c
+index 930b47c..34f31fd 100644
+--- a/arch/ppc/qemu/methods.c
++++ b/arch/ppc/qemu/methods.c
+@@ -116,6 +116,7 @@ ciface_quiesce( unsigned long args[], unsigned long ret[] )
+ 	usb_exit();
+ 
+ 	ob_ide_quiesce();
++	cuda_quiesce();
+ #if 0
+ 	unsigned long msr;
+ 	/* This seems to be the correct thing to do - but I'm not sure */
+diff --git a/arch/ppc/qemu/start.S b/arch/ppc/qemu/start.S
+index c679230..c24fbbc 100644
+--- a/arch/ppc/qemu/start.S
++++ b/arch/ppc/qemu/start.S
+@@ -630,7 +630,33 @@ GLOBL(of_client_callback):
+ 	/* rtas glue (must be reloctable) */
+ GLOBL(of_rtas_start):
+ 	/* r3 = argument buffer, r4 = of_rtas_start */
+-	/* according to the CHRP standard, cr must be preserved (cr0/cr1 too?) */
++	/*
++	 * Minimal RTAS compatibility for classic Mac OS.  Mac OS requires the
++	 * standard tokens to exist before its native CUDA and PCI drivers take
++	 * over.  NVRAM is exposed directly in the device tree, so acknowledge its
++	 * RTAS transfer calls with zero bytes; unsupported services report a
++	 * hardware error and let Mac OS use its native driver instead.
++	 */
++	mfcr	r9
++	lwz	r7,0(r3)
++	lwz	r5,4(r3)
++	slwi	r5,r5,2
++	addi	r5,r5,12
++	li	r6,-1
++	cmpwi	r7,1
++	beq	1f
++	cmpwi	r7,2
++	bne	2f
++1:
++	li	r6,0
++	stwx	r6,r3,r5
++	addi	r5,r5,4
++	stwx	r6,r3,r5
++	b	3f
++2:
++	stwx	r6,r3,r5
++3:
++	mtcr	r9
+ 	blr
+ GLOBL(of_rtas_end):
+ 
+diff --git a/config/examples/ppc_config.xml b/config/examples/ppc_config.xml
+index 19dc043..43d5757 100644
+--- a/config/examples/ppc_config.xml
++++ b/config/examples/ppc_config.xml
+@@ -63,7 +63,7 @@
+   <!-- Miscellaneous -->
+   <option name="CONFIG_PPC_64BITSUPPORT" type="boolean" value="true"/>
+   <option name="CONFIG_LINUXBIOS" type="boolean" value="false"/>
+-  <option name="CONFIG_RTAS" type="boolean" value="false"/>
++  <option name="CONFIG_RTAS" type="boolean" value="true"/>
+   <option name="CONFIG_LOCALS" type="boolean" value="true"/>
+ 
+   <!-- Drivers -->
+diff --git a/drivers/cuda.c b/drivers/cuda.c
+index c89b174..12f0422 100644
+--- a/drivers/cuda.c
++++ b/drivers/cuda.c
+@@ -6,6 +6,7 @@
+ 
+ #include "macio.h"
+ #include "cuda.h"
++#include "timer.h"
+ 
+ //#define DEBUG_CUDA
+ #ifdef DEBUG_CUDA
+@@ -174,6 +175,25 @@ DECLARE_UNNAMED_NODE(ob_cuda, 0, sizeof(int));
+ 
+ static cuda_t *main_cuda;
+ 
++void
++cuda_quiesce(void)
++{
++	if (main_cuda == NULL)
++		return;
++
++	/*
++	 * OpenBIOS polls CUDA synchronously and does not install an interrupt
++	 * handler.  Do not leave a pending VIA interrupt asserted when the client
++	 * calls quiesce: older Mac OS ROMs enable external interrupts before their
++	 * CUDA driver has taken ownership and otherwise loop in the NanoKernel
++	 * interrupt dispatcher.
++	 */
++	/* Let QEMU's delayed shift-register completion become visible first. */
++	udelay(1000);
++	cuda_readb(main_cuda, SR);
++	cuda_writeb(main_cuda, IFR, 0x7f);
++}
++
+ static void
+ ppc32_reset_all(void)
+ {
+diff --git a/drivers/virtio.c b/drivers/virtio.c
+index 7808d94..b4a55dc 100644
+--- a/drivers/virtio.c
++++ b/drivers/virtio.c
+@@ -129,12 +129,13 @@ static void vring_send_buf(VRing *vr, uint64_t p, int len, int flags)
+ 
+ static int vr_poll(VDev *vdev, VRing *vr)
+ {
+-    if (__le16_to_cpu(vr->used->idx) == vr->used_idx) {
++    uint16_t device_idx = __le16_to_cpu(vr->used->idx);
++    if (device_idx == vr->used_idx) {
+         vring_notify(vdev, vr);
+         return 0;
+     }
+ 
+-    vr->used_idx = __le16_to_cpu(vr->used->idx);
++    vr->used_idx = device_idx;
+     vr->next_idx = 0;
+     vr->desc[0].len = __cpu_to_le32(0);
+     vr->desc[0].flags = __cpu_to_le16(0);
+@@ -176,12 +177,12 @@ static int vring_wait_reply(VDev *vdev)
+     return 1;
+ }
+ 
+-static uint64_t vring_addr_translate(VDev *vdev, void *p)
++static uint64_t vring_addr_translate(VDev *vdev, const volatile void *p)
+ {
+     ucell mode;
+     uint64_t iova;
+ 
+-    iova = ofmem_translate(pointer2cell(p), &mode);
++    iova = ofmem_translate(pointer2cell((const void *)p), &mode);
+     return iova;
+ }
+ 
+@@ -193,7 +194,7 @@ static int virtio_blk_read_many(VDev *vdev,
+                                 uint64_t offset, void *load_addr, int len)
+ {
+     VirtioBlkOuthdr out_hdr;
+-    u8 status;
++    volatile u8 status;
+     VRing *vr = &vdev->vrings[vdev->cmd_vr_idx];
+     uint8_t discard[VIRTIO_SECTOR_SIZE];
+ 
+@@ -371,6 +372,13 @@ ob_virtio_disk_close(VDev **_vdev)
+     return;
+ }
+ 
++/* ( -- pos.d ) */
++static void
++ob_virtio_disk_tell(VDev **_vdev)
++{
++    DPUSH((*_vdev)->pos);
++}
++
+ /* ( pos.d -- status ) */
+ static void
+ ob_virtio_disk_seek(VDev **_vdev)
+@@ -381,12 +389,18 @@ ob_virtio_disk_seek(VDev **_vdev)
+     pos = ((uint64_t)POP()) << 32;
+     pos |= POP();
+ 
++    if (pos == (uint64_t)-1) {
++        vdev->pos = vdev->config.blk.capacity * virtio_get_block_size(vdev);
++        PUSH(0);
++        return;
++    }
++
+     /* Make sure we are within the physical limits */
+-    if (pos < (vdev->config.blk.capacity * virtio_get_block_size(vdev))) {
++    if (pos <= (vdev->config.blk.capacity * virtio_get_block_size(vdev))) {
+         vdev->pos = pos;
+         PUSH(0);
+     } else {
+-        PUSH(1);
++        PUSH(-1);
+     }
+ 
+     return;
+@@ -425,6 +439,7 @@ NODE_METHODS(ob_virtio_disk) = {
+     { "open",      ob_virtio_disk_open          },
+     { "close",     ob_virtio_disk_close         },
+     { "seek",      ob_virtio_disk_seek          },
++    { "tell",      ob_virtio_disk_tell          },
+     { "read",      ob_virtio_disk_read          },
+ };
+ 
+diff --git a/drivers/virtio.h b/drivers/virtio.h
+index 36cb205..8d07446 100644
+--- a/drivers/virtio.h
++++ b/drivers/virtio.h
+@@ -206,7 +206,7 @@ struct VRing {
+     int used_idx;
+     VRingDesc *desc;
+     VRingAvail *avail;
+-    VRingUsed *used;
++    volatile VRingUsed *used;
+     long cookie;
+     int id;
+ };
+diff --git a/forth/debugging/client.fs b/forth/debugging/client.fs
+index 5ee6003..3e33e50 100644
+--- a/forth/debugging/client.fs
++++ b/forth/debugging/client.fs
+@@ -182,6 +182,17 @@ variable file-size
+     " bootpath" rot (property)
+   then
+ 
++  \ A client-side NDRV loader may arrange for Mac OS to use a device that
++  \ OpenBIOS cannot itself read.  Keep loading the client from the firmware
++  \ boot device, then expose the NDRV-backed device as the startup path.
++  " /chosen" (find-dev) if
++    dup >r
++    " classicmac-bootpath" rot get-package-property 0= if
++      " bootpath" r@ (property)
++    then
++    r> drop
++  then
++
+   r> close-dev
+   init-program
+   ;
+diff --git a/include/drivers/drivers.h b/include/drivers/drivers.h
+index 3d6fa12..6059c18 100644
+--- a/include/drivers/drivers.h
++++ b/include/drivers/drivers.h
+@@ -50,6 +50,7 @@ static inline int has_adb(void)
+ #define AAPL(_cmd)      do { if (is_apple()) _cmd; } while(0)
+ #define OLDWORLD(_cmd)  do { if (is_oldworld()) _cmd; } while(0)
+ #define NEWWORLD(_cmd)  do { if (is_newworld()) _cmd; } while(0)
++void cuda_quiesce(void);
+ #endif
+ #ifdef CONFIG_DRIVER_SBUS
+ /* drivers/sbus.c */
+diff --git a/packages/nvram.c b/packages/nvram.c
+index a402f00..29bfd9b 100644
+--- a/packages/nvram.c
++++ b/packages/nvram.c
+@@ -29,9 +29,11 @@ do { printk("NVRAM: " fmt , ##args); } while (0)
+ #endif
+ 
+ #define DEF_SYSTEM_SIZE	0xc10
++#define DEF_MACOS_SIZE	0x510
+ 
+ #define NV_SIG_SYSTEM	0x70
+ #define NV_SIG_FREE	0x7f
++#define NV_SIG_MACOS	0xa0
+ 
+ 
+ typedef struct {
+@@ -146,6 +148,8 @@ zap_nvram( void )
+ {
+ 	create_free_part( nvram.data, nvram.size );
+ 	create_nv_part( NV_SIG_SYSTEM, "common", DEF_SYSTEM_SIZE );
++	/* 256 bytes of XPRAM followed by 1 KiB of Name Registry data. */
++	create_nv_part( NV_SIG_MACOS, "APL,MacOS75", DEF_MACOS_SIZE );
+ }
+ 
+ #if 0
+
