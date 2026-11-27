@@ -46,6 +46,13 @@ struct HIDState {
     QEMUTimer *idle_timer;
     HIDEventFunc event;
     QemuInputHandlerState *s;
+    /*
+     * Absolute pointers only: shrink positions about the centre by
+     * 10000 / abs_scale before the guest sees them (0 = off). An installed
+     * Mac OS X 10.4 stretches tablet input by ~1.1775 about the screen
+     * centre, so abs-scale=11775 puts its cursor under the host pointer.
+     */
+    uint32_t abs_scale;
 };
 
 void hid_init(HIDState *hs, int kind, HIDEventFunc event);

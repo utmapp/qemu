@@ -35,6 +35,7 @@ system_ss.add(when: 'CONFIG_XLNX_USB_SUBSYS', if_true: files('xlnx-usb-subsystem
 # emulated usb devices
 system_ss.add(when: 'CONFIG_USB_HUB', if_true: files('dev-hub.c'))
 system_ss.add(when: 'CONFIG_USB_HID', if_true: files('dev-hid.c'))
+system_ss.add(when: 'CONFIG_USB_HID', if_true: files('dev-poweremu-pad.c'))
 system_ss.add(when: 'CONFIG_USB_TABLET_WACOM', if_true: files('dev-wacom.c'))
 system_ss.add(when: 'CONFIG_USB_STORAGE_CORE', if_true: files('dev-storage.c'))
 system_ss.add(when: 'CONFIG_USB_STORAGE_BOT', if_true: files('dev-storage-bot.c'))

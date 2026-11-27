@@ -67,6 +67,27 @@ void qemu_input_handler_activate(QemuInputHandlerState *s)
     notifier_list_notify(&mouse_mode_notifiers, NULL);
 }
 
+/*
+ * Bring the first handler that takes `mask` events (INPUT_EVENT_MASK_ABS
+ * or INPUT_EVENT_MASK_REL) to the front, so the buttons go to the same
+ * device as the motion - with both a USB mouse and a USB tablet in the
+ * guest, a click could otherwise reach it through the other device, ahead
+ * of the position.  No-op if it is already first.
+ */
+void qemu_input_handler_activate_kind(uint32_t mask)
+{
+    QemuInputHandlerState *s;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->handler->mask & mask) {
+            if (s != QTAILQ_FIRST(&handlers)) {
+                qemu_input_handler_activate(s);
+            }
+            return;
+        }
+    }
+}
+
 void qemu_input_handler_deactivate(QemuInputHandlerState *s)
 {
     QTAILQ_REMOVE(&handlers, s, node);

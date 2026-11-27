@@ -885,9 +885,13 @@ static void mac_dbdma_reset(DeviceState *d)
     int i;
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        DBDMA_channel *ch = &s->channels[i];
+
+        memset(ch->regs, 0, DBDMA_SIZE);
         /* No command is in progress after a reset */
-        s->channels[i].io.processing = false;
+        ch->io.processing = false;
+        ch->io.len = 0;
+        memset(&ch->current, 0, sizeof(ch->current));
     }
 }
 
