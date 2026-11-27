@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
@@ -79,6 +80,17 @@
 #define SE_VTX_FMT              0x2080
 #define SE_VF_CNTL              0x2084
 #define SE_CNTL_STATUS          0x2140
+#define SE_TCL_VECTOR_INDX_REG  0x2200
+#define SE_TCL_VECTOR_DATA_REG  0x2204
+#define SE_TCL_SCALAR_INDX_REG  0x2208
+#define SE_TCL_SCALAR_DATA_REG  0x220c
+#define SE_TCL_OUTPUT_VTX_FMT   0x2254
+#define SE_TCL_OUTPUT_VTX_SEL   0x2258
+#define SE_TCL_MATRIX_SELECT_0  0x225c
+#define SE_TCL_MATRIX_SELECT_1  0x2260
+#define SE_TCL_UCP_VERT_BLEND_CTL 0x2264
+#define SE_TCL_TEXTURE_PROC_CTL 0x2268
+#define SE_TCL_LIGHT_MODEL_CTL  0x226c
 #define RE_TOP_LEFT             0x26c0
 #define RE_MISC                 0x26c4
 #define SURFACE_CNTL            0x0b00
@@ -101,6 +113,41 @@
 #define VF_Q0       (1u << 14)
 #define VF_N0       (1u << 18)
 #define VF_Z        (1u << 31)
+
+/* TCL vector state addresses (octwords) and sizes, see ATI-R100-TCL.md */
+#define TCL_VS_MATRIX_EYE2CLIP  112
+#define TCL_VEC_N               256     /* octwords (4 dwords each) */
+#define TCL_SCAL_N              512     /* dwords */
+#define VFCNTL_TCL_ENABLE       (1u << 9)
+#define TCL_VS_LIGHT_AMBIENT    64      /* + 8 * (0 amb, 1 diff, 2 spec, 3 pos, 4 spot dir, 5 atten) + light */
+#define TCL_VS_UCP              116
+#define TCL_VS_GLOBAL_AMBIENT   122
+#define TCL_VS_FOG_PARAM        123
+#define TCL_VS_EYE_VECTOR       124
+#define TCL_SS_LIGHT_EXPONENT   8       /* + 8 * (0 dcd, 1 exp, 2 cutoff, 3 spec thresh, 4 range, 5 1/const) + light */
+#define SE_TCL_MATERIAL_EMISSIVE 0x2210 /* 4 floats; ambient 0x2220, diffuse 0x2230, specular 0x2240 */
+#define SE_TCL_SHININESS        0x2250
+#define SE_TCL_PER_LIGHT_CTL_0  0x2270
+
+/* per-draw state of the TCL stages after the position transform (T2..T4) */
+typedef struct TCLLight {
+    uint32_t ctl;               /* 16 bit flags from SE_TCL_PER_LIGHT_CTL */
+    float amb[4], dif[4], spec[4], pos[4], spot[4], att[4];
+    float exponent, cutoff, const_inv;
+} TCLLight;
+
+typedef struct TCLFx {
+    bool light, tex;
+    uint8_t ucp, fog;           /* enabled planes; fog mode (0 off) */
+    uint32_t lm, ucp_ctl, vsel, tpc;
+    float mv[4][4], it[4][4];
+    float texm[3][4][4];
+    float plane[6][4];
+    float emis[4], mamb[4], mdif[4], mspec[4], shine, glt[4], eye[4];
+    int nl;
+    TCLLight L[8];
+    float fog_c, fog_d;
+} TCLFx;
 
 /* GL enums used in the draw description (match GLES values) */
 enum {
@@ -150,6 +197,24 @@ struct ATI3DState {
     /* vertex arrays from 3D_LOAD_VBPNTR */
     unsigned narrays;
     uint32_t arr_addr[16], arr_stride[16], arr_size[16];
+    /*
+     * TCL (hardware transform) state: the vector/scalar memories behind
+     * SE_TCL_VECTOR_* / SE_TCL_SCALAR_*, the index registers' auto-increment
+     * state, and the transform of the draw being decoded.
+     */
+    uint32_t tcl_vec[TCL_VEC_N * 4];
+    uint32_t tcl_scal[TCL_SCAL_N];
+    uint16_t vec_addr, scal_addr;
+    uint8_t vec_stride, scal_stride, vec_dw;
+    bool tcl_on;                      /* this draw goes through the transform */
+    float tcl_m[4][4];                /* clip = tcl_m * (x, y, z, w) */
+    TCLFx tx;                         /* lighting / texgen / fog / clip planes */
+    uint32_t tcl_sig;                 /* identity of tcl_m, for the traces */
+    int tcl_dump_left;                /* draws still to trace after a change */
+    unsigned tcl_dumps;               /* matrix traces so far */
+    bool tcl_vtx_set;                 /* first vertex of the draw captured */
+    float tcl_vtx[8];                 /* its object x y z w, clip x y z w */
+    uint64_t tcl_draws;
     uint64_t draws, verts, syncs, readbacks, uploads, texuploads, texhits;
     uint64_t zclears, upload_skips, flips, vblank_waits, readbacks_joined;
     uint64_t gl_fills;          /* RetroBoot: 2D fills done as GL clears */
@@ -1236,12 +1301,552 @@ static inline float fl(uint32_t u)
     return v.f;
 }
 
+/* float -> scaled int for the traces, without overflowing */
+static inline int tr_i(float f, float k)
+{
+    float v = f * k;
+
+    return v != v ? 0 : v > 2e9f ? 2000000000 : v < -2e9f ? -2000000000 : (int)v;
+}
+
+/* ---------------------------------------------------------------------
+ * Hardware TCL (see ATI-R100-TCL.md)
+ *
+ * T1: the position transform.  The guest loads matrices into the vector
+ * memory through SE_TCL_VECTOR_INDX/DATA; a draw with TCL on carries object
+ * space positions, which decode_vertex() multiplies by the model-view-
+ * projection matrix, divides by w and sends through the viewport transform
+ * like any other vertex.  Lighting, texgen, texture matrices, fog and user
+ * clip planes are not emulated yet (logged once).
+ */
+
+static void tcl_reg_write(ATI3DState *t, hwaddr addr, uint32_t data)
+{
+    switch (addr) {
+    case SE_TCL_VECTOR_INDX_REG:
+        /* [7:0] octword address, [23:16] octword stride, [31:28] dword count */
+        t->vec_addr = data & 0xff;
+        t->vec_stride = (data >> 16) & 0xff ? (data >> 16) & 0xff : 1;
+        t->vec_dw = 0;
+        break;
+    case SE_TCL_VECTOR_DATA_REG:
+        t->tcl_vec[(t->vec_addr & (TCL_VEC_N - 1)) * 4 + t->vec_dw] = data;
+        if (++t->vec_dw == 4) {
+            t->vec_dw = 0;
+            t->vec_addr = (t->vec_addr + t->vec_stride) & (TCL_VEC_N - 1);
+        }
+        break;
+    case SE_TCL_SCALAR_INDX_REG:
+        t->scal_addr = data & (TCL_SCAL_N - 1);
+        t->scal_stride = (data >> 16) & 0xff ? (data >> 16) & 0xff : 1;
+        break;
+    case SE_TCL_SCALAR_DATA_REG:
+        t->tcl_scal[t->scal_addr & (TCL_SCAL_N - 1)] = data;
+        t->scal_addr = (t->scal_addr + t->scal_stride) & (TCL_SCAL_N - 1);
+        break;
+    }
+}
+
+/* the four octwords at vector address a are the rows of a 4x4 matrix */
+static bool tcl_matrix(ATI3DState *t, unsigned a, float m[4][4])
+{
+    bool nonzero = false;
+
+    for (unsigned r = 0; r < 4; r++) {
+        for (unsigned c = 0; c < 4; c++) {
+            uint32_t u = t->tcl_vec[((a + r) & (TCL_VEC_N - 1)) * 4 + c];
+            nonzero |= u != 0;
+            m[r][c] = fl(u);
+        }
+    }
+    return nonzero;
+}
+
+static void tcl_vec4(ATI3DState *t, unsigned a, float *o)
+{
+    for (int c = 0; c < 4; c++) {
+        o[c] = fl(t->tcl_vec[(a & (TCL_VEC_N - 1)) * 4 + c]);
+    }
+}
+
+static float tcl_scl(ATI3DState *t, unsigned a)
+{
+    return fl(t->tcl_scal[a & (TCL_SCAL_N - 1)]);
+}
+
+static void reg_vec4(ATIVGAState *s, unsigned reg, float *o)
+{
+    for (int c = 0; c < 4; c++) {
+        o[c] = fl(R(s, reg + 4 * c));
+    }
+}
+
+/*
+ * T2..T4: collect the state the post-transform stages need (see
+ * ATI-R100-TCL.md for the source of each register).  Done once per draw, and
+ * only for the stages that are switched on.
+ */
+static void tcl_fx_setup(ATIVGAState *s, uint32_t tpc, uint32_t lm,
+                         uint32_t ucp, uint32_t sel0, uint32_t sel1)
+{
+    ATI3DState *t = s->r3d;
+    TCLFx *x = &t->tx;
+    static bool w_texin;
+
+    memset(x, 0, sizeof(*x));
+    x->lm = lm;
+    x->ucp_ctl = ucp;
+    x->tpc = tpc;
+    x->vsel = R(s, SE_TCL_OUTPUT_VTX_SEL);
+    x->light = lm & 1;
+    x->fog = (ucp >> 8) & 3;
+    x->ucp = (ucp >> 2) & 0x3f;
+    /* texture: a unit is computed when its output select has bit 3 set */
+    for (int u = 0; u < 3; u++) {
+        unsigned sel = (x->vsel >> (16 + 4 * u)) & 0xf;
+
+        if (sel & 8) {
+            unsigned in = (tpc >> (16 + 4 * u)) & 0xf;
+
+            x->tex = true;
+            if (in > 8 && !w_texin) {
+                w_texin = true;
+                qemu_log_mask(LOG_UNIMP, "ati: TCL texgen input %u unknown "
+                              "(texture proc 0x%08x)\n", in, tpc);
+            }
+            if (tpc & (0x10u << u)) {
+                tcl_matrix(t, ((sel1 >> (16 + 4 * u)) & 0xf) * 4, x->texm[u]);
+            }
+        }
+    }
+    if (x->light || x->fog || x->ucp || x->tex) {
+        /* eye-space matrices */
+        tcl_matrix(t, (sel0 & 0xf) * 4, x->mv);
+        tcl_matrix(t, ((sel0 >> 16) & 0xf) * 4, x->it);
+    }
+    if (x->light) {
+        tcl_vec4(t, TCL_VS_GLOBAL_AMBIENT, x->glt);
+        tcl_vec4(t, TCL_VS_EYE_VECTOR, x->eye);
+        reg_vec4(s, SE_TCL_MATERIAL_EMISSIVE, x->emis);
+        reg_vec4(s, SE_TCL_MATERIAL_EMISSIVE + 0x10, x->mamb);
+        reg_vec4(s, SE_TCL_MATERIAL_EMISSIVE + 0x20, x->mdif);
+        reg_vec4(s, SE_TCL_MATERIAL_EMISSIVE + 0x30, x->mspec);
+        x->shine = fl(R(s, SE_TCL_SHININESS));
+        for (unsigned l = 0; l < 8; l++) {
+            uint32_t ctl = (R(s, SE_TCL_PER_LIGHT_CTL_0 + 4 * (l / 2)) >>
+                            (16 * (l & 1))) & 0xffff;
+            TCLLight *L;
+
+            if (!(ctl & 1)) {
+                continue;
+            }
+            L = &x->L[x->nl++];
+            L->ctl = ctl;
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + l, L->amb);
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + 8 + l, L->dif);
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + 16 + l, L->spec);
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + 24 + l, L->pos);
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + 32 + l, L->spot);
+            tcl_vec4(t, TCL_VS_LIGHT_AMBIENT + 40 + l, L->att);
+            L->exponent = tcl_scl(t, TCL_SS_LIGHT_EXPONENT + l);
+            L->cutoff = tcl_scl(t, TCL_SS_LIGHT_EXPONENT + 8 + l);
+            L->const_inv = tcl_scl(t, TCL_SS_LIGHT_EXPONENT + 32 + l);
+        }
+    }
+    if (x->ucp) {
+        for (int p = 0; p < 6; p++) {
+            tcl_vec4(t, TCL_VS_UCP + p, x->plane[p]);
+        }
+    }
+    if (x->fog) {
+        float f[4];
+
+        tcl_vec4(t, TCL_VS_FOG_PARAM, f);
+        x->fog_c = f[1];
+        x->fog_d = f[2];
+    }
+}
+
+static inline void mat4v(const float m[4][4], const float *v, float *o)
+{
+    for (int r = 0; r < 4; r++) {
+        o[r] = m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2] +
+               m[r][3] * v[3];
+    }
+}
+
+static inline float dot3(const float *a, const float *b)
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static inline void norm3(float *v)
+{
+    float l = sqrtf(dot3(v, v));
+
+    if (l > 1e-20f) {
+        v[0] /= l; v[1] /= l; v[2] /= l;
+    }
+}
+
+static inline float sat(float v)
+{
+    return v != v ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+/* a material colour source: 0 premultiplied into the light, 1 state, 2/3 vertex */
+static void lm_src(unsigned src, const float *state, const float *c0,
+                   const float *c1, float *o)
+{
+    const float *p = src == 1 ? state : src == 2 ? c0 : src == 3 ? c1 : NULL;
+
+    for (int i = 0; i < 4; i++) {
+        o[i] = p ? p[i] : 1.0f;
+    }
+}
+
+/*
+ * T2: texture matrices and texgen.  Output unit u is either an input
+ * texcoord (select 0..3) or, with bit 3 set, the generated vector
+ * (TEXGEN input: 0..3 texcoord, 4 object, 5 eye, 6 eye normal, 7 reflection,
+ * 8 normalised eye) run through the unit's texture matrix when
+ * TEXMAT_u_ENABLE.  Inputs without a q default to (s, t, 1, 1).
+ */
+static void tcl_texture(const TCLFx *x, ATIVertex *v, const float tin[3][4],
+                        const float *obj, const float *eye, const float *nrm)
+{
+    for (int u = 0; u < 3; u++) {
+        unsigned sel = (x->vsel >> (16 + 4 * u)) & 0xf;
+        float in[4], o[4];
+
+        if (!(sel & 8)) {
+            if ((sel & 7) < 3 && (sel & 7) != (unsigned)u) {
+                memcpy(v->tc[u], tin[sel & 7], 3 * sizeof(float));
+            }
+            continue;
+        }
+        switch ((x->tpc >> (16 + 4 * u)) & 0xf) {
+        case 4: memcpy(in, obj, sizeof(in)); break;
+        case 5: memcpy(in, eye, sizeof(in)); break;
+        case 8: memcpy(in, eye, sizeof(in)); norm3(in); in[3] = 1.0f; break;
+        case 6:
+            memcpy(in, nrm, 3 * sizeof(float)); in[3] = 1.0f;
+            break;
+        case 7: {       /* reflect the eye vector about the normal */
+            float e[3] = { eye[0], eye[1], eye[2] }, d;
+
+            norm3(e);
+            d = 2.0f * dot3(e, nrm);
+            for (int i = 0; i < 3; i++) {
+                in[i] = e[i] - d * nrm[i];
+            }
+            in[3] = 1.0f;
+            break;
+        }
+        default:
+            in[0] = tin[(x->tpc >> (16 + 4 * u)) & 3][0];
+            in[1] = tin[(x->tpc >> (16 + 4 * u)) & 3][1];
+            in[2] = tin[(x->tpc >> (16 + 4 * u)) & 3][2];
+            in[3] = 1.0f;
+            break;
+        }
+        if (x->tpc & (0x10u << u)) {
+            mat4v(x->texm[u], in, o);
+        } else {
+            memcpy(o, in, sizeof(o));
+        }
+        v->tc[u][0] = o[0];
+        v->tc[u][1] = o[1];
+        v->tc[u][2] = o[2];
+    }
+}
+
+/* T3: fixed-function lighting; fills v->c0 (and c1 rgb when not combined) */
+static void tcl_light(const TCLFx *x, ATIVertex *v, bool have_n,
+                      const float *pos, const float *n)
+{
+    unsigned es = (x->lm >> 16) & 3, as = (x->lm >> 18) & 3;
+    unsigned ds = (x->lm >> 20) & 3, ss = (x->lm >> 22) & 3;
+    float em[4], am[4], dm[4], sm[4], col[3], spc[3] = { 0, 0, 0 };
+    float vw[3] = { x->eye[0], x->eye[1], -x->eye[2] };
+    bool local_viewer = x->lm & (1 << 2);
+
+    lm_src(es, x->emis, v->c0, v->c1, em);
+    lm_src(as, x->mamb, v->c0, v->c1, am);
+    lm_src(ds, x->mdif, v->c0, v->c1, dm);
+    lm_src(ss, x->mspec, v->c0, v->c1, sm);
+    for (int i = 0; i < 3; i++) {
+        col[i] = (es ? em[i] : 0.0f) + x->glt[i] * am[i];
+    }
+    if (local_viewer) {
+        vw[0] = -pos[0]; vw[1] = -pos[1]; vw[2] = -pos[2];
+        norm3(vw);
+    }
+    for (int l = 0; l < x->nl; l++) {
+        const TCLLight *L = &x->L[l];
+        float lv[3], hv[3], att = 1.0f, spot = 1.0f, nl, d = 0.0f;
+
+        if (L->ctl & 8) {               /* local light */
+            for (int i = 0; i < 3; i++) {
+                lv[i] = L->pos[i] - pos[i];
+            }
+            d = sqrtf(dot3(lv, lv));
+            norm3(lv);
+            if (L->ctl & 0x40) {        /* range attenuation */
+                att = (L->ctl & 0x80) ? L->const_inv :
+                      1.0f / (L->att[2] + L->att[1] * d + L->att[0] * d * d);
+            }
+            if (L->ctl & 0x10) {        /* spot: spot[] = -spot direction */
+                float sd = dot3(lv, L->spot);
+
+                spot = sd < L->cutoff || sd <= 0.0f ? 0.0f :
+                       L->exponent != 0.0f ? powf(sd, L->exponent) : 1.0f;
+            }
+        } else {
+            memcpy(lv, L->pos, sizeof(lv));
+            norm3(lv);
+        }
+        att *= spot;
+        if ((L->ctl & 2)) {
+            for (int i = 0; i < 3; i++) {
+                col[i] += att * L->amb[i] * am[i];
+            }
+        }
+        if (!have_n) {
+            continue;
+        }
+        nl = dot3(n, lv);
+        if (nl <= 0.0f) {
+            continue;
+        }
+        for (int i = 0; i < 3; i++) {
+            col[i] += att * nl * L->dif[i] * dm[i];
+        }
+        if ((x->lm & 0x20) && (L->ctl & 4)) {
+            float nh, sp;
+
+            for (int i = 0; i < 3; i++) {
+                hv[i] = lv[i] + vw[i];
+            }
+            norm3(hv);
+            nh = dot3(n, hv);
+            if (nh > 0.0f) {
+                sp = x->shine == 0.0f ? 1.0f : powf(nh, x->shine);
+                for (int i = 0; i < 3; i++) {
+                    spc[i] += att * sp * L->spec[i] * sm[i];
+                }
+            }
+        }
+    }
+    if (x->lm & 0x40) {         /* DIFFUSE_SPECULAR_COMBINE */
+        for (int i = 0; i < 3; i++) {
+            col[i] += spc[i];
+            spc[i] = 0.0f;
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        v->c0[i] = sat(col[i]);
+        v->c1[i] = sat(spc[i]);
+    }
+    v->c0[3] = sat(dm[3]);
+}
+
+/*
+ * Everything after the position transform for one vertex: eye space,
+ * texgen/texmat, lighting, fog and the user clip plane outcode (kept in
+ * tc[0][3] until draw() has dropped the triangles outside a plane).
+ */
+static void tcl_post(ATI3DState *t, ATIVertex *v, uint32_t f,
+                     const float *obj, const float *nrm, const float *clip,
+                     const float tin[3][4])
+{
+    const TCLFx *x = &t->tx;
+    float eye[4] = { obj[0], obj[1], obj[2], obj[3] };
+    float n[3] = { nrm[0], nrm[1], nrm[2] }, lp[3];
+    bool have_n = f & VF_N0;
+
+    if (!(x->light || x->tex || x->fog || x->ucp)) {
+        return;
+    }
+    mat4v(x->mv, obj, eye);
+    if (have_n) {
+        float ne[4], i4[4] = { nrm[0], nrm[1], nrm[2], 0.0f };
+
+        mat4v(x->it, i4, ne);
+        memcpy(n, (x->lm & 2) ? nrm : ne, sizeof(n));
+        if (x->lm & 8) {
+            norm3(n);
+        } else if (x->lm & 16) {
+            for (int i = 0; i < 3; i++) {
+                n[i] *= x->eye[3];
+            }
+        }
+    }
+    if (x->tex) {
+        float ne[3] = { n[0], n[1], n[2] };
+
+        if (x->lm & 2) {    /* texgen wants eye-space normals */
+            float i4[4] = { nrm[0], nrm[1], nrm[2], 0.0f }, o[4];
+
+            mat4v(x->it, i4, o);
+            memcpy(ne, o, sizeof(ne));
+        }
+        norm3(ne);
+        tcl_texture(x, v, tin, obj, eye, ne);
+    }
+    if (x->light) {
+        if (x->lm & 2) {
+            lp[0] = obj[0]; lp[1] = obj[1]; lp[2] = obj[2];
+        } else {
+            lp[0] = eye[0]; lp[1] = eye[1]; lp[2] = eye[2];
+        }
+        tcl_light(x, v, have_n, lp, n);
+    }
+    if (x->fog) {
+        float z = x->ucp_ctl & (1u << 10) ?
+                  sqrtf(eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]) :
+                  fabsf(eye[2]);
+        float ff;
+
+        switch (x->fog) {
+        case 1:  ff = expf(x->fog_d * z); break;
+        case 2:  ff = expf(x->fog_d * z * z); break;
+        default: ff = x->fog_c + x->fog_d * z; break;
+        }
+        v->c1[3] = sat(ff);
+    }
+    if (x->ucp) {
+        unsigned out = 0;
+
+        for (int p = 0; p < 6; p++) {
+            const float *pl = x->plane[p];
+            const float *sp = (x->ucp_ctl & 1) ? clip :
+                              (x->ucp_ctl & 2) ? obj : eye;
+
+            if ((x->ucp & (1u << p)) &&
+                pl[0] * sp[0] + pl[1] * sp[1] + pl[2] * sp[2] +
+                pl[3] * sp[3] < 0.0f) {
+                out |= 1u << p;
+            }
+        }
+        v->tc[0][3] = (float)out;
+    }
+}
+
+/*
+ * Decide whether the draw about to be decoded goes through the transform
+ * and prepare the matrix.  Bypass (SE_CNTL_STATUS bit 8: RAVE) and
+ * primitives without VF_CNTL.TCL_ENABLE are window-space, as before.
+ */
+static unsigned cur_op;        /* packet3 opcode being executed */
+
+static void tcl_begin(ATIVGAState *s, uint32_t vfmt, uint32_t vfcntl,
+                      bool allow)
+{
+    ATI3DState *t = s->r3d;
+    static bool warned_vf;
+    float m[4][4], mv[4][4], p[4][4];
+    uint32_t sel0, sel1, tpc, lm, ucp, sig;
+    bool composed = false;
+    unsigned mvp_slot, mv_slot;
+
+    t->tcl_on = false;
+    t->tcl_vtx_set = false;
+    if (!allow || (R(s, SE_CNTL_STATUS) & (1 << 8))) {
+        return;
+    }
+    {
+        static bool first = true;
+
+        if (first) {
+            first = false;
+            qemu_log_mask(LOG_UNIMP, "ati: first non-bypass draw: packet3 "
+                          "0x%02x vfmt 0x%08x vf_cntl 0x%08x se_cntl_status "
+                          "0x%08x -> %s\n", cur_op, vfmt, vfcntl,
+                          R(s, SE_CNTL_STATUS),
+                          (vfcntl & VFCNTL_TCL_ENABLE) ?
+                          "TCL transform" : "window space (TCL_ENABLE clear)");
+        }
+    }
+    if (!(vfcntl & VFCNTL_TCL_ENABLE)) {
+        if (!warned_vf) {
+            warned_vf = true;
+            qemu_log_mask(LOG_UNIMP, "ati: TCL not bypassed but the primitive "
+                          "has VF_CNTL.TCL_ENABLE clear (0x%x); treating its "
+                          "vertices as window coordinates\n", vfcntl);
+        }
+        return;
+    }
+    t->tcl_on = true;
+    t->tcl_draws++;
+
+    sel0 = R(s, SE_TCL_MATRIX_SELECT_0);
+    sel1 = R(s, SE_TCL_MATRIX_SELECT_1);
+    mv_slot = sel0 & 0xf;
+    mvp_slot = sel1 & 0xf;
+    if (!tcl_matrix(t, mvp_slot * 4, m)) {
+        /* no model-view-projection matrix loaded: compose the model-view
+         * matrix with the eye-to-clip (projection) matrix */
+        tcl_matrix(t, mv_slot * 4, mv);
+        tcl_matrix(t, TCL_VS_MATRIX_EYE2CLIP, p);
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                m[r][c] = p[r][0] * mv[0][c] + p[r][1] * mv[1][c] +
+                          p[r][2] * mv[2][c] + p[r][3] * mv[3][c];
+            }
+        }
+        composed = true;
+    }
+    memcpy(t->tcl_m, m, sizeof(m));
+
+    tpc = R(s, SE_TCL_TEXTURE_PROC_CTL);
+    lm = R(s, SE_TCL_LIGHT_MODEL_CTL);
+    ucp = R(s, SE_TCL_UCP_VERT_BLEND_CTL);
+    tcl_fx_setup(s, tpc, lm, ucp, sel0, sel1);
+    {
+        static bool w_blend, w_two;
+
+        if ((ucp & ((1u << 16) | (1u << 17))) && !w_blend) {
+            w_blend = true;
+            qemu_log_mask(LOG_UNIMP, "ati: TCL vertex blending not emulated "
+                          "(0x%08x)\n", ucp);
+        }
+        if ((lm & 1) && (ucp & (1u << 11)) && !w_two) {
+            w_two = true;
+            qemu_log_mask(LOG_UNIMP, "ati: TCL two-sided lighting not "
+                          "emulated (front side only)\n");
+        }
+    }
+
+    sig = 0;
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            sig = sig * 31 + (uint32_t)tr_i(m[r][c], 4096.0f);
+        }
+    }
+    if (sig != t->tcl_sig || !t->tcl_dumps) {
+        /* the matrix changed: trace it and the first vertices drawn with it */
+        t->tcl_sig = sig;
+        t->tcl_dump_left = 3;
+        if (t->tcl_dumps < 64 &&
+            trace_event_get_state_backends(TRACE_ATI_3D_TCL_MAT)) {
+            t->tcl_dumps++;
+            for (int r = 0; r < 4; r++) {
+                trace_ati_3d_tcl_mat(r, sel0, sel1, composed,
+                                     tr_i(m[r][0], 1000), tr_i(m[r][1], 1000),
+                                     tr_i(m[r][2], 1000), tr_i(m[r][3], 1000));
+            }
+        }
+    }
+}
+
 static void decode_vertex(ATIVGAState *s, uint32_t f, const uint32_t *d,
                           ATIVertex *v, bool rgba_order)
 {
     uint32_t coord = R(s, SE_COORD_FMT), se = R(s, SE_CNTL);
+    bool tcl = s->r3d->tcl_on;
     unsigned i = 0;
-    float w0 = 1.0f;
+    float w0 = 1.0f, nrm[3] = { 0, 0, 1 }, tin[3][4];
 
     memset(v, 0, sizeof(*v));
     v->x = fl(d[i++]);
@@ -1249,6 +1854,11 @@ static void decode_vertex(ATIVGAState *s, uint32_t f, const uint32_t *d,
     v->z = (f & VF_Z) ? fl(d[i++]) : 0.0f;
     if (f & VF_W0) {
         w0 = fl(d[i++]);
+    }
+    if (tcl && (f & VF_N0)) {
+        /* the normal sits between the position and the colours */
+        nrm[0] = fl(d[i]); nrm[1] = fl(d[i + 1]); nrm[2] = fl(d[i + 2]);
+        i += 3;
     }
     v->c0[0] = v->c0[1] = v->c0[2] = v->c0[3] = 1.0f;
     if (f & VF_FPCOLOR) {
@@ -1297,31 +1907,66 @@ static void decode_vertex(ATIVGAState *s, uint32_t f, const uint32_t *d,
             q = fl(d[i++]);
         }
         if (u < 3) {
-            v->tc[u][0] = st0;
-            v->tc[u][1] = st1;
-            v->tc[u][2] = q;
+            v->tc[u][0] = tin[u][0] = st0;
+            v->tc[u][1] = tin[u][1] = st1;
+            v->tc[u][2] = tin[u][2] = q;
         }
     }
-    /* W0 is 1/w unless the coordinate format says otherwise */
-    if (f & VF_W0) {
-        v->rhw = (coord & (1 << 16)) ? (w0 != 0 ? 1.0f / w0 : 1.0f) : w0;
+    if (tcl) {
+        /*
+         * Hardware TCL: the position is object space.  Transform it to clip
+         * space, then divide by w like the viewport transform engine does
+         * for vertices that are not pre-divided; the sign of w is kept so
+         * the renderer can clip against the near plane.
+         */
+        ATI3DState *t = s->r3d;
+        float (*m)[4] = t->tcl_m;
+        float ox = v->x, oy = v->y, oz = v->z, c[4], iw;
+
+        for (int r = 0; r < 4; r++) {
+            c[r] = m[r][0] * ox + m[r][1] * oy + m[r][2] * oz + m[r][3] * w0;
+        }
+        if (fabsf(c[3]) < 1e-12f) {
+            c[3] = c[3] < 0 ? -1e-12f : 1e-12f;
+        }
+        iw = 1.0f / c[3];
+        v->x = c[0] * iw;
+        v->y = c[1] * iw;
+        v->z = c[2] * iw;
+        v->rhw = iw;
+        if (t->tcl_dump_left > 0 && !t->tcl_vtx_set) {
+            t->tcl_vtx_set = true;
+            t->tcl_vtx[0] = ox; t->tcl_vtx[1] = oy;
+            t->tcl_vtx[2] = oz; t->tcl_vtx[3] = w0;
+            memcpy(&t->tcl_vtx[4], c, sizeof(c));
+        }
+        {
+            float obj[4] = { ox, oy, oz, w0 };
+
+            tcl_post(t, v, f, obj, nrm, c, tin);
+        }
     } else {
-        v->rhw = 1.0f;
-    }
-    /*
-     * SE_COORD_FMT: *_PRE_MULT_1_OVER_W0 means the value has already been
-     * divided by w (projected).  The shader wants projected X/Y/Z and the
-     * true texture coordinates (GL interpolates them with w), so
-     * pre-divided texture coordinates are multiplied back by w, and X/Y/Z
-     * that are not pre-divided are divided here.  Quake III through ATI's
-     * OpenGL renderer: X/Y/Z projected, S/T divided by w, W0 = 1/w.
-     */
-    if (!(coord & 1) && v->rhw) {
-        v->x *= v->rhw;
-        v->y *= v->rhw;
-    }
-    if (!(coord & 2) && (f & VF_Z) && v->rhw) {
-        v->z *= v->rhw;
+        /* W0 is 1/w unless the coordinate format says otherwise */
+        if (f & VF_W0) {
+            v->rhw = (coord & (1 << 16)) ? (w0 != 0 ? 1.0f / w0 : 1.0f) : w0;
+        } else {
+            v->rhw = 1.0f;
+        }
+        /*
+         * SE_COORD_FMT: *_PRE_MULT_1_OVER_W0 means the value has already been
+         * divided by w (projected).  The shader wants projected X/Y/Z and the
+         * true texture coordinates (GL interpolates them with w), so
+         * pre-divided texture coordinates are multiplied back by w, and X/Y/Z
+         * that are not pre-divided are divided here.  Quake III through ATI's
+         * OpenGL renderer: X/Y/Z projected, S/T divided by w, W0 = 1/w.
+         */
+        if (!(coord & 1) && v->rhw) {
+            v->x *= v->rhw;
+            v->y *= v->rhw;
+        }
+        if (!(coord & 2) && (f & VF_Z) && v->rhw) {
+            v->z *= v->rhw;
+        }
     }
     for (int u = 0; u < 3; u++) {
         static const uint32_t qbit[3] = { VF_Q0, VF_Q1, VF_Q2 };
@@ -1401,6 +2046,37 @@ static unsigned expand_prim(unsigned type, const ATIVertex *in, unsigned n,
     }
 }
 
+/*
+ * User clip planes (T4): tcl_post() left an outcode per vertex in tc[0][3].
+ * Triangles and quads wholly outside one plane are dropped; primitives that
+ * only cross a plane are drawn unclipped (and other primitive types are not
+ * culled).  The outcodes are cleared again: the shader reads tc[0][3].
+ */
+static unsigned tcl_ucp_cull(unsigned type, ATIVertex *v, unsigned n)
+{
+    unsigned k = 0, g = type == 4 ? 3 : type == 13 ? 4 : 0;
+
+    if (g) {
+        for (unsigned i = 0; i + g <= n; i += g) {
+            unsigned all = ~0u;
+
+            for (unsigned j = 0; j < g; j++) {
+                all &= (unsigned)v[i + j].tc[0][3];
+            }
+            if (!all) {
+                for (unsigned j = 0; j < g; j++) {
+                    v[k++] = v[i + j];
+                }
+            }
+        }
+        n = k;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        v[i].tc[0][3] = 0.0f;
+    }
+    return n;
+}
+
 static void draw(ATIVGAState *s, uint32_t vfmt, uint32_t vfcntl,
                  ATIVertex *v, unsigned n)
 {
@@ -1413,18 +2089,32 @@ static void draw(ATIVGAState *s, uint32_t vfmt, uint32_t vfcntl,
     if (!t->r || !n) {
         return;
     }
-    if (!(R(s, SE_CNTL_STATUS) & (1 << 8))) {
-        static bool warned;
-        if (!warned) {
-            warned = true;
-            qemu_log_mask(LOG_UNIMP, "ati: TCL (hardware transform) draws are "
-                          "not emulated; drawing vertices as window "
-                          "coordinates\n");
-        }
-    }
     if (!decode_state(s, &st)) {
+        t->tcl_on = false;
         return;
     }
+    st.tcl = t->tcl_on;
+    if (t->tcl_on && t->tcl_dump_left > 0) {
+        if (t->tcl_vtx_set &&
+            trace_event_get_state_backends(TRACE_ATI_3D_TCL_VTX)) {
+            const float *f = t->tcl_vtx;
+
+            trace_ati_3d_tcl_vtx(vfmt, vfcntl, tr_i(f[0], 1000),
+                                 tr_i(f[1], 1000), tr_i(f[2], 1000),
+                                 tr_i(f[3], 1000), tr_i(f[4], 1000),
+                                 tr_i(f[5], 1000), tr_i(f[6], 1000),
+                                 tr_i(f[7], 1000));
+            trace_ati_3d_tcl_win(tr_i(v[0].x, 1000), tr_i(v[0].y, 1000),
+                                 tr_i(v[0].z, 1e6f), tr_i(v[0].rhw, 1e6f),
+                                 R(s, SE_CNTL), R(s, SE_COORD_FMT),
+                                 tr_i(RF(s, SE_VPORT_XSCALE), 1000),
+                                 tr_i(RF(s, SE_VPORT_XOFFSET), 1000),
+                                 tr_i(RF(s, SE_VPORT_YSCALE), 1000),
+                                 tr_i(RF(s, SE_VPORT_YOFFSET), 1000));
+        }
+        t->tcl_dump_left--;
+    }
+    t->tcl_vtx_set = false;
     if (trace_event_get_state_backends(TRACE_ATI_3D_TARGET)) {
         /* the colour target's raw state, whenever it changes */
         static uint32_t last[9];
@@ -1437,6 +2127,12 @@ static void draw(ATIVGAState *s, uint32_t vfmt, uint32_t vfcntl,
             memcpy(last, cur, sizeof(cur));
             trace_ati_3d_target(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5],
                                 cur[6], cur[7], cur[8], st.color.fmt);
+        }
+    }
+    if (t->tcl_on && t->tx.ucp) {
+        n = tcl_ucp_cull(vfcntl & 15, v, n);
+        if (!n) {
+            return;
         }
     }
     en = expand_prim(vfcntl & 15, v, n, &ev, &glprim);
@@ -1474,7 +2170,8 @@ static ATIVertex *vbuf(ATI3DState *t, unsigned n)
     return t->vbuf;
 }
 
-static void draw_immd(ATIVGAState *s, const uint32_t *d, unsigned n)
+static void draw_immd(ATIVGAState *s, const uint32_t *d, unsigned n,
+                      bool tcl_ok)
 {
     ATI3DState *t = s->r3d;
     uint32_t vfmt, vf;
@@ -1488,6 +2185,7 @@ static void draw_immd(ATIVGAState *s, const uint32_t *d, unsigned n)
     vf = d[1];
     vsz = vtx_dwords(vfmt);
     nv = MIN(vf >> 16, (n - 2) / vsz);
+    tcl_begin(s, vfmt, vf, tcl_ok);
     v = vbuf(t, nv);
     for (unsigned i = 0; i < nv; i++) {
         decode_vertex(s, vfmt, d + 2 + i * vsz, &v[i], vf & (1 << 6));
@@ -1502,6 +2200,7 @@ static void draw_vbuf(ATIVGAState *s, uint32_t vfmt, uint32_t vf,
     unsigned vsz = vtx_dwords(vfmt);
     unsigned nv = idx ? nidx : (vf >> 16);
     uint32_t stride, base;
+    bool multi;
     ATIVertex *v;
     uint32_t tmp[64];
 
@@ -1510,10 +2209,38 @@ static void draw_vbuf(ATIVGAState *s, uint32_t vfmt, uint32_t vf,
     }
     base = t->arr_addr[0];
     stride = t->arr_stride[0] ? t->arr_stride[0] : vsz;
+    /*
+     * With hardware TCL a driver (Mesa's r100 does) loads one array per
+     * vertex component (position, normal, colour, ...).  Each array's word
+     * in 3D_LOAD_VBPNTR holds its dword count in bits 7:0 (arr_stride here)
+     * and its stride in bits 14:8 (arr_size); a stride of 0 is a constant.
+     * When the counts add up to the vertex format's size the vertex is
+     * gathered from the arrays; otherwise array 0 is read as interleaved.
+     */
+    {
+        unsigned tot = 0;
+
+        for (unsigned k = 0; k < t->narrays; k++) {
+            tot += t->arr_stride[k];
+        }
+        multi = t->narrays > 1 && tot == vsz;
+    }
+    tcl_begin(s, vfmt, vf, true);
     v = vbuf(t, nv);
     for (unsigned i = 0; i < nv; i++) {
         unsigned vi = idx ? idx[i] : i;
-        ati_mc_rw(s, base + (uint64_t)vi * stride * 4, tmp, vsz * 4, false);
+        if (multi) {
+            unsigned o = 0;
+            for (unsigned k = 0; k < t->narrays; k++) {
+                unsigned comps = t->arr_stride[k];
+                unsigned step = t->arr_size[k];
+                ati_mc_rw(s, t->arr_addr[k] + (uint64_t)(step ? vi : 0) * step * 4,
+                          tmp + o, comps * 4, false);
+                o += comps;
+            }
+        } else {
+            ati_mc_rw(s, base + (uint64_t)vi * stride * 4, tmp, vsz * 4, false);
+        }
         /* vertex arrays are fetched with the CP's swap setting */
         for (unsigned k = 0; k < vsz; k++) {
             tmp[k] = (R(s, SE_CNTL_STATUS) & 3) == 2 ? ldl_be_p(&tmp[k])
@@ -1576,6 +2303,7 @@ static void draw_membuf(ATIVGAState *s, uint32_t base, uint32_t vfmt,
     for (size_t k = 0; k < ndw; k++) {
         buf[k] = be ? ldl_be_p(&buf[k]) : ldl_le_p(&buf[k]);
     }
+    tcl_begin(s, vfmt, vf, true);
     v = vbuf(t, n);
     if (idx && nbuf <= n) {
         if (nbuf > t->dec_cap) {
@@ -1639,15 +2367,19 @@ void ati_3d_packet(ATIVGAState *s, uint8_t op, const uint32_t *d, unsigned n)
 {
     ATI3DState *t = s->r3d;
 
+    cur_op = op;
     trace_ati_3d_packet(op, n, n > 0 ? d[0] : 0, n > 1 ? d[1] : 0);
     if (!t || !t->r) {
         return;
     }
     switch (op) {
     case 0x25:  /* used by ATI's Mac OS RAVE engine like 3D_DRAW_IMMD (same
-                 * vertex format and VF_CNTL words, vertices inline) */
+                 * vertex format and VF_CNTL words, vertices inline); RAVE sets
+                 * the TCL bypass bit, which tcl_begin() honours */
+        draw_immd(s, d, n, true);
+        break;
     case 0x29:  /* 3D_DRAW_IMMD */
-        draw_immd(s, d, n);
+        draw_immd(s, d, n, true);
         break;
     case 0x2f:  /* 3D_LOAD_VBPNTR */
     {
@@ -1725,19 +2457,24 @@ const char *ati_3d_stats(ATIVGAState *s)
              " rb_2d=%" PRIu64 " rb_status=%" PRIu64 " rb_scanout=%" PRIu64
              " flips=%" PRIu64 " joined=%" PRIu64 " flip_waits=%" PRIu64
              " vb_fetch=%" PRIu64 " vb_idx=%" PRIu64 " gl_fills=%" PRIu64
-             " gl=%s",
+             " tcl_draws=%" PRIu64 " gl=%s",
              t->draws, t->verts, t->readbacks, t->uploads, t->texuploads,
              t->texhits, t->zclears, t->upload_skips, t->rb_why[ATI_SYNC_2D],
              t->rb_why[ATI_SYNC_STATUS], t->rb_why[ATI_SYNC_VBLANK], t->flips,
              t->readbacks_joined, t->vblank_waits, t->vb_fetch, t->vb_idx,
-             t->gl_fills,
+             t->gl_fills, t->tcl_draws,
              t->r ? "on" : "off");
     return t->stats;
 }
 
 void ati_3d_reg_write(ATIVGAState *s, hwaddr addr, uint32_t data)
 {
-    /* state lives in the register file; draws decode it there */
+    /* state lives in the register file; draws decode it there, except for
+     * the TCL vector/scalar memories behind their index/data ports */
+    if (s->r3d && addr >= SE_TCL_VECTOR_INDX_REG &&
+        addr <= SE_TCL_SCALAR_DATA_REG) {
+        tcl_reg_write(s->r3d, addr, data);
+    }
 }
 
 /* ClassicMac: the host renderer for status ("" while 3D is off) */

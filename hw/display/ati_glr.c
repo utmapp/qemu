@@ -95,7 +95,7 @@ struct ATIRenderer {
     size_t scratch_len;
     ATIGL gl;
     GLuint prog, vao, vbo;
-    GLint u_fbsize, u_stage_c, u_stage_a, u_tfactor, u_stage_en, u_tex_en,
+    GLint u_fbsize, u_tcl, u_stage_c, u_stage_a, u_tfactor, u_stage_en, u_tex_en,
           u_tex[3], u_alpha, u_alpharef, u_fog, u_fogcol, u_flags, u_solid;
     GLRTarget targets[MAX_TARGETS];
     GLRTexture texs[MAX_TEXTURES];
@@ -446,6 +446,7 @@ static void encode_row(const uint8_t *src, uint8_t *dst, unsigned w,
 /* sources start after the version line, which glr_shader() supplies */
 static const char *vs_src =
     "uniform vec2 fbsize;\n"
+    "uniform int tcl;\n"          /* positions come from the TCL transform */
     "in vec4 a_pos;\n"            /* x, y (pixels), z (0..1), rhw */
     "in vec4 a_c0;\n"
     "in vec4 a_c1;\n"
@@ -462,9 +463,11 @@ static const char *vs_src =
     "out float v_z;\n"
     "void main() {\n"
     "  float w = a_pos.w > 0.0 ? 1.0 / a_pos.w : 1.0;\n"
+    /* TCL: 1/rhw is the clip-space w, negative behind the eye; GL clips */
+    "  if (tcl != 0) w = a_pos.w != 0.0 ? 1.0 / a_pos.w : 1.0;\n"
     "  vec2 ndc = vec2(a_pos.x / fbsize.x * 2.0 - 1.0,\n"
     "                  a_pos.y / fbsize.y * 2.0 - 1.0);\n"
-    "  float z = clamp(a_pos.z, 0.0, 1.0) * 2.0 - 1.0;\n"
+    "  float z = (tcl != 0 ? a_pos.z : clamp(a_pos.z, 0.0, 1.0)) * 2.0 - 1.0;\n"
     "  gl_Position = vec4(ndc * w, z * w, w);\n"
     "  v_c0 = a_c0; v_c1 = a_c1; f_c0 = a_c0; f_c1 = a_c1;\n"
     "  v_t0 = a_t0; v_t1 = a_t1; v_t2 = a_t2; v_z = a_pos.z;\n"
@@ -625,6 +628,7 @@ static bool glr_program(ATIRenderer *r)
     }
     gl->UseProgram(r->prog);
     r->u_fbsize = gl->GetUniformLocation(r->prog, "fbsize");
+    r->u_tcl = gl->GetUniformLocation(r->prog, "tcl");
     r->u_stage_c = gl->GetUniformLocation(r->prog, "stage_c");
     r->u_stage_a = gl->GetUniformLocation(r->prog, "stage_a");
     r->u_tfactor = gl->GetUniformLocation(r->prog, "tfactor");
@@ -952,6 +956,7 @@ static void glr_draw(ATIRenderer *r, GLRCmd *c)
     gl->BindVertexArray(r->vao);
     gl->Viewport(0, 0, t->w, t->h);
     gl->Uniform2f(r->u_fbsize, t->w, t->h);
+    gl->Uniform1i(r->u_tcl, st->tcl);
 
     if (st->scissor) {
         gl->Enable(GL_SCISSOR_TEST);

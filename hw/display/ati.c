@@ -999,8 +999,9 @@ static void ati_mm_write_reg(void *opaque, hwaddr addr,
         if (ati_cp_write(s, addr, data)) {
             return;
         }
-        if (addr >= 0x1c00 && addr < 0x2000) {
-            ati_3d_reg_write(s, addr, data);    /* 3D state */
+        if (addr >= 0x1c00 && addr < 0x2300) {
+            /* 3D state, and the TCL vector/scalar ports at 0x2200 */
+            ati_3d_reg_write(s, addr, data);
         }
     }
     switch (addr) {

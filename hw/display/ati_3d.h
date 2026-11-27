@@ -21,7 +21,7 @@
 
 /* canonical vertex: window-space position plus everything interpolated */
 typedef struct ATIVertex {
-    float x, y, z, rhw;        /* window x/y in pixels, z in [0,1], 1/w */
+    float x, y, z, rhw;        /* window x/y in pixels, z in [0,1], 1/w (signed after TCL) */
     float c0[4];               /* diffuse RGBA */
     float c1[4];               /* specular RGB, fog factor in [3] */
     float tc[3][4];            /* s, t, q (r unused) per unit, already /w */
@@ -104,6 +104,8 @@ typedef struct ATIDrawState {
     float line_width;
     float zbias_factor, zbias_const;
     bool zbias;
+    bool tcl;                  /* vertices came through the TCL transform:
+                                * clip-space w may be negative or zero */
 } ATIDrawState;
 
 /* render thread API (ati_glr.c) */
