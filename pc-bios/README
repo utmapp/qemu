@@ -11,6 +11,31 @@
   Sparc32 (including QEMU,tcx.bin and QEMU,cgthree.bin) and Sparc64 are built
   from OpenBIOS SVN revision 1280.
 
+- openbios-ppc-r300 is the PowerPC OpenBIOS image with two 4-byte changes for
+  the ati-radeon-9700 device: the built-in VGA table entry is the Radeon 9700
+  PRO (PCI 1002:4E44) instead of QEMU VGA, and the mac99 PCI host's memory
+  "ranges" window is 1 GB so the card's VRAM and register BARs fit.  It comes
+  from linuxkid473/ppc-osx-vgpu (firmware/radeon/openbios-ppc, made by
+  firmware/src/patch-openbios.py from the UTM OpenBIOS image).  GPL v2, like
+  OpenBIOS.  Select it with -bios openbios-ppc-r300 together with
+  -global uni-north-pci.agp-capable=on.
+
+- openbios-ppc-rv250 is the same image with the VGA table entry set to the
+  Radeon 9000 PRO (PCI 1002:4966) for the ati-radeon-9000 device and Mac OS X
+  10.2 Jaguar, whose ATIRadeon8500.kext matches 4966 and has no R300 driver.
+  It comes from linuxkid473/ppc-osx-vgpu (firmware/jaguar/openbios-ppc, made
+  by "firmware/src/patch-openbios.py vga/openbios-ppc jaguar/openbios-ppc
+  4966"; SHA-1 6e3632adca666e22e3566b7eb3bb043c3ef7e72a).  GPL v2, like
+  OpenBIOS.
+
+- qemu_vga_hwc.ndrv is the QEMU VGA NDRV (ozbenh/QemuMacDrivers) patched for
+  a hardware cursor at BAR2+0xFF00 and extra modes, which the ati-radeon-9700
+  device implements; without it Mac OS X draws a software cursor that leaves
+  traces over GL surfaces.  From linuxkid473/ppc-osx-vgpu
+  (firmware/radeon/qemu_vga_hwc.ndrv, built by firmware/src/ndrv/build.py,
+  patcher from Spartan0285/PowerEmu).  GPL v2.  Select it with
+  -machine mac99,ndrv=qemu_vga_hwc.ndrv.
+
 - SLOF (Slimline Open Firmware) is a free IEEE 1275 Open Firmware
   implementation for certain IBM POWER hardware.  The sources are at
   https://gitlab.com/slof/slof, and the image currently in qemu is
